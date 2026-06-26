@@ -23,8 +23,10 @@ def main() -> int:
     print("=== 1. IFC schema validation ===")
     errors: list[str] = []
     try:
-        ifcopenshell.validate.validate(model)
-        print("  schema validation: PASS (no exceptions)")
+        logger = ifcopenshell.validate.json_logger()
+        ifcopenshell.validate.validate(model, logger)
+        n = len(getattr(logger, "statements", []) or [])
+        print(f"  schema validation: PASS ({n} issues)")
     except Exception as e:
         # validate raises on the first error; capture it
         print("  schema validation: RAISED ->", type(e).__name__, str(e)[:200])
