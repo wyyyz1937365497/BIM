@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Generated artifacts
+output/
+*.ifc
+!tests/**/*.ifc
+
+# Data (large, user-provided)
+data/
+datasets/
+**/images/
+**/sparse/
+*.ply
+*.ply.gz
+*.bag
+
+# Conda / venv
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
