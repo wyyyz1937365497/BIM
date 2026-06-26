@@ -70,6 +70,11 @@ def build_demo_ifc() -> ifcopenshell.file:
     ifcopenshell.api.aggregate.assign_object(model, relating_object=site, products=[building])
     ifcopenshell.api.aggregate.assign_object(model, relating_object=building, products=[storey])
 
+    # Explicit placements for the spatial containers (origin; storey at z=0).
+    ifcopenshell.api.geometry.edit_object_placement(model, product=site)
+    ifcopenshell.api.geometry.edit_object_placement(model, product=building)
+    ifcopenshell.api.geometry.edit_object_placement(model, product=storey)
+
     # --- wall (SweptSolid: 5 m long, 2.8 m high, 0.2 m thick) --------------
     wall = ifcopenshell.api.root.create_entity(model, ifc_class="IfcWall", name="W1")
     ifcopenshell.api.geometry.edit_object_placement(model, product=wall)
@@ -88,8 +93,12 @@ def build_demo_ifc() -> ifcopenshell.file:
 
     rect_profile = ifcopenshell.api.profile.add_parameterized_profile(
         model, ifc_class="IfcRectangleProfileDef", profile_type="AREA")
+    # NB: edit_profile writes RAW IFC attributes, stored in the project unit
+    # (millimetre here). The add_*_representation helpers take metres and
+    # convert automatically, but profile dims do NOT -- provide mm directly.
     ifcopenshell.api.profile.edit_profile(
-        model, profile=rect_profile, attributes={"XDim": 1.0, "YDim": 0.4})  # 1.0 m wide, 0.4 m through
+        model, profile=rect_profile,
+        attributes={"XDim": 1000.0, "YDim": 400.0})  # 1.0 m wide, 0.4 m through (cuts the 0.2 m wall)
     opening_rep = ifcopenshell.api.geometry.add_profile_representation(
         model, context=body, profile=rect_profile, depth=2.1)  # 2.1 m tall (extrude along Z)
     ifcopenshell.api.geometry.assign_representation(
@@ -103,7 +112,9 @@ def build_demo_ifc() -> ifcopenshell.file:
         model, ifc_class="IfcDoor", name="D1",
         predefined_type="DOOR")  # create_entity applies schema defaults (OperationType, etc.)
     door_rep = ifcopenshell.api.geometry.add_door_representation(
-        model, context=body, overall_height=2.1, overall_width=1.0)
+        # NB: overall_height/overall_width are in PROJECT units (mm here),
+        # not metres -- see add_door_representation docstring.
+        model, context=body, overall_height=2100.0, overall_width=1000.0)
     if door_rep is not None:
         ifcopenshell.api.geometry.assign_representation(
             model, product=door, representation=door_rep)
