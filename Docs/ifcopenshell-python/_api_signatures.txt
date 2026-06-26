@@ -1,0 +1,70 @@
+# IfcOpenShell Python API signatures (introspected from installed 0.8.5)
+
+## module: ifcopenshell.api.unit
+  add_si_unit(file: ifcopenshell.file.file, unit_type: str = 'LENGTHUNIT', prefix: Optional[str] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Add a new SI unit
+  assign_unit(file: ifcopenshell.file.file, units: Optional[list[ifcopenshell.entity_instance.entity_instance]] = None, length: Optional[dict] = None, area: Optional[dict] = None, volume: Optional[dict] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Assign default project units
+
+## module: ifcopenshell.api.context
+  add_context(file: ifcopenshell.file.file, context_type: Optional[Literal['Model', 'Plan', 'NotDefined']] = None, context_identifier: Optional[Literal['CoG', 'Box', 'Annotation', 'Axis', 'FootPrint', 'Profile', 'Surface', 'Reference', 'Body', 'Body-Fallback', 'Clearance', 'Lighting']] = None, target_view: Optional[Literal['ELEVATION_VIEW', 'GRAPH_VIEW', 'MODEL_VIEW', 'PLAN_VIEW', 'REFLECTED_PLAN_VIEW', 'SECTION_VIEW', 'SKETCH_VIEW', 'USERDEFINED', 'NOTDEFINED']] = None, target_scale: Optional[float] = None, parent: Optional[ifcopenshell.entity_instance.entity_instance] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Adds a new geometric representation context
+
+## module: ifcopenshell.api.aggregate
+  assign_object(file: ifcopenshell.file.file, products: list[ifcopenshell.entity_instance.entity_instance], relating_object: ifcopenshell.entity_instance.entity_instance) -> Optional[ifcopenshell.entity_instance.entity_instance]
+      doc: Assigns object as an aggregate to the products
+
+## module: ifcopenshell.api.spatial
+  assign_container(file: ifcopenshell.file.file, products: list[ifcopenshell.entity_instance.entity_instance], relating_structure: ifcopenshell.entity_instance.entity_instance) -> Optional[ifcopenshell.entity_instance.entity_instance]
+      doc: Assigns products to be contained hierarchically in a space
+
+## module: ifcopenshell.api.root
+  create_entity(file: ifcopenshell.file.file, ifc_class: str = 'IfcBuildingElementProxy', predefined_type: Optional[str] = None, name: Optional[str] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Create a new rooted product
+  remove_product(file: ifcopenshell.file.file, product: ifcopenshell.entity_instance.entity_instance) -> None
+      doc: Removes a product
+
+## module: ifcopenshell.api.geometry
+  edit_object_placement(file: ifcopenshell.file.file, product: ifcopenshell.entity_instance.entity_instance, matrix: Optional[numpy.ndarray[tuple[Any, ...], numpy.dtype[numpy.float64]]] = None, is_si: bool = True, should_transform_children: bool = False) -> ifcopenshell.entity_instance.entity_instance
+      doc: Changes the object placement matrix of an element
+  assign_representation(file: ifcopenshell.file.file, product: ifcopenshell.entity_instance.entity_instance, representation: ifcopenshell.entity_instance.entity_instance) -> None
+  add_wall_representation(file: ifcopenshell.file.file, context: ifcopenshell.entity_instance.entity_instance, length: float = 1.0, height: float = 3.0, direction_sense: str = 'POSITIVE', offset: float = 0.0, thickness: float = 0.2, x_angle: float = 0.0, clippings: Optional[list[Union[ifcopenshell.util.data.Clipping, dict[str, Any]]]] = None, booleans: Optional[list[ifcopenshell.entity_instance.entity_instance]] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Add a geometric representation for a wall.
+  add_slab_representation(file: ifcopenshell.file.file, context: ifcopenshell.entity_instance.entity_instance, depth: float = 0.2, direction_sense: str = 'POSITIVE', offset: float = 0.0, x_angle: float = 0.0, clippings: Optional[list[Union[ifcopenshell.util.data.Clipping, ifcopenshell.entity_instance.entity_instance]]] = None, polyline: Optional[list[tuple[float, float]]] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Add a geometric representation for a slab.
+  add_door_representation(file: 'ifcopenshell.file', *, context: 'ifcopenshell.entity_instance', overall_height: 'Optional[float]' = None, overall_width: 'Optional[float]' = None, operation_type: 'DOOR_TYPE' = 'SINGLE_SWING_LEFT', lining_properties: 'Optional[Union[DoorLiningProperties, dict[str, Any]]]' = None, panel_properties: 'Optional[Union[DoorPanelProperties, dict[str, Any]]]' = None, part_of_product: 'Optional[ifcopenshell.entity_instance]' = None, unit_scale: 'Optional[float]' = None) -> 'Union[ifcopenshell.entity_instance, None]'
+      doc: Add a geometric representation for a door.
+  add_window_representation(file: 'ifcopenshell.file', *, context: 'ifcopenshell.entity_instance', overall_height: 'Optional[float]' = None, overall_width: 'Optional[float]' = None, partition_type: 'WINDOW_TYPE' = 'SINGLE_PANEL', lining_properties: 'Optional[Union[WindowLiningProperties, dict[str, Any]]]' = None, panel_properties: 'Optional[list[Union[WindowPanelProperties, dict[str, Any]]]]' = None, part_of_product: 'Optional[ifcopenshell.entity_instance]' = None, unit_scale: 'Optional[float]' = None) -> 'ifcopenshell.entity_instance'
+      doc: units in usecase_settings expected to be in ifc project units
+  add_profile_representation(file: ifcopenshell.file.file, context: ifcopenshell.entity_instance.entity_instance, profile: ifcopenshell.entity_instance.entity_instance, depth: float = 1.0, cardinal_point: Union[Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], Literal['bottom left', 'bottom centre', 'bottom right', 'mid-depth left', 'mid-depth centre', 'mid-depth right', 'top left', 'top centre', 'top right', 'geometric centroid', 'bottom in line with the geometric centroid', 'left in line with the geometric centroid', 'right in line with the geometric centroid', 'top in line with the geometric centroid', 'shear centre', 'bottom in line with the shear centre', 'left in line with the shear centre', 'right in line with the shear centre', 'top in line with the shear centre'], NoneType] = 5, clippings: Optional[list[Union[ifcopenshell.util.data.Clipping, dict[str, Any]]]] = None, placement_zx_axes: tuple[typing.Optional[tuple[float, float, float]], typing.Optional[tuple[float, float, float]]] = (None, None)) -> ifcopenshell.entity_instance.entity_instance
+      doc: Add profile representation.
+  add_mesh_representation(file: ifcopenshell.file.file, context: ifcopenshell.entity_instance.entity_instance, vertices: list[typing.Union[collections.abc.Sequence[typing.Any], numpy.ndarray]], edges: Optional[list[list[tuple[int, int]]]] = None, faces: list[list[list[int]]] = None, coordinate_offset: Optional[Any] = None, unit_scale: Optional[float] = None, force_faceted_brep: bool = False) -> ifcopenshell.entity_instance.entity_instance
+      doc: Add a mesh representation.
+  add_box_representation -> MISSING
+  clip_solid(file: 'ifcopenshell.file', item: 'ifcopenshell.entity_instance', location: 'Sequence[float]', normal: 'Sequence[float]', element: 'Optional[ifcopenshell.entity_instance]' = None) -> 'ifcopenshell.entity_instance'
+      doc: Clip a solid with a half-space plane, returning an IfcBooleanClippingResult.
+  add_void -> MISSING
+
+## module: ifcopenshell.api.feature
+  add_feature(file: ifcopenshell.file.file, feature: ifcopenshell.entity_instance.entity_instance, element: ifcopenshell.entity_instance.entity_instance) -> ifcopenshell.entity_instance.entity_instance
+      doc: Create a projecting, voiding, or surface feature in an element
+  add_filling(file: ifcopenshell.file.file, opening: ifcopenshell.entity_instance.entity_instance, element: ifcopenshell.entity_instance.entity_instance) -> ifcopenshell.entity_instance.entity_instance
+      doc: Fill an opening with an element
+  remove_feature(file: ifcopenshell.file.file, feature: ifcopenshell.entity_instance.entity_instance) -> None
+      doc: Permanently delete a feature element and its void or projection relationship.
+  remove_filling(file: ifcopenshell.file.file, element: ifcopenshell.entity_instance.entity_instance) -> None
+      doc: Remove a filling relationship
+
+## module: ifcopenshell.api.profile
+  add_arbitrary_profile(file: ifcopenshell.file.file, profile: Union[collections.abc.Sequence[Any], numpy.ndarray], name: Optional[str] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Adds a new arbitrary polyline-based profile
+  add_arbitrary_profile_with_voids(file: ifcopenshell.file.file, outer_profile: Union[collections.abc.Sequence[Any], numpy.ndarray], inner_profiles: list[typing.Union[collections.abc.Sequence[typing.Any], numpy.ndarray]], name: Optional[str] = None) -> ifcopenshell.entity_instance.entity_instance
+      doc: Adds a new arbitrary polyline-based profile with voids
+  add_parameterized_profile(file: ifcopenshell.file.file, ifc_class: str, profile_type: str = 'AREA') -> ifcopenshell.entity_instance.entity_instance
+      doc: Adds a new parameterised profile
+  copy_profile(file: ifcopenshell.file.file, profile: ifcopenshell.entity_instance.entity_instance) -> ifcopenshell.entity_instance.entity_instance
+      doc: Copies a profile
+  edit_profile(file: ifcopenshell.file.file, profile: ifcopenshell.entity_instance.entity_instance, attributes: dict[str, typing.Any]) -> None
+      doc: Edits the attributes of an IfcProfileDef
+  remove_profile(file: ifcopenshell.file.file, profile: ifcopenshell.entity_instance.entity_instance) -> None
+      doc: Removes a profile
