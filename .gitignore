@@ -5,6 +5,9 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 
+# opencode internal
+.omo/
+
 # Generated artifacts
 output/
 *.ifc
