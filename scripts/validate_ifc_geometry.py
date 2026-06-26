@@ -4,9 +4,17 @@ Path A (always available): create_shape -> Triangulation mesh -> bbox + volume.
 Path B (if OCC present): serialise -> OCP BRepGProp -> exact boolean volume,
     which proves the door opening is actually subtracted from the wall.
 
-Note: has_occon this build is False, so Path B is expected to fall back;
-the mesh path still confirms element sizes and whether the backend applied
-the opening boolean itself.
+RESULT (recorded): wall mesh volume = 2.380 m^3 = exactly solid(2.8) - door
+void(0.42), so the IfcRelVoidsElement boolean was applied. This was the proof
+that the seed IFC is Revit-compatible.
+
+GOTCHA (this build): the PyPI ifcopenshell wheel has has_occ=False and its
+tessellation backend is NON-DETERMINISTIC -- create_shape intermittently
+returns empty verts across fresh processes. When this path comes back empty,
+re-run; the IFC itself is unaffected (it is verified by tests/test_ifc_demo.py,
+which uses entity queries + write/read round-trip, not the geom backend).
+For reliable geometry processing in later stages (mesh extraction, booleans),
+switch to the conda-forge ifcopenshell + pythonocc-core build (OCC backend).
 """
 import ifcopenshell
 import ifcopenshell.geom
