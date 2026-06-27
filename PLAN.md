@@ -44,7 +44,7 @@
 | 手机 IMU 用法 | MVP 仅作**重力对齐**，位姿交给 COLMAP |
 | 是否自研 Android App | **不做**；手机自带录像即可（位姿不依赖图像匹配） |
 | GPU | 两张 2080Ti 22G（单房间 3DGS 训练充裕） |
-| **IFC 版本标准** | **IFC2X3**（AEC 业界事实交换标准，工具兼容性最广）。**注意**：3D 视图不可见的根因是 Revit 的孤立点/地理参考包围盒 bug 或新版 IFC 处理器缺陷，**与格式版本无关**（见 §12 失败探索记录）；选 IFC2X3 是为兼容性，**非**为修 3D bug。A 类用 SweptSolid；B 类 mesh 用 `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`（详见 §10.1） |
+| **IFC 版本标准** | **IFC4**。原生 `IfcTriangulatedFaceSet` 便于未来 B 类 mesh 回灌（见 §10.1）。3D 不可见的真正根因是 Revit 导入后"Phase Created（创建阶段）"默认为不存在的阶段（改为"现有"即恢复），**与 IFC 版本无关**（见 §12.1） |
 
 ---
 
@@ -212,29 +212,29 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 **流程**：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → `IfcBuildingElementProxy`。
 
-**IFC 版本与 mesh 表达策略（关键）**：项目标准为 IFC2X3（见 §2.3），B 类 mesh 在 IFC2X3 下用"哑代理"路线，符合 MVP 定位。
+**IFC 版本与 mesh 表达策略（关键）**：项目标准为 **IFC4**（见 §2.3），B 类 mesh 直接用原生 `IfcTriangulatedFaceSet` + `IfcCartesianPointList3D`，代码简洁、文件紧凑。
 
-| 维度 | IFC2X3（MVP 采用） | IFC4（未来扩展） |
+| 维度 | IFC4（项目采用） | IFC2X3（备选/历史） |
 |---|---|---|
-| 三角网格实体 | ❌ 无 IfcTriangulatedFaceSet | ✅ 原生（含顶点索引/法线/颜色） |
-| 替代表达 | `IfcShellBasedSurfaceModel`+`IfcFaceSurface`+`IfcPolyLoop`+`IfcCartesianPoint`（三层嵌套） | 一行 `IfcTriangulatedFaceSet`（配合 `IfcCartesianPointList3D` 批量存顶点） |
-| 顶点存储 | 每点单独 IfcCartesianPoint，文件臃肿 | `IfcCartesianPointList3D` 批量，紧凑 |
-| Revit 行为 | 直接打开可见、可整体移动；**不可参数化编辑**（哑代理） | 只能链接，不能打开转换；几何保真度更高但失去 A 类可编辑性 |
-| 代码复杂度 | 高（手动三层嵌套） | 低（一行） |
+| 三角网格实体 | ✅ 原生 IfcTriangulatedFaceSet（顶点索引/法线/颜色） | ❌ 无专用实体 |
+| 替代表达 | 一行 `IfcTriangulatedFaceSet`（配合 `IfcCartesianPointList3D` 批量存顶点） | `IfcShellBasedSurfaceModel`+`IfcFaceSurface`+`IfcPolyLoop`+`IfcCartesianPoint`（三层嵌套） |
+| 顶点存储 | `IfcCartesianPointList3D` 批量，紧凑 | 每点单独 IfcCartesianPoint，文件臃肿 |
+| Revit 行为 | 几何保真度高；导入后改"Phase Created=现有"即可正常显示（见 §12.1） | 直接打开可见、可整体移动；不可参数化编辑（哑代理） |
+| 代码复杂度 | 低（一行） | 高（手动三层嵌套） |
 
 **落地建议（分阶段）**：
 - **MVP（P0–P2）**：不涉及 mesh；A 类用 SweptSolid（墙/板/柱/门窗可编辑 ✅）。
-- **P4 难例探索**：IFC2X3 + `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`，Revit 中为哑代理（可见不可编辑）。
-- **未来扩展（mesh 密度爆炸时）**：混合导出 —— A 类留 IFC2X3 主文件（可编辑），B 类 mesh **单独导 IFC4 文件做链接补充**（鱼与熊掌兼得）。
+- **P4 难例探索**：IFC4 + `IfcBuildingElementProxy` + `IfcTriangulatedFaceSet`。
+- **若 Revit 直接打开遇阻**：先把导入图元的"Phase Created"改为"现有"；或用"链接→绑定→解组"工作流；必要时 mesh 单独导出做链接补充。
 
 **关键技巧**（无论版本）：
-- 回灌前用 `trimesh.simplify_quadric_decimation` 把面数压到 **5000 以下**，否则 IFC2X3 文件膨胀/解析卡死。
+- 回灌前用 `trimesh.simplify_quadric_decimation` 把面数压到 **5000 以下**，避免 IFC 文件膨胀/解析卡死。
 - 容器用 `IfcBuildingElementProxy`（Revit 归类"常规模型"），**不要**用 `IfcFurnishingElement`（可能被过滤）。
 - 即便是哑代理，仍通过 `IfcRelDefinesByProperties` 挂 Pset（材质/来源/置信度）供查询。
 - 导出用 `.ifczip`（mesh 类 IFC 可压缩 60%+）。
-- **BlenderBIM/Bonsai 预览验证** IFC2X3 mesh 表达是否正确，比反复开 Revit 快。
+- **BlenderBIM/Bonsai 预览验证** mesh 表达是否正确，比反复开 Revit 快。
 
-> 澄清：IFC2X3 并非"不支持 mesh"，而是"支持得不好看"——几何体系（CSG/SweptSolid/Brep/ShellBasedSurfaceModel）能承载任意三角网格，只是无 IFC4 的专用 `IfcTriangulatedFaceSet`，导致代码冗长、文件臃肿。对大创级应用（B 类本就是加分项/未来工作），哑代理路线完全符合 §2.2"不追求毫米级施工精度"的定位。
+> 说明：IFC4 选型正是为 B 类 mesh 兼容——原生 `IfcTriangulatedFaceSet` 让回灌代码极简；若将来必须用 IFC2X3 交换，退而用 `IfcShellBasedSurfaceModel`（三层嵌套、哑代理）也完全可行，符合 §2.2"不追求毫米级施工精度"的定位。
 
 ### 10.2 多房间 / 整层拼接
 通过多点底图 + 3DGS 分区重建，软件层拼接（MVP 仅留接口占位）。
@@ -265,7 +265,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 **当时的（错误）判断**：归因为"Revit 不支持 IFC4 直接打开"，遂把种子脚本切到 IFC2X3（commit `709482e`）。
 
-**实际根因**（经诊断纠正）：3D 不可见是 Revit 的两类已知 bug，**与 IFC 版本无关**：
+**排查假设（后证伪）**：3D 不可见初判为 Revit 的两类已知 bug，**与 IFC 版本无关**：
 - **Bug ①** 导出端写入远离原点的孤立点（地理参考/IfcSite 全局坐标），如 `IFCCARTESIANPOINT((0.,0.24,1.79769313486232E+305))`，把三维视图包围盒撑爆，几何体看似"消失"；平面视图受视图范围约束仍可见。
 - **Bug ②** 新版 IFC 处理器三维渲染缺陷。
 
@@ -276,10 +276,14 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 - 仅 1 个科学计数法 token `1.0000000000000001E-05`（无害 epsilon）。
 → **文件本身干净，3D 不可见不是本文件造成的**。
 
-**结论与遗留**：
-- IFC2X3 作为交换标准保留（兼容性优势），但它**不是** 3D bug 的修复手段——换格式不解决问题。
-- 后续修复方向在 Revit 侧：`Revit.ini [ImportIFC] LinkProcessor=Legacy`；"链接→绑定→解组"获取可编辑原生图元；或评估 pyRevit 转 RVT / Revit API 直生（方案 B/C）。
-- 由用户继续研究其他可能性；本条记录避免重复踩坑。
+**✅ 确认的真正根因**（用户后续定位）：Revit 导入 IFC 后，图元的 **"Phase Created（创建阶段）"默认被设为项目中不存在的阶段（阶段三）**，导致三维视图不显示；**把 Phase Created 改为"现有（Existing）"即恢复正常显示**。前述孤立点/处理器 bug 仅为排查假设（文件已证清白），非本例病因。
+
+**Phase 能否在 IFC 创建时指定？** 不能可靠指定——Revit 的 Phase 是 Revit 侧概念，导入时按视图/默认阶段分配，不读 IFC 内容（Revit 导出会写 `Pset_Revit_Phasing`，但导入不读）。手动在 Revit 改 Phase 是可靠路径。
+
+**结论**：
+- 标准**回退 IFC4**（本次 commit）：原生 `IfcTriangulatedFaceSet` 利于未来 B 类 mesh；commit `709482e` 的 IFC4→IFC2X3 误诊切换已撤销。
+- IFC 文件本身经多轮验证（schema/header/guid/placement/boolean/round-trip 全绿）是正确的；3D 可见性属 Revit 导入侧 Phase 设置问题，非文件缺陷。
+- 本条记录避免重复踩坑。
 
 ---
 
