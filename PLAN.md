@@ -1,6 +1,7 @@
 # 3DGS → BIM 自动重建系统 · 项目计划
 
 > **状态**：计划已定稿，待启动
+> **⚠️ 架构变更（2026-06-27）**：**放弃 IFC 交换生态**，改用 **pyRevit + Revit API** 直接在 Revit 中生成/编辑原生图元（原生可编辑、无 IFC 导入兼容性问题）。下文所有 IfcOpenShell/IFC 相关内容（§5、§8、§10.1、§12 等）视为**历史/已弃用**，以本条为准。FloorPlan 契约、3DGS、VLM/MCP 等其余架构不变。
 > **日期**：2026-06-26
 > **类型**：大学生创新训练计划（SITP）/ 大创
 > **MVP 周期**：约 24 周（1–2 人）
@@ -10,7 +11,7 @@
 
 ## 1. 项目概述
 
-用**消费级设备**（手机 + 一个 50 元 2D 旋转 LiDAR + 3D 打印支架）采集房间，以 **3D Gaussian Splatting (3DGS)** 作为"信息丰富的中间表示"，让**多模态视觉大模型 (VLM) 借助 MCP** 在 3DGS 场景中自由巡视、分割出符合建筑语义的结构构件，最终由 **IfcOpenShell** 产出可在 **Revit 等 BIM 软件中打开并编辑**的 IFC 实体。
+用**消费级设备**（手机 + 一个 50 元 2D 旋转 LiDAR + 3D 打印支架）采集房间，以 **3D Gaussian Splatting (3DGS)** 作为"信息丰富的中间表示"，让**多模态视觉大模型 (VLM) 借助 MCP** 在 3DGS 场景中自由巡视、分割出符合建筑语义的结构构件，最终由 **pyRevit + Revit API** 直接在 Revit 中生成**可编辑的原生 BIM 图元**（不再走 IFC 交换）。
 
 **目标用户**：设计师（快速现状测绘 + 后期可改图），**不是**施工级 BIM。
 
@@ -142,7 +143,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | VLM | Claude / GPT-4o / Gemini | 推理循环 | API |
 | **水平底图 Provider** | Manual（自写）+ LiDAR（ROS2 `/scan`→矢量化） | 去耦底图接口 | **自建** |
 | 2D LiDAR 取墙线 | 现有 **ROS2 driver** + split-and-merge | 扫描→墙线段 | 复用 driver + 小算法 |
-| IFC 生成 | **IfcOpenShell** `IfcOpenShell/IfcOpenShell` | 写 IfcWall/Slab/Door/Window | 复用 |
+| Revit 互操作 | **pyRevit** + Revit API (`Autodesk.Revit.DB`) | 在 Revit 内直接 `Wall.Create`/`Floor.Create`/`NewFamilyInstance` 生成原生可编辑图元（取代 IFC 交换） | 复用 |
 
 ### 5.2 按阶段安装清单（提前准备依赖用）
 - **第 1 周必备**：`COLMAP`(二进制)、`nerfstudio`、`gsplat`、`open3d`、`ifcopenshell`、`mcp`(Python SDK)
@@ -187,7 +188,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 ## 8. 第 1 周可执行任务清单（P0 启动）
 1. 建 conda 环境，装：`gsplat`、`nerfstudio`、`open3d`、`ifcopenshell`、`mcp`(Python SDK)、COLMAP(二进制)。
-2. IfcOpenShell 最小脚本：生成带 `IfcOpeningElement` + `IfcDoor` 的 `IfcWall` 和一块 `IfcSlab`，存 `.ifc`，在 Revit 打开并拖动编辑验证。
+2. pyRevit 最小脚本（`scripts/revit_wall_door.py`）：在 Revit 内 `Wall.Create` 生成 5×2.8m 墙 + 在中点 host 一樘门；验证 pyRevit↔Revit 互操作（原生图元、可直接编辑）。
 3. 定义 `FloorPlan` 契约（见附录）+ `ManualProvider`（JSON 输入长宽 + 门位）。
 4. 选一间测试房间，手机录 2 分钟环绕视频。
 5. （第 2 周）`ns-process-data images` → COLMAP → `ns-train splatfacto` 训 3DGS；gsplat 渲一张 RGB+ED 验证。
@@ -210,7 +211,9 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 ### 10.1 B 类复杂构件 mesh 回灌
 
-**流程**：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → `IfcBuildingElementProxy`。
+> ⚠️ **已弃用 IFC 路线**：下方原 IfcBuildingElementProxy / IfcShellBasedSurfaceModel 描述为历史记录。pyRevit 架构下，B 类 mesh 用 `doc.Create.NewDirectShape(...)`（Revit DirectShape 承载任意 mesh，原生可见但不可参数化编辑）；A 类用 `Wall.Create`/`Floor.Create` 等原生 API。
+
+**流程**：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → Revit **DirectShape**（via pyRevit）。
 
 **IFC 版本与 mesh 表达策略（关键）**：项目标准为 **IFC4**（见 §2.3），B 类 mesh 直接用原生 `IfcTriangulatedFaceSet` + `IfcCartesianPointList3D`，代码简洁、文件紧凑。
 
@@ -248,9 +251,9 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 ---
 
 ## 11. 叙事与卖点（答辩用）
-"**一部手机 + 一个 50 元 2D LiDAR + 一个 3D 打印支架**：底图锁定房间绝对尺寸与墙位，3DGS 提供丰富可探索的中间表示，VLM 借 MCP 在其中自由巡视并分割结构构件，IfcOpenShell 产出可在 Revit 编辑的 BIM。"
+"**一部手机 + 一个 50 元 2D LiDAR + 一个 3D 打印支架**：底图锁定房间绝对尺寸与墙位，3DGS 提供丰富可探索的中间表示，VLM 借 MCP 在其中自由巡视并分割结构构件，pyRevit 直接在 Revit 中生成可编辑的原生 BIM 图元。"
 
-- **四领域交叉**：机器人/SLAM 思想 + 神经渲染(3DGS) + 多模态大模型(VLM/MCP) + BIM(IfcOpenShell) + 几何处理。
+- **四领域交叉**：机器人/SLAM 思想 + 神经渲染(3DGS) + 多模态大模型(VLM/MCP) + BIM(pyRevit/Revit API) + 几何处理。
 - **可复现、低成本**：无专业扫描仪，无施工级设备。
 - **架构优雅**：去耦的 FloorPlan Provider 让系统适配几乎所有既有建筑。
 - **务实分工**：VLM 做它擅长的（语义判定），几何交给确定性求解器，避免"让 LLM 算坐标"的陷阱。
@@ -358,7 +361,7 @@ class FloorPlanProvider:
 | `get_depth(pose)` | gsplat `render_mode="ED"` | 几何查询 |
 | `select_cluster(mask_2d)` | SAGA/Gaussian Grouping | 2D 圈选→3D 高斯 |
 | `list_elements()` | 内部状态机 | 已建模元素 |
-| `add_wall / add_slab / add_door / add_window` | Open3D 拟合 + IfcOpenShell | 写入 BIM |
+| `add_wall / add_slab / add_door / add_window` | Open3D 拟合 + pyRevit/Revit API | 写入 Revit 原生图元 |
 | `validate(element_id)` | gsplat 重渲染叠合 | VLM 回看确认 |
 | `report_diff()` | 3DGS 墙 vs FloorPlan | 差异报告 |
 
