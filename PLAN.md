@@ -74,24 +74,27 @@
 └──────────────────────────────────────────────────────────────────────┘
         │
         ▼
-┌────────────────── VLM 决策循环 (via MCP) ────────────────────────────┐
-│  工具: render_from_pose[gsplat] · get_depth · select_cluster[SAGA]   │
-│        project_mask · add_wall/slab/door/window · validate · report  │
-│  VLM(Claude/GPT-4o): 看渲染图 → 判定"这是墙/门洞/到此为止" → 选区    │
-│  原则: VLM 只下判定, 不算坐标; 几何数值一律由求解器产出               │
+┌────────────────── VLM 决策循环 (via 双 MCP 服务器) ────────────────────┐
+│  3DGS 侧 MCP: render_from_pose[gsplat] · get_depth · select_cluster  │
+│               [SAGA] · project_mask · validate · report               │
+│  Revit 侧 MCP: place_family · execute_revit_code · get_revit_view    │
+│               · list_families · list_levels · get_current_view_elements│
+│  VLM(Claude/GPT-4o): 看 3DGS 渲染图→判定"这是墙/门洞"→调 Revit MCP  │
+│  原则: VLM 只下判定; 几何数值由求解器产出; Revit MCP 执行原生图元创建  │
 └──────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌────────────────── 几何规范化 + 配准 ─────────────────────────────────┐
 │  配准: 3DGS(相对尺度) ↔ FloorPlan(米制) → 解 s,θ,t                   │
-│        (LiDAR 情形用 gsplat 旋转LiDAR光栅仿真扫描做原理性配准)        │
-│  拟合: Open3D RANSAC 平面 + 重力对齐(IMU) + 拉伸 → SweptSolid         │
-│        (PGSR 平面化可作为墙拟合加成)                                  │
+│  拟合: Open3D RANSAC 平面 + 重力对齐(IMU) + 拉伸 → 墙参数化          │
 │  差异: 3DGS 墙 vs 底图墙线 → 仅报告                                   │
 └──────────────────────────────────────────────────────────────────────┘
         │
         ▼
-┌────────────────── IfcOpenShell → Revit 可编辑 IFC ───────────────────┐
+┌────────────────── Revit MCP 服务器 → Revit 原生图元 ─────────────────┐
+│  MCP Server for Revit (git 子模块, pyRevit Routes + FastMCP)         │
+│    → Wall.Create / NewFamilyInstance / execute_revit_code             │
+│    → Revit 中原生可编辑图元（墙/板/门/窗/柱）                         │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -139,14 +142,14 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | （加分）开放词表查询 | **OpenGaussian** `yanmin-wu/OpenGaussian` (NeurIPS'24) / **LangSplat V2** `minghanqin/LangSplat` | 文本→高斯 | 可选 |
 | 曲面/Mesh（楼板/复杂面备用） | **PGSR** `zju3dv/PGSR`（平面基，适合墙）/ **2DGS** `hbb1/2d-gaussian-splatting`（TSDF）/ **SuGaR** `Anttwo/SuGaR` | 需要网格时 | 选择性 |
 | 几何处理 | **Open3D** `isl-org/Open3D` | RANSAC 平面、2D ICP 配准 | 复用 |
-| **VLM 工具服务器** | **MCP Python SDK** `modelcontextprotocol/python-sdk` | 暴露 render/pick/segment/add_wall 给 VLM | **自建（薄壳）** |
+| **VLM 工具服务器（3DGS 侧）** | **MCP Python SDK** `modelcontextprotocol/python-sdk` | 暴露 render_from_pose/pick/segment 等 3DGS 工具给 VLM | **自建（薄壳）** |
 | VLM | Claude / GPT-4o / Gemini | 推理循环 | API |
+| **Revit MCP 服务器** | **MCP Server for Revit** `mcp-servers-for-revit/mcp-server-for-revit-python`（git 子模块） | pyRevit Routes + FastMCP 桥接 Revit API；已实现 19 个工具（`place_family`/`execute_revit_code`/`get_revit_view`/`list_families` 等）；可添加自定义 BIM-Recon 扩展 | 复用 |
 | **水平底图 Provider** | Manual（自写）+ LiDAR（ROS2 `/scan`→矢量化） | 去耦底图接口 | **自建** |
 | 2D LiDAR 取墙线 | 现有 **ROS2 driver** + split-and-merge | 扫描→墙线段 | 复用 driver + 小算法 |
-| Revit 互操作 | **pyRevit** + Revit API (`Autodesk.Revit.DB`) | 在 Revit 内直接 `Wall.Create`/`Floor.Create`/`NewFamilyInstance` 生成原生可编辑图元（取代 IFC 交换） | 复用 |
 
 ### 5.2 按阶段安装清单（提前准备依赖用）
-- **第 1 周必备**：`COLMAP`(二进制)、`nerfstudio`、`gsplat`、`open3d`、`ifcopenshell`、`mcp`(Python SDK)
+- **第 1 周必备**：`COLMAP`(二进制)、`nerfstudio`、`gsplat`、`open3d`、`mcp[cli]`、`httpx`、`uvicorn`（MCP Server for Revit 依赖）；`pyRevit`（Revit 侧，需安装到 Revit + 激活 Routes Server）
 - **第 5 周前**：`SAGA` 或 `Gaussian Grouping`（建议先 SAGA，交互调试方便）+ segment-anything 权重
 - **第 11 周前**：`Metric3D V2` 权重（深度正则）
 - **第 16 周前**：ROS2 LiDAR driver + `pip install "gsplat[lidar]"`
@@ -187,8 +190,8 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 ---
 
 ## 8. 第 1 周可执行任务清单（P0 启动）
-1. 建 conda 环境，装：`gsplat`、`nerfstudio`、`open3d`、`ifcopenshell`、`mcp`(Python SDK)、COLMAP(二进制)。
-2. pyRevit 最小脚本（`scripts/revit_wall_door.py`）：在 Revit 内 `Wall.Create` 生成 5×2.8m 墙 + 在中点 host 一樘门；验证 pyRevit↔Revit 互操作（原生图元、可直接编辑）。
+1. 建 conda 环境，装：`gsplat`、`nerfstudio`、`open3d`、`mcp[cli]`、`httpx`、`uvicorn`、COLMAP(二进制)；装 `pyRevit` 到 Revit 并激活 Routes Server。
+2. MCP Server for Revit 验证：启动 Revit + pyRevit Routes，运行 `main.py --combined`，通过 MCP 工具 `execute_revit_code` 发送 `Wall.Create` 代码生成 5×2.8m 墙 + host 门；或使用 `scripts/revit_wall_door.py` 作为备选（直接在 Revit 内运行）。
 3. 定义 `FloorPlan` 契约（见附录）+ `ManualProvider`（JSON 输入长宽 + 门位）。
 4. 选一间测试房间，手机录 2 分钟环绕视频。
 5. （第 2 周）`ns-process-data images` → COLMAP → `ns-train splatfacto` 训 3DGS；gsplat 渲一张 RGB+ED 验证。
@@ -297,6 +300,49 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 **修复**（Revit 侧，一次性配置）：导入自定义映射表 `Docs/importIFCClassMapping.txt`（含 `IfcOpeningElement → 常规模型` 及全部类别）。
 
 **代码侧对应改动**（依据该规则表）：`IfcSlab` 加 `predefined_type="FLOOR"`，使其映射为 Revit "楼板"而非"常规模型"（无 type 的 IfcSlab 默认→常规模型）。`IfcWall→墙`、`IfcDoor→门` 无需 type 即正确映射。
+
+### 12.3 [2026-06-27] MCP Server for Revit —— VLM↔Revit 互操作的现成基础设施
+
+**发现**：`mcp-servers-for-revit/mcp-server-for-revit-python`（已作为 git 子模块引入）是一个 pyRevit-based 的 MCP 服务器，架构恰好是我们 PLAN.md §1 描述的 VLM↔MCP↔Revit 桥梁：
+
+```
+VLM (Claude/GPT-4o/Gemini)
+  |  MCP Protocol (stdio / HTTP)
+  v
+main.py (MCP Server, FastMCP, port 8000)
+  |  HTTP requests (localhost:48884)
+  v
+pyRevit Routes (REST API, 运行在 Revit 进程内)
+  |  Revit API calls
+  v
+Revit Application
+```
+
+**已实现的工具（直接可用于 BIM-Recon）**：
+- `place_family`：在指定位置放置族实例（门/窗/家具），支持 level、rotation、properties
+- `create_point_based_element`：创建点式构件（门、窗、家具）
+- `list_families` / `list_family_categories`：发现可用族（VLM 查询用）
+- `list_levels`：获取所有标高及标高值
+- `get_revit_view` / `list_revit_views`：**将视图导出为图片** —— VLM 反馈回路的关键
+- `execute_revit_code`：**在 Revit 内执行任意 IronPython 代码** —— 万能后门，未实现专用工具的操作可通过此途径执行（如 `Wall.Create`、`Floor.Create`）
+- `get_current_view_elements`：获取当前视图中所有构件
+- `get_revit_model_info`：模型全面信息（构件统计、标高、房间、链接模型）
+- `launch_revit` / `open_document` / `save_document`：Revit 生命周期管理
+
+**待实现的工具（BIM-Recon 核心需求）**：
+- `create_line_based_element` —— 墙体创建（**最需要**）
+- `create_surface_based_element` —— 楼板创建
+- `delete_elements` / `modify_element` —— 构件管理
+
+**对 BIM-Recon 的具体益处**：
+1. **VLM↔Revit 桥梁已建成**：无需从零构建 MCP↔Revit 连接，直接复用。
+2. **`execute_revit_code` = 万能后门**：即使 `create_line_based_element` 未实现，也可通过代码执行 `Wall.Create()`，MVP 立即可用。
+3. **`get_revit_view` 导出视图图片**：VLM 可以"看到" Revit 当前状态，形成完整的"创建→查看→迭代"反馈闭环。
+4. **`place_family` 已可用**：门/窗放置可直接使用（配合 `list_families` 发现可用族）。
+5. **模块化扩展架构**：可添加自定义 `revit_mcp/bim_recon.py` 路由模块 + `tools/bim_recon_tools.py` 工具模块，实现从 FloorPlan 契约到墙/板批量创建。
+6. **`list_families` + `list_family_categories`**：VLM 可自动发现可用的门/窗族，无需硬编码。
+
+**结论**：该项目是 BIM-Recon 的核心基础设施——应将其作为 Revit 互操作层（取代纯 pyRevit 脚本方案），在此基础上扩展 BIM-Recon 专用工具。`scripts/revit_wall_door.py` 作为参考/备选保留。
 
 ---
 
