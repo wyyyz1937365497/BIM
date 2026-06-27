@@ -35,6 +35,7 @@ import ifcopenshell.api.root  # noqa: F401
 import ifcopenshell.api.geometry  # noqa: F401
 import ifcopenshell.api.feature  # noqa: F401
 import ifcopenshell.api.profile  # noqa: F401
+import ifcopenshell.api.owner  # noqa: F401
 
 
 def _translate(x: float, y: float, z: float) -> np.ndarray:
@@ -45,7 +46,24 @@ def _translate(x: float, y: float, z: float) -> np.ndarray:
 
 
 def build_demo_ifc() -> ifcopenshell.file:
-    model = ifcopenshell.api.project.create_file()
+    # IFC2X3 is the project standard: Revit's direct-open importer supports
+    # IFC2X3 natively (IFC4 can only be Linked, not opened/edited). See the
+    # Revit QA finding recorded in PLAN.md.
+    model = ifcopenshell.api.project.create_file(version="IFC2X3")
+
+    # IFC2X3 does not auto-create an OwnerHistory (the IFC4 default path does),
+    # so set one up explicitly before root.create_entity needs it: the api's
+    # get_user requires an IfcPersonAndOrganization AND an IfcApplication.
+    person = ifcopenshell.api.owner.add_person(
+        model, identification="bim-recon", family_name="Recon", given_name="BIM")
+    org = ifcopenshell.api.owner.add_organisation(
+        model, identification="bim-recon", name="BIM-Recon")
+    ifcopenshell.api.owner.add_person_and_organisation(
+        model, person=person, organisation=org)
+    ifcopenshell.api.owner.add_application(
+        model, application_developer=org,
+        application_full_name="BIM-Recon", application_identifier="bim-recon")
+    ifcopenshell.api.owner.create_owner_history(model)
 
     # --- project must exist before units can be assigned -------------------
     project = ifcopenshell.api.root.create_entity(

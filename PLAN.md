@@ -44,6 +44,7 @@
 | 手机 IMU 用法 | MVP 仅作**重力对齐**，位姿交给 COLMAP |
 | 是否自研 Android App | **不做**；手机自带录像即可（位姿不依赖图像匹配） |
 | GPU | 两张 2080Ti 22G（单房间 3DGS 训练充裕） |
+| **IFC 版本标准** | **IFC2X3**。Revit 2026 直接打开（可编辑）只认 IFC2X3；IFC4 只能"链接"且不可编辑（P0 Revit QA 已验证）。A 类用 SweptSolid；B 类 mesh 用 `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`（详见 §10.1） |
 
 ---
 
@@ -208,8 +209,32 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 ## 10. 未来工作（MVP 之外）
 
 ### 10.1 B 类复杂构件 mesh 回灌
-区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → `IfcBuildingElementProxy`。
-- 注意：回灌的 mesh 在 Revit 是"哑代理几何"，不可参数化编辑（A 类才是真 BIM）。
+
+**流程**：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → `IfcBuildingElementProxy`。
+
+**IFC 版本与 mesh 表达策略（关键）**：项目标准为 IFC2X3（见 §2.3），B 类 mesh 在 IFC2X3 下用"哑代理"路线，符合 MVP 定位。
+
+| 维度 | IFC2X3（MVP 采用） | IFC4（未来扩展） |
+|---|---|---|
+| 三角网格实体 | ❌ 无 IfcTriangulatedFaceSet | ✅ 原生（含顶点索引/法线/颜色） |
+| 替代表达 | `IfcShellBasedSurfaceModel`+`IfcFaceSurface`+`IfcPolyLoop`+`IfcCartesianPoint`（三层嵌套） | 一行 `IfcTriangulatedFaceSet`（配合 `IfcCartesianPointList3D` 批量存顶点） |
+| 顶点存储 | 每点单独 IfcCartesianPoint，文件臃肿 | `IfcCartesianPointList3D` 批量，紧凑 |
+| Revit 行为 | 直接打开可见、可整体移动；**不可参数化编辑**（哑代理） | 只能链接，不能打开转换；几何保真度更高但失去 A 类可编辑性 |
+| 代码复杂度 | 高（手动三层嵌套） | 低（一行） |
+
+**落地建议（分阶段）**：
+- **MVP（P0–P2）**：不涉及 mesh；A 类用 SweptSolid（墙/板/柱/门窗可编辑 ✅）。
+- **P4 难例探索**：IFC2X3 + `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`，Revit 中为哑代理（可见不可编辑）。
+- **未来扩展（mesh 密度爆炸时）**：混合导出 —— A 类留 IFC2X3 主文件（可编辑），B 类 mesh **单独导 IFC4 文件做链接补充**（鱼与熊掌兼得）。
+
+**关键技巧**（无论版本）：
+- 回灌前用 `trimesh.simplify_quadric_decimation` 把面数压到 **5000 以下**，否则 IFC2X3 文件膨胀/解析卡死。
+- 容器用 `IfcBuildingElementProxy`（Revit 归类"常规模型"），**不要**用 `IfcFurnishingElement`（可能被过滤）。
+- 即便是哑代理，仍通过 `IfcRelDefinesByProperties` 挂 Pset（材质/来源/置信度）供查询。
+- 导出用 `.ifczip`（mesh 类 IFC 可压缩 60%+）。
+- **BlenderBIM/Bonsai 预览验证** IFC2X3 mesh 表达是否正确，比反复开 Revit 快。
+
+> 澄清：IFC2X3 并非"不支持 mesh"，而是"支持得不好看"——几何体系（CSG/SweptSolid/Brep/ShellBasedSurfaceModel）能承载任意三角网格，只是无 IFC4 的专用 `IfcTriangulatedFaceSet`，导致代码冗长、文件臃肿。对大创级应用（B 类本就是加分项/未来工作），哑代理路线完全符合 §2.2"不追求毫米级施工精度"的定位。
 
 ### 10.2 多房间 / 整层拼接
 通过多点底图 + 3DGS 分区重建，软件层拼接（MVP 仅留接口占位）。
