@@ -285,6 +285,16 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 - IFC 文件本身经多轮验证（schema/header/guid/placement/boolean/round-trip 全绿）是正确的；3D 可见性属 Revit 导入侧 Phase 设置问题，非文件缺陷。
 - 本条记录避免重复踩坑。
 
+### 12.2 [2026-06-27] Revit 默认 IFC 映射表缺 IfcOpeningElement → 门洞不显示
+
+**现象**：IFC 文件本身正确（IfcOpeningElement + IfcRelVoidsElement 完整、布尔已验证），但导入 Revit 后门洞不显示。
+
+**根因**：Revit 默认 IFC 类映射表（`File → Import/Export Settings → IFC Options`）缺 `IfcOpeningElement` 条目 → 导入时该实体被丢弃 → `IfcRelVoidsElement` 无法定位 opening → 墙体未被挖空。
+
+**修复**（Revit 侧，一次性配置）：导入自定义映射表 `Docs/importIFCClassMapping.txt`（含 `IfcOpeningElement → 常规模型` 及全部类别）。
+
+**代码侧对应改动**（依据该规则表）：`IfcSlab` 加 `predefined_type="FLOOR"`，使其映射为 Revit "楼板"而非"常规模型"（无 type 的 IfcSlab 默认→常规模型）。`IfcWall→墙`、`IfcDoor→门` 无需 type 即正确映射。
+
 ---
 
 ## 附录 A：FloorPlan 契约（草案）

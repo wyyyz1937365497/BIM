@@ -131,7 +131,10 @@ def build_demo_ifc() -> ifcopenshell.file:
     ifcopenshell.api.feature.add_filling(model, opening=opening, element=door)
 
     # --- slab (5 x 4 m floor, 0.2 m thick) --------------------------------
-    slab = ifcopenshell.api.root.create_entity(model, ifc_class="IfcSlab", name="S1")
+    # predefined_type=FLOOR so Revit's IFC class mapping (Docs/importIFCClassMapping.txt
+    # line: IfcSlab FLOOR -> 楼板) categorises it as a Floor, not Generic Model.
+    slab = ifcopenshell.api.root.create_entity(
+        model, ifc_class="IfcSlab", name="S1", predefined_type="FLOOR")
     ifcopenshell.api.geometry.edit_object_placement(model, product=slab)
     slab_rep = ifcopenshell.api.geometry.add_slab_representation(
         model, context=body, depth=0.2,
