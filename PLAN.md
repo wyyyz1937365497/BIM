@@ -44,7 +44,7 @@
 | 手机 IMU 用法 | MVP 仅作**重力对齐**，位姿交给 COLMAP |
 | 是否自研 Android App | **不做**；手机自带录像即可（位姿不依赖图像匹配） |
 | GPU | 两张 2080Ti 22G（单房间 3DGS 训练充裕） |
-| **IFC 版本标准** | **IFC2X3**。Revit 2026 直接打开（可编辑）只认 IFC2X3；IFC4 只能"链接"且不可编辑（P0 Revit QA 已验证）。A 类用 SweptSolid；B 类 mesh 用 `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`（详见 §10.1） |
+| **IFC 版本标准** | **IFC2X3**（AEC 业界事实交换标准，工具兼容性最广）。**注意**：3D 视图不可见的根因是 Revit 的孤立点/地理参考包围盒 bug 或新版 IFC 处理器缺陷，**与格式版本无关**（见 §12 失败探索记录）；选 IFC2X3 是为兼容性，**非**为修 3D bug。A 类用 SweptSolid；B 类 mesh 用 `IfcBuildingElementProxy` + `IfcShellBasedSurfaceModel`（详见 §10.1） |
 
 ---
 
@@ -254,6 +254,32 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 - **可复现、低成本**：无专业扫描仪，无施工级设备。
 - **架构优雅**：去耦的 FloorPlan Provider 让系统适配几乎所有既有建筑。
 - **务实分工**：VLM 做它擅长的（语义判定），几何交给确定性求解器，避免"让 LLM 算坐标"的陷阱。
+
+---
+
+## 12. 失败探索记录（Lessons / Failed Explorations）
+
+### 12.1 [2026-06-27] IFC4→IFC2X3 切换 ≠ 3D 不可见的修复（误诊）
+
+**现象**：Revit 2026 打开 `demo.ifc`，三维视图不可见，平面视图可见可拖动；"链接 IFC"可见但不可编辑。
+
+**当时的（错误）判断**：归因为"Revit 不支持 IFC4 直接打开"，遂把种子脚本切到 IFC2X3（commit `709482e`）。
+
+**实际根因**（经诊断纠正）：3D 不可见是 Revit 的两类已知 bug，**与 IFC 版本无关**：
+- **Bug ①** 导出端写入远离原点的孤立点（地理参考/IfcSite 全局坐标），如 `IFCCARTESIANPOINT((0.,0.24,1.79769313486232E+305))`，把三维视图包围盒撑爆，几何体看似"消失"；平面视图受视图范围约束仍可见。
+- **Bug ②** 新版 IFC 处理器三维渲染缺陷。
+
+**诊断证据**（`scripts/diag_coords.py`，对 IfcOpenShell 生成的 IFC2X3 `demo.ifc`）：
+- 最大坐标 = 5000 mm（= 5 m 墙长，房间尺度），**无** `1.79e+305` 孤立点；
+- IfcSite `RefLatitude/Longitude/Elevation` 均 None（无地理参考）；
+- IFC2X3 schema 不含 `IfcMapConversion` / `IfcProjectedCoordinateSystem`（结构上不可能有）；
+- 仅 1 个科学计数法 token `1.0000000000000001E-05`（无害 epsilon）。
+→ **文件本身干净，3D 不可见不是本文件造成的**。
+
+**结论与遗留**：
+- IFC2X3 作为交换标准保留（兼容性优势），但它**不是** 3D bug 的修复手段——换格式不解决问题。
+- 后续修复方向在 Revit 侧：`Revit.ini [ImportIFC] LinkProcessor=Legacy`；"链接→绑定→解组"获取可编辑原生图元；或评估 pyRevit 转 RVT / Revit API 直生（方案 B/C）。
+- 由用户继续研究其他可能性；本条记录避免重复踩坑。
 
 ---
 
