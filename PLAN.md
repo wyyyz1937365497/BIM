@@ -189,7 +189,115 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 ---
 
-## 8. 第 1 周可执行任务清单（P0 启动）
+## 8. P0 已完成（2026-06-27）
+
+**P0 成果**：
+- ✅ FloorPlan 契约 + ManualProvider（6/6 测试通过）
+- ✅ Revit MCP 服务器集成（C#/TypeScript，26 工具全实现）
+- ✅ Revit MCP 验证：say_hello 成功 + 创建 3m×200mm×3m 墙 + 750×2000mm 门（原生可编辑图元）
+
+**P0 证明**：VLM→MCP→Revit 链路已打通，可直接在 Revit 中创建/修改原生 BIM 图元。
+
+---
+
+## 9. P1 实施计划（3DGS 重建 + VLM 集成）
+
+### 目标
+构建 3DGS 场景 → VLM 巡视分割 → Revit 原生图元的完整闭环。
+
+### 任务清单
+1. **安装依赖**：COLMAP、nerfstudio、gsplat、open3d、mcp[cli]
+2. **3DGS 训练流水线**：手机视频 → COLMAP SfM → nerfstudio splatfacto（深度正则）
+3. **语义高斯**：SAGA 或 Gaussian Grouping（SAM/CLIP 特征钉到高斯）
+4. **MCP 服务器（3DGS 侧）**：
+   - 
+ender_from_pose：gsplat 渲染 RGB+深度
+   - get_depth：深度图查询
+   - select_cluster：SAGA 语义拾取
+   - project_mask：2D mask→3D 高斯
+5. **VLM 集成**：Claude/GPT-4o 通过 MCP 巡视 3DGS → 判定墙/门洞 → 调用 Revit MCP 创建图元
+6. **端到端测试**：单房间视频 → 3DGS → VLM 分割 → Revit 墙体
+
+### 技术栈
+- COLMAP（SfM 位姿）
+- nerfstudio / gsplat（3DGS 训练 + 渲染）
+- SAGA / Gaussian Grouping（语义高斯）
+- MCP Python SDK（3DGS 侧 MCP 服务器）
+- Claude / GPT-4o（VLM 推理）
+
+### 验收标准
+- 单房间视频 → 3DGS 场景（PSNR > 25dB）
+- VLM 通过 MCP 巡视场景，识别墙体/门洞（准确率 > 80%）
+- Revit 中生成对应原生图元（墙/门），可编辑
+
+---
+
+## 9.1 P1 已完成模块（2026-06-29）
+
+### 模块清单
+| 文件 | 职责 | 验证状态 |
+|---|---|---|
+| `bim_recon/gs_scene.py` | 加载 nerfstudio 导出的 splat.ply，提供 gsplat 渲染（RGB + 期望深度）| 9/9 pytest 通过 |
+| `bim_recon/mcp_gs.py` | 3DGS MCP server（5 工具：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster）| demo 场景全工具通过 |
+| `bim_recon/colmap_runner.py` | 包装 `ns-process-data images`，输出 transforms.json + images/ | dry-run 命令构造正确 |
+| `scripts/train_gs.py` | 包装 `ns-train splatfacto`，含室内深度正则 | dry-run 命令构造正确 |
+| `scripts/run_mcp_gs.bat` | MCP server 启动器（vcvars64 + conda activate + python -m）| 已写入 opencode.json |
+| `tests/test_gs_scene.py` | GSScene 单元测试（相机工具、合成渲染、PLY 往返、mask 选择）| 9/9 通过 |
+| `scripts/probe_gsplat.py` | gsplat rasterization API 探查 | 验证 RGB+ED 模式 |
+| `scripts/test_mcp_gs.py` | MCP 工具集成测试（直接调函数，不走 stdio）| 5/5 工具 + select_cluster 通过 |
+
+### 关键技术决策
+
+1. **nerfstudio 训练 + gsplat 渲染分层**：训练用 nerfstudio splatfacto（工程成熟、自带 COLMAP pipeline），渲染用 gsplat 直调（轻量、MCP server 不依赖 nerfstudio 运行时）。
+
+2. **gsplat 1.4.0 render_mode**：用 `RGB+ED`（expected depth = sum(w_i*z_i) / sum(w_i)）得到真实度量深度；4 通道输出 = RGB(3) + depth(1)，第二返回值是 alpha 而非 depth。
+
+3. **相机约定**：OpenCV / COLMAP（+x 右、+y 下、+z 前），与 nerfstudio / COLMAP 一致。`CameraPose.to_viewmat()` 返回 world-to-camera 4x4 矩阵。
+
+4. **PLY 格式**：nerfstudio 导出的 SH DC 模式。加载时需 sigmoid(opacity_logit)、exp(log_scale)、C0*SH_DC+0.5（C0 = 0.28209479177387814）。
+
+5. **MSVC JIT 编译**：gsplat 1.4.0 在 Windows 上首次使用需 JIT 编译 CUDA 后端，要求 `cl.exe` 在 PATH。通过 vcvars64.bat 解决（已内置到 `scripts/run_mcp_gs.bat`）。
+
+### MCP 工具语义
+
+| 工具 | 入参 | 返回 | VLM 用途 |
+|---|---|---|---|
+| `get_scene_info` | 无 | JSON: 高斯数、AABB、默认相机 | 了解场景规模 |
+| `list_cameras` | 无 | JSON: 训练相机列表 | 选择已有视角 |
+| `render_from_pose` | eye, target, up, fov, W, H | PNG (HxWx3) | 看一眼场景 |
+| `get_depth_grid` | eye, target, stride, W, H | JSON: 下采样深度网格 + 统计 | 推断墙距、房间尺寸 |
+| `select_cluster` | eye, target, bbox_xyxy, W, H | JSON: 选中高斯数 + centroid + AABB | 2D box 到 3D 高斯桥接 |
+
+### 数据流
+
+    手机视频
+      -> ffmpeg 抽帧
+      -> colmap_runner.py (ns-process-data images)
+      -> transforms.json
+      -> train_gs.py (ns-train splatfacto)
+      -> nerfstudio checkpoint
+      -> ns-export gaussian-splat
+      -> splat.ply
+      -> mcp_gs.py --ply splat.ply
+      -> VLM 巡视 (render_from_pose + get_depth_grid)
+      -> select_cluster (2D bbox -> 3D 高斯子集)
+      -> 墙拟合器 (待实现)
+      -> revit MCP create_line_based_element
+      -> Revit 原生墙
+
+### 用户下一步（需要真实数据）
+
+1. 拍摄测试房间视频（手持手机，缓慢绕场一周，约 1-2 分钟）
+2. `ffmpeg -i video.mp4 -q:v 2 images/%04d.jpg` 抽帧
+3. `python -m bim_recon.colmap_runner --images images/ --output data/room1`
+4. `python scripts/train_gs.py --data data/room1 --output output/room1`
+5. `ns-export gaussian-splat --load-config output/room1/config.yml --output-dir output/room1/splat`
+6. 把 opencode.json 里 `bim-recon-gs` 的 `--demo` 换成 `--ply output/room1/splat/splat.ply --cameras data/room1/transforms.json`
+7. 重启 opencode，VLM 即可巡视真实房间
+
+---
+
+## 10. 第 1 周可执行任务清单（P0 启动）
 1. 建 conda 环境，装：`gsplat`、`nerfstudio`、`open3d`、`mcp[cli]`、`httpx`、`uvicorn`、COLMAP(二进制)；装 `pyRevit` 到 Revit 并激活 Routes Server。
 2. mcp-servers-for-revit 验证：启动 Revit + pyRevit Routes，运行 `main.py --combined`，通过 MCP 工具 `execute_revit_code` 发送 `Wall.Create` 代码生成 5×2.8m 墙 + host 门；或使用 `scripts/revit_wall_door.py` 作为备选（直接在 Revit 内运行）。
 3. 定义 `FloorPlan` 契约（见附录）+ `ManualProvider`（JSON 输入长宽 + 门位）。
