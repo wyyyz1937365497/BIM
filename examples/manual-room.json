@@ -1,0 +1,28 @@
+{
+  "rectangle": {
+    "width": 5.0,
+    "depth": 4.0,
+    "wall_type": "bearing",
+    "thickness": 0.24
+  },
+  "openings": [
+    {
+      "wall_index": 0,
+      "offset": 1.1,
+      "width": 0.9,
+      "kind": "door"
+    },
+    {
+      "wall_index": 2,
+      "offset": 1.4,
+      "width": 1.2,
+      "kind": "window",
+      "sill_height": 0.9
+    }
+  ],
+  "meta": {
+    "scale_known": true,
+    "orientation_known": false,
+    "gravity_axis": [0.0, 0.0, 1.0]
+  }
+}
