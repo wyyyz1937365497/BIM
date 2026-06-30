@@ -9,16 +9,20 @@ used by gsplat (``viewmats`` is world-to-camera).
 """
 from __future__ import annotations
 
+import json
 import math
 import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 from gsplat import rasterization
+
+if TYPE_CHECKING:
+    from bim_recon.semantics import SemanticQuerier
 
 # SH C0 constant — converts DC coefficient to linear RGB.
 SH_C0 = 0.28209479177387814
@@ -156,6 +160,9 @@ class GSScene:
 
     The PLY format follows nerfstudio's ``ExportGaussianSplat`` layout
     (SH DC coefficients, logit opacity, log scales, (w,x,y,z) quaternions).
+
+    Optionally carries per-Gaussian semantic features (SceneSplat ``feat.pt``)
+    and a :class:`SemanticQuerier` for text→Gaussian queries.
     """
 
     means: torch.Tensor       # (N, 3) float32 on device
@@ -164,18 +171,85 @@ class GSScene:
     opacities: torch.Tensor   # (N,) float32 in [0, 1]
     colors: torch.Tensor      # (N, 3) float32 linear RGB in [0, 1]
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
+    # Optional semantic features from SceneSplat
+    feat: Optional[torch.Tensor] = None           # (N, 768) float32
+    semantic_querier: Optional["SemanticQuerier"] = None
 
     # ---- construction -------------------------------------------------------
 
     @classmethod
-    def from_ply(cls, ply_path: str | Path, device: Optional[torch.device] = None) -> "GSScene":
-        """Load a nerfstudio-exported splat PLY file."""
+    def from_ply(
+        cls,
+        ply_path: str | Path,
+        device: Optional[torch.device] = None,
+        feat_path: Optional[str | Path] = None,
+        text_emb_path: Optional[str | Path] = None,
+        class_names_path: Optional[str | Path] = None,
+    ) -> "GSScene":
+        """Load a nerfstudio-exported splat PLY file.
+
+        If *feat_path* is given, loads SceneSplat per-Gaussian features.
+        If *text_emb_path* and *class_names_path* are also given, constructs
+        a :class:`SemanticQuerier` for text→Gaussian queries.
+        """
         path = Path(ply_path)
         if not path.exists():
             raise FileNotFoundError(f"PLY file not found: {path}")
         device = device or torch.device("cuda")
         data = _parse_ply_binary(path)
-        return cls._from_parsed(data, device)
+        scene = cls._from_parsed(data, device)
+        if feat_path:
+            scene._load_semantics(feat_path, text_emb_path, class_names_path)
+        return scene
+
+    @classmethod
+    def from_npy(
+        cls,
+        data_dir: str | Path,
+        device: Optional[torch.device] = None,
+        feat_path: Optional[str | Path] = None,
+        text_emb_path: Optional[str | Path] = None,
+        class_names_path: Optional[str | Path] = None,
+    ) -> "GSScene":
+        """Load from SceneSplat preprocessed ``.npy`` files.
+
+        Unlike :meth:`from_ply`, the ``.npy`` files are already in final
+        (post-activation) form: opacity is sigmoid'd, scale is exp'd,
+        color is uint8 [0,255]. No activation transforms are applied.
+
+        Expects ``coord.npy``, ``color.npy``, ``opacity.npy``,
+        ``scale.npy``, ``quat.npy`` in *data_dir*.
+        """
+        data_dir = Path(data_dir)
+        device = device or torch.device("cuda")
+
+        def _load(name: str) -> np.ndarray:
+            p = data_dir / f"{name}.npy"
+            if not p.exists():
+                raise FileNotFoundError(f"Missing required file: {p}")
+            return np.load(p)
+
+        means = _load("coord").astype(np.float32)
+        colors_uint8 = _load("color")
+        colors = (colors_uint8.astype(np.float32) / 255.0).clip(0, 1)
+        opacity = _load("opacity").astype(np.float32).reshape(-1)
+        scales = _load("scale").astype(np.float32)
+        quats = _load("quat").astype(np.float32)
+        # Defensively normalize quaternions
+        norms = np.linalg.norm(quats, axis=1, keepdims=True)
+        quats = quats / np.clip(norms, 1e-12, None)
+
+        scene = cls(
+            means=torch.from_numpy(means).to(device),
+            quats=torch.from_numpy(quats).to(device),
+            scales=torch.from_numpy(scales).to(device),
+            opacities=torch.from_numpy(opacity).to(device),
+            colors=torch.from_numpy(colors).to(device),
+            device=device,
+        )
+        if feat_path:
+            scene._load_semantics(feat_path, text_emb_path, class_names_path)
+        return scene
 
     @classmethod
     def from_synthetic(
@@ -253,6 +327,85 @@ class GSScene:
         mx = self.means.max(dim=0).values.cpu().numpy()
         return mn, mx
 
+    # ---- semantic features -------------------------------------------------
+
+    def _load_semantics(
+        self,
+        feat_path: str | Path,
+        text_emb_path: Optional[str | Path] = None,
+        class_names_path: Optional[str | Path] = None,
+    ) -> None:
+        """Load SceneSplat feat.pt and optionally construct a SemanticQuerier."""
+        from bim_recon.semantics import SemanticQuerier
+
+        raw = torch.load(feat_path, map_location="cpu", weights_only=False)
+        if not isinstance(raw, torch.Tensor):
+            raise TypeError(f"feat.pt must be a Tensor, got {type(raw).__name__}")
+        if raw.shape[0] != self.num_gaussians:
+            raise ValueError(
+                f"feat.pt has {raw.shape[0]} rows but the scene has "
+                f"{self.num_gaussians} Gaussians"
+            )
+        self.feat = raw.float().to(self.device)
+
+        if text_emb_path and class_names_path:
+            self.semantic_querier = SemanticQuerier(
+                feat_path=feat_path,
+                text_emb_path=text_emb_path,
+                class_names_path=class_names_path,
+                device=str(self.device),
+            )
+
+    def query_semantics(
+        self,
+        text: str,
+        mode: str = "dominant",
+        threshold: float = 0.52,
+        percent: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Query Gaussians matching a semantic text label.
+
+        ``mode`` selects the query strategy:
+
+        - ``"dominant"`` *(default)*: Gaussians whose argmax class is *text*.
+          Most reliable for SceneSplat features because cosine similarities
+          cluster tightly (~0.1 ± 0.015), making absolute thresholds fragile.
+        - ``"threshold"``: Gaussians whose sigmoid probability for *text*
+          exceeds *threshold*.
+        - ``"top_percent"``: The top *percent* % Gaussians by probability.
+
+        Returns a dict with keys from the SemanticQuerier query plus
+        ``centroid``, ``bounds_min``, ``bounds_max`` (world-space AABB
+        of matching Gaussians).
+
+        Raises RuntimeError if no semantic features are loaded.
+        """
+        if self.semantic_querier is None:
+            raise RuntimeError(
+                "No semantic features loaded. "
+                "Construct with feat_path/text_emb_path/class_names_path."
+            )
+        if mode == "dominant":
+            result = self.semantic_querier.query_dominant(text)
+        elif mode == "threshold":
+            result = self.semantic_querier.query(text, threshold)
+        elif mode == "top_percent":
+            result = self.semantic_querier.query_top_percent(text, percent)
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Use 'dominant', 'threshold', or 'top_percent'.")
+
+        indices = result["indices"]
+        if len(indices) > 0:
+            selected_means = self.means[torch.as_tensor(indices, device=self.device)].cpu().numpy()
+            result["centroid"] = selected_means.mean(axis=0).tolist()
+            result["bounds_min"] = selected_means.min(axis=0).tolist()
+            result["bounds_max"] = selected_means.max(axis=0).tolist()
+        else:
+            result["centroid"] = None
+            result["bounds_min"] = None
+            result["bounds_max"] = None
+        return result
+
     # ---- rendering ----------------------------------------------------------
 
     def render(
@@ -311,6 +464,8 @@ class GSScene:
         width: int,
         height: int,
         fov_degrees: float = 60.0,
+        text_filter: Optional[str] = None,
+        confidence_threshold: float = 0.5,
     ) -> np.ndarray:
         """Return the indices of Gaussians contributing to ``mask`` pixels.
 
@@ -319,6 +474,9 @@ class GSScene:
         meta, and return the indices of Gaussians whose projection overlaps any
         selected pixel. This is the bridge between a 2D VLM mask and the 3D
         Gaussians, enabling cluster selection.
+
+        If *text_filter* is given and semantic features are loaded, the result
+        is additionally filtered to Gaussians matching the semantic class.
         """
         if mask.shape != (height, width):
             raise ValueError(f"mask shape {mask.shape} != ({height}, {width})")
@@ -340,7 +498,19 @@ class GSScene:
         px = np.clip(px, 0, width - 1)
         py = np.clip(py, 0, height - 1)
         selected = mask[py, px]
-        return gaussian_ids[selected]
+        ids = gaussian_ids[selected]
+
+        # Optional semantic filtering — uses dominant (argmax) labels,
+        # the most reliable method for SceneSplat features.
+        if text_filter and self.semantic_querier is not None:
+            sem = self.semantic_querier.query_dominant(text_filter)
+            semantic_set = set(sem["indices"].tolist())
+            if len(semantic_set) > 0:
+                ids = ids[np.isin(ids, list(semantic_set))]
+            else:
+                ids = np.zeros(0, dtype=np.int64)
+
+        return ids
 
 
 # ---- PLY parsing -----------------------------------------------------------
