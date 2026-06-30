@@ -114,9 +114,11 @@ LiDAR 的本质作用只是"提供房间水平底图（绝对尺寸 + 墙位）"
 VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值。让 VLM 输出"墙平面：原点(1.234,2.567,0)、法向(…)"——数值不可靠、单位会乱、多次不一致。
 - **分工**：VLM 产出意图/约束（"这片是墙 X""到此角落为止"），确定性求解器产出几何数值。这是系统能稳定的前提。
 
-### 4.3 语义双通道
-- **离线蒸馏**：SAGA / Gaussian Grouping 把 SAM/CLIP 特征钉到每个高斯 → 系统自动可聚类，VLM 不必从零看整场。
-- **在线反投影**：VLM 看渲染图圈选 mask → 系统选中背后高斯（SAGA 已实现 2D-mask→3D-高斯关联，**无需自写**）。
+### 4.3 语义通道：SceneSplat 3DGS-native 语言特征
+- **离线编码**：SceneSplat（ICCV 2025 Oral）的 PT-v3 预训练编码器直接在 3DGS 参数上输出 per-Gaussian 768 维语言特征（`feat.pt`），零样本对齐 SigLIP2 文本嵌入——**取代 SAGA/Gaussian Grouping 的逐帧 SAM/CLIP 蒸馏**。
+- **文本查询**：VLM 直接用自然语言查询高斯（"哪些是墙？"→ `query_semantics("wall")`），无需 2D mask 反投影。
+- **语义渲染**：`render_semantic_overlay` 把匹配高斯染红/其余染青，或全局按 argmax 类别着色，供 VLM 视觉确认。
+- **阈值校准**：实测 SceneSplat 余弦相似度聚集在 ~0.1±0.015，sigmoid 后概率全在 ~0.52——**绝对阈值不可靠，argmax(dominant) 是可靠信号**（详见 §12.5）。
 
 ### 4.4 几何由确定性求解器产出
 3DGS→Mesh 现有方法（Poisson/marching cubes on opacity）只用高斯位置、丢视觉语义，平面坑洼。本项目的对策：
@@ -138,8 +140,9 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | 度量深度先验 | **Metric3D V2** `YvanYin/Metric3D` | 单目度量深度，喂深度正则损失 | 复用 |
 | 3DGS 训练（深度正则+已知位姿） | **nerfstudio / splatfacto** `nerfstudio-project/nerfstudio` | 端到端训练 | 复用 |
 | **核心光栅器（MCP 渲染引擎）** | **gsplat** `nerfstudio-project/gsplat` | `rasterization(...,render_mode="RGB+ED")` 从任意位姿出 RGB+深度；**2026-03 新增旋转 LiDAR 相机模型** `pip install "gsplat[lidar]"` | 复用 ⭐ |
-| **语义高斯：2D mask→3D 拾取** | **SAGA** `Jumpat/SegAnyGAussians` (AAAI'25) 或 **Gaussian Grouping** `lkeab/gaussian-grouping` (ECCV'24) | VLM 圈选→选中背后高斯；实例分组 | 复用 ⭐ |
-| （加分）开放词表查询 | **OpenGaussian** `yanmin-wu/OpenGaussian` (NeurIPS'24) / **LangSplat V2** `minghanqin/LangSplat` | 文本→高斯 | 可选 |
+| **语义高斯：3DGS-native 语言特征** | **SceneSplat** `Say6n/SceneSplat` (ICCV'25 Oral) | PT-v3 预训练编码器直出 per-Gaussian 768 维语言特征，零样本对齐 SigLIP2；feat.pt 文件交接 | 复用 ⭐（已替代 SAGA） |
+| ~~开放词表（逐帧蒸馏）~~ | ~~OpenGaussian / LangSplat V2 / SAGA / Gaussian Grouping~~ | ~~逐帧 SAM/CLIP 蒸馏~~ | **已弃用**（被 SceneSplat 替代） |
+| 文本嵌入 | **SigLIP2** `google/siglip2-base-patch16-512` | 生成 BIM 词表文本嵌入，与 feat.pt 对齐 | 复用 |
 | 曲面/Mesh（楼板/复杂面备用） | **PGSR** `zju3dv/PGSR`（平面基，适合墙）/ **2DGS** `hbb1/2d-gaussian-splatting`（TSDF）/ **SuGaR** `Anttwo/SuGaR` | 需要网格时 | 选择性 |
 | 几何处理 | **Open3D** `isl-org/Open3D` | RANSAC 平面、2D ICP 配准 | 复用 |
 | **VLM 工具服务器（3DGS 侧）** | **MCP Python SDK** `modelcontextprotocol/python-sdk` | 暴露 render_from_pose/pick/segment 等 3DGS 工具给 VLM | **自建（薄壳）** |
@@ -150,7 +153,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 
 ### 5.2 按阶段安装清单（提前准备依赖用）
 - **第 1 周必备**：`COLMAP`(二进制)、`nerfstudio`、`gsplat`、`open3d`、`mcp[cli]`、`httpx`、`uvicorn`（mcp-servers-for-revit 依赖）；`pyRevit`（Revit 侧，需安装到 Revit + 激活 Routes Server）
-- **第 5 周前**：`SAGA` 或 `Gaussian Grouping`（建议先 SAGA，交互调试方便）+ segment-anything 权重
+- **第 5 周前**：`SceneSplat`（独立 conda 环境 Python 3.10 / PyTorch 2.5.1）+ `transformers`（bim-recon 环境，SigLIP2 文本嵌入）
 - **第 11 周前**：`Metric3D V2` 权重（深度正则）
 - **第 16 周前**：ROS2 LiDAR driver + `pip install "gsplat[lidar]"`
 - **弹性**：`PGSR` / `2DGS`（墙平面化加成）、`LangSplat`（开放词表）
@@ -158,11 +161,12 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 ---
 
 ## 6. 关键复用发现（避免造轮子）
-1. **"VLM 在渲染图圈选→选中 3D 高斯"已由 SAGA / Gaussian Grouping 实现**——不必自写 2D-mask→3D 投影关联。
-2. **gsplat 的 `rasterization()` 就是 MCP `render_from_pose` / `get_depth` 工具本体**，几行代码即可。
-3. **gsplat 2026-03 旋转 LiDAR 光栅化**可"从 3DGS 仿真一次 LiDAR 扫描"，与真实扫描对齐解配准 (s,θ,t)——比通用 ICP 更原理性。
-4. **没有现成的"3DGS 场景探索 MCP server"**——MCP server 自建，但它是薄壳，底下全是成熟库。
-5. **PGSR 是平面基 3DGS**，与"墙=平面"天然契合，可作为墙拟合的加成选项。
+1. **SceneSplat（ICCV'25 Oral）直出 per-Gaussian 语言特征**——PT-v3 预训练编码器在 3DGS 参数上推理一次即得 `feat.pt`(N,768)，零样本对齐 SigLIP2 文本嵌入，**完全取代 SAGA/Gaussian Grouping 的逐帧 SAM/CLIP 蒸馏**。feat.pt 文件交接实现两个 conda 环境零耦合（scene_splat env 推理，bim-recon env 加载）。
+2. **SceneSplat 余弦相似度聚集紧致（~0.1±0.015）**：sigmoid 后概率全在 ~0.52，绝对阈值不可靠；argmax(dominant label) 是可靠分类信号。`SemanticQuerier` 提供三种查询模式：`dominant`（默认，最可靠）/ `threshold` / `top_percent`。
+3. **gsplat 的 `rasterization()` 就是 MCP `render_from_pose` / `get_depth` 工具本体**，几行代码即可。
+4. **gsplat 2026-03 旋转 LiDAR 光栅化**可"从 3DGS 仿真一次 LiDAR 扫描"，与真实扫描对齐解配准 (s,θ,t)——比通用 ICP 更原理性。
+5. **没有现成的"3DGS 场景探索 MCP server"**——MCP server 自建，但它是薄壳，底下全是成熟库。
+6. **PGSR 是平面基 3DGS**，与"墙=平面"天然契合，可作为墙拟合的加成选项。
 
 ---
 
@@ -175,7 +179,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | 1 | P0 | 环境；IfcOpenShell 出墙+门洞+板在 Revit 可编辑；定义 FloorPlan 契约 + ManualProvider | IFC 尾巴通 |
 | 2–3 | P0 | 手机视频→COLMAP→splatfacto 训 3DGS；gsplat 渲 RGB+ED；Open3D 拟合墙→IfcWall；Manual 矩形配准 3DGS (s,θ,t) | 已知管线全跑通 |
 | 4 | P0 | 鲁棒性首测 + 文档 | P0 收尾 |
-| 5–6 | P1 | 接 SAGA/Gaussian Grouping 训语义高斯；验证 2D-prompt→3D 拾取 | 语义高斯可用 |
+| 5–6 | P1 | 接 SceneSplat 推理语义高斯（feat.pt）；验证文本→3D 查询 | 语义高斯可用 |
 | 7–8 | P1 | 写 MCP server（薄壳 over gsplat+SAGA）；Claude 循环定位墙 | VLM 能找墙 |
 | 9–10 | P1 | 确定性墙拟合器 + 重力对齐 + 拉伸；VLM vs 手工吻合度 | **核心创新验证** |
 | 11–12 | P2 | 地板/天花板 IfcSlab；门/窗→IfcOpeningElement 布尔 | A类全要素 |
@@ -213,15 +217,16 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
    - 
 ender_from_pose：gsplat 渲染 RGB+深度
    - get_depth：深度图查询
-   - select_cluster：SAGA 语义拾取
-   - project_mask：2D mask→3D 高斯
+   - select_cluster：语义拾取（支持 text_query 文本过滤）
+   - query_semantics：文本→高斯查询
+   - render_semantic_overlay：语义着色渲染
 5. **VLM 集成**：Claude/GPT-4o 通过 MCP 巡视 3DGS → 判定墙/门洞 → 调用 Revit MCP 创建图元
 6. **端到端测试**：单房间视频 → 3DGS → VLM 分割 → Revit 墙体
 
 ### 技术栈
 - COLMAP（SfM 位姿）
 - nerfstudio / gsplat（3DGS 训练 + 渲染）
-- SAGA / Gaussian Grouping（语义高斯）
+- SceneSplat + SigLIP2（3DGS-native 语义特征）
 - MCP Python SDK（3DGS 侧 MCP 服务器）
 - Claude / GPT-4o（VLM 推理）
 
@@ -237,14 +242,19 @@ ender_from_pose：gsplat 渲染 RGB+深度
 ### 模块清单
 | 文件 | 职责 | 验证状态 |
 |---|---|---|
-| `bim_recon/gs_scene.py` | 加载 nerfstudio 导出的 splat.ply，提供 gsplat 渲染（RGB + 期望深度）| 9/9 pytest 通过 |
-| `bim_recon/mcp_gs.py` | 3DGS MCP server（5 工具：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster）| demo 场景全工具通过 |
+| `bim_recon/gs_scene.py` | 加载 3DGS 场景（PLY / SceneSplat .npy），gsplat 渲染（RGB+ED），语义查询 | 5/9 pytest 通过（4 个需 MSVC JIT） |
+| `bim_recon/semantics.py` | SemanticQuerier：加载 feat.pt + text_emb.pt，文本→高斯查询（dominant/threshold/top_percent 三模式）| 18/18 pytest 通过 |
+| `bim_recon/mcp_gs.py` | 3DGS MCP server（**7 工具**：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster / query_semantics / render_semantic_overlay）| demo 场景全工具 + 语义守卫通过 |
 | `bim_recon/colmap_runner.py` | 包装 `ns-process-data images`，输出 transforms.json + images/ | dry-run 命令构造正确 |
 | `scripts/train_gs.py` | 包装 `ns-train splatfacto`，含室内深度正则 | dry-run 命令构造正确 |
-| `scripts/run_mcp_gs.bat` | MCP server 启动器（vcvars64 + conda activate + python -m）| 已写入 opencode.json |
-| `tests/test_gs_scene.py` | GSScene 单元测试（相机工具、合成渲染、PLY 往返、mask 选择）| 9/9 通过 |
-| `scripts/probe_gsplat.py` | gsplat rasterization API 探查 | 验证 RGB+ED 模式 |
-| `scripts/test_mcp_gs.py` | MCP 工具集成测试（直接调函数，不走 stdio）| 5/5 工具 + select_cluster 通过 |
+| `scripts/encode_bim_labels.py` | SigLIP2 文本嵌入生成器（9 类 BIM 词表 → bim_text_emb.pt）| 已生成 (9, 768) 嵌入 |
+| `scripts/run_mcp_gs.bat` | MCP server 启动器（vcvars64 + conda + 支持 --feat/--data-dir）| 文档完整 |
+| `data/bim_class_names.txt` | BIM 语义词表（wall/floor/ceiling/door/window/column/beam/stairs/furniture）| 9 类 |
+| `data/bim_text_emb.pt` | SigLIP2 文本嵌入 (9, 768)，L2 归一化 | 已生成 |
+| `data/bim_class_names.json` | 类名→索引映射 | 已生成 |
+| `tests/test_gs_scene.py` | GSScene 单元测试（相机工具、合成渲染、PLY 往返、mask 选择）| 9/9 通过（渲染类需 MSVC） |
+| `tests/test_semantics.py` | SemanticQuerier 单元测试（init/query/dominant/top_percent/label_at）| 18/18 通过 |
+| `scripts/test_mcp_gs.py` | MCP 工具集成测试（7 工具 + 语义守卫）| demo 场景通过 |
 
 ### 关键技术决策
 
@@ -258,6 +268,12 @@ ender_from_pose：gsplat 渲染 RGB+深度
 
 5. **MSVC JIT 编译**：gsplat 1.4.0 在 Windows 上首次使用需 JIT 编译 CUDA 后端，要求 `cl.exe` 在 PATH。通过 vcvars64.bat 解决（已内置到 `scripts/run_mcp_gs.bat`）。
 
+6. **SceneSplat 集成（feat.pt 文件交接）**：scene_splat conda 环境（Python 3.10 / PyTorch 2.5.1）推理产出 `feat.pt`(N,768) + `.npy` 文件；bim-recon 环境用 `GSScene.from_npy()` 加载——两环境零耦合。SceneSplat 输出的 PLY（`data_feat_vis_3dgs.ply`）含 PCA 颜色非真实 RGB，故从 `color.npy`（uint8）加载真实颜色。
+
+7. **SceneSplat 阈值校准**：实测余弦相似度聚集在 ~0.1±0.015（logits），sigmoid 后概率全在 ~0.52——绝对阈值不可靠。`SemanticQuerier` 默认用 `query_dominant`（argmax），MCP `query_semantics` 默认 `mode="dominant"`。真实数据（1.5M Gaussians）上 floor=21.6%、door=24.8%、wall=10.8% 分布合理。
+
+8. **SigLIP2 API 变化**：transformers 5.x 中 `get_text_features()` 返回 `BaseModelOutputWithPooling`，需取 `.pooler_output`。prompt 格式 `"this is a {label}"`，max_length=64（与 SceneSplat 对齐）。
+
 ### MCP 工具语义
 
 | 工具 | 入参 | 返回 | VLM 用途 |
@@ -266,7 +282,9 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `list_cameras` | 无 | JSON: 训练相机列表 | 选择已有视角 |
 | `render_from_pose` | eye, target, up, fov, W, H | PNG (HxWx3) | 看一眼场景 |
 | `get_depth_grid` | eye, target, stride, W, H | JSON: 下采样深度网格 + 统计 | 推断墙距、房间尺寸 |
-| `select_cluster` | eye, target, bbox_xyxy, W, H | JSON: 选中高斯数 + centroid + AABB | 2D box 到 3D 高斯桥接 |
+| `select_cluster` | eye, target, bbox_xyxy, [text_query], W, H | JSON: 选中高斯数 + centroid + AABB | 2D box 到 3D 高斯桥接；text_query 可选语义过滤 |
+| `query_semantics` | text_query, [mode], [threshold], [percent] | JSON: 类别 + 高斯数 + centroid + AABB + 置信度 | 文本→3D 高斯查询（"哪些是墙？"）|
+| `render_semantic_overlay` | eye, target, [text_query], W, H | PNG (语义着色) | VLM 视觉确认语义分类 |
 
 ### 数据流
 
@@ -277,23 +295,43 @@ ender_from_pose：gsplat 渲染 RGB+深度
       -> train_gs.py (ns-train splatfacto)
       -> nerfstudio checkpoint
       -> ns-export gaussian-splat
-      -> splat.ply
-      -> mcp_gs.py --ply splat.ply
-      -> VLM 巡视 (render_from_pose + get_depth_grid)
-      -> select_cluster (2D bbox -> 3D 高斯子集)
+      -> splat.ply + .npy（coord/color/opacity/scale/quat）
+
+    语义通道（SceneSplat，独立 conda env）:
+      .npy + splat.ply
+      -> SceneSplat preprocess_gs.py + lang_inference.py
+      -> feat.pt (N, 768) per-Gaussian 语言特征
+
+    bim-recon env:
+      -> encode_bim_labels.py (SigLIP2)
+      -> bim_text_emb.pt (C, 768)
+      -> mcp_gs.py --data-dir data/ --feat output/data_feat.pt \
+           --text-emb data/bim_text_emb.pt --class-names data/bim_class_names.json
+      -> VLM 巡视 (render_from_pose + get_depth_grid + render_semantic_overlay)
+      -> query_semantics("wall") → 墙高斯子集（argmax dominant）
+      -> select_cluster (2D bbox + text_query → 3D 高斯子集)
       -> 墙拟合器 (待实现)
       -> revit MCP create_line_based_element
       -> Revit 原生墙
 
 ### 用户下一步（需要真实数据）
 
+**几何训练（bim-recon env）：**
 1. 拍摄测试房间视频（手持手机，缓慢绕场一周，约 1-2 分钟）
 2. `ffmpeg -i video.mp4 -q:v 2 images/%04d.jpg` 抽帧
 3. `python -m bim_recon.colmap_runner --images images/ --output data/room1`
 4. `python scripts/train_gs.py --data data/room1 --output output/room1`
 5. `ns-export gaussian-splat --load-config output/room1/config.yml --output-dir output/room1/splat`
-6. 把 opencode.json 里 `bim-recon-gs` 的 `--demo` 换成 `--ply output/room1/splat/splat.ply --cameras data/room1/transforms.json`
-7. 重启 opencode，VLM 即可巡视真实房间
+
+**语义推理（scene_splat env，用户管理）：**
+6. `python preprocess_gs.py --output-dir output/room1/scenesplat data/room1/`（产出 .npy + inverse_map）
+7. `python lang_inference.py --output-dir output/room1/scenesplat ...`（产出 `data_feat.pt`）
+8. `python scripts/encode_bim_labels.py --class-names data/bim_class_names.txt --output-dir data/`（bim-recon env，生成 `bim_text_emb.pt`）
+
+**启动 MCP server：**
+9. 把 opencode.json 里 `bim-recon-gs` 的 `--demo` 换成：
+   `--data-dir data/room1 --feat output/room1/data_feat.pt --text-emb data/bim_text_emb.pt --class-names data/bim_class_names.json --cameras data/room1/transforms.json`
+10. 重启 opencode，VLM 即可用 `query_semantics("wall")` + `render_semantic_overlay` 巡视真实房间语义
 
 ---
 
@@ -467,6 +505,42 @@ Revit API
 
 **决策**：移除 `mcp-server-for-revit-python` 子模块及其文档（`Docs/pyrevit/`、`scripts/revit_wall_door.py`），改用 `mcp-servers-for-revit`。
 
+### 12.5 [2026-06-30] SceneSplat 集成：3DGS-native 语义特征取代 SAGA/Gaussian Grouping
+
+**背景**：原 §4.3 计划用 SAGA / Gaussian Grouping 做逐帧 SAM/CLIP 蒸馏得到语义高斯。调研发现 **SceneSplat（ICCV 2025 Oral）**——PT-v3 预训练编码器直接在 3DGS 参数上输出 per-Gaussian 768 维语言特征，零样本对齐 SigLIP2 文本嵌入，无需逐帧处理。
+
+**切换理由**：
+1. **更原生**：直接在高斯参数上推理一次，不依赖渲染图 + SAM mask 蒸馏。
+2. **开放词表**：768 维语言特征 + SigLIP2 文本嵌入 → 任意文本查询（"墙""门""家具"），无需固定类别训练。
+3. **更简单**：feat.pt 文件交接，两个 conda 环境零耦合（scene_splat env 推理，bim-recon env 加载）。
+4. **已验证**：真实数据（1.5M Gaussians, ARKitScenes）上 argmax 分布合理（floor 21.6%、door 24.8%、wall 10.8%）。
+
+**关键发现：余弦相似度阈值不可靠**：
+- 实测 logits（`feat @ text_emb.T`）聚集在 **~0.1 ± 0.015**，sigmoid 后概率全在 **~0.52**。
+- 绝对阈值（如 0.5）会把几乎所有高斯判为所有类——无区分力。
+- **argmax（dominant label）是可靠信号**：虽然各类绝对概率接近，但 argmax 跨类有区分力。
+- 对策：`SemanticQuerier` 默认 `query_dominant()`（argmax），MCP `query_semantics` 默认 `mode="dominant"`；另提供 `threshold` / `top_percent` 模式备用。
+
+**架构**：
+```
+scene_splat env (用户管理)          bim-recon env (agent 管理)
+  .npy + splat.ply                   feat.pt (torch.load)
+  -> preprocess_gs.py                text_emb.pt (SigLIP2)
+  -> lang_inference.py               -> SemanticQuerier
+  -> feat.pt (N,768) ──────────────> -> GSScene.from_npy()
+                                     -> MCP 7 工具
+```
+
+**数据格式关键点**：
+- SceneSplat `feat.pt` 是 **post-normalization**（L2 归一化）float16；加载时转 float32。
+- SceneSplat `.npy` 是 **post-activation**（opacity 已 sigmoid、scale 已 exp、quat 已归一化）——`from_npy()` 不再应用激活函数（与 PLY raw 格式不同）。
+- SceneSplat 导出的 PLY（`data_feat_vis_3dgs.ply`）含 **PCA 颜色非真实 RGB**；真实颜色在 `color.npy`（uint8 [0,255]），故用 `from_npy()` 而非 `from_ply()`。
+- 高斯顺序保证：`preprocess_gs.py` 按 PLY vertex 顺序读取，`lang_inference.py` 用 inverse_map 恢复原始顺序。
+
+**SigLIP2 API 变化**：transformers 5.x 中 `get_text_features()` 返回 `BaseModelOutputWithPooling`，需取 `.pooler_output` 获取嵌入张量（旧版直接返回张量）。
+
+**新增模块**：`bim_recon/semantics.py`（SemanticQuerier）、`scripts/encode_bim_labels.py`、`data/bim_class_names.txt`（9 类）、GSScene 扩展（`from_npy`/`query_semantics(mode=)`）、MCP 新增 2 工具 + select_cluster 增强。
+
 ## 附录 A：FloorPlan 契约（草案）
 
 ```python
@@ -521,16 +595,32 @@ class FloorPlanProvider:
 
 ---
 
-## 附录 B：MCP 工具集（草案）
+## 附录 B：MCP 工具集（已实现）
+
+### 3DGS 侧（`bim-recon-gs`，7 工具）
+
 | 工具 | 底层 | 用途 |
 |---|---|---|
-| `render_from_pose(pose)` | gsplat `rasterization` | VLM 看场景 |
-| `get_depth(pose)` | gsplat `render_mode="ED"` | 几何查询 |
-| `select_cluster(mask_2d)` | SAGA/Gaussian Grouping | 2D 圈选→3D 高斯 |
-| `list_elements()` | 内部状态机 | 已建模元素 |
-| `add_wall / add_slab / add_door / add_window` | Open3D 拟合 + pyRevit/Revit API | 写入 Revit 原生图元 |
-| `validate(element_id)` | gsplat 重渲染叠合 | VLM 回看确认 |
-| `report_diff()` | 3DGS 墙 vs FloorPlan | 差异报告 |
+| `get_scene_info()` | GSScene.scene_bounds | 高斯数、AABB、默认相机 |
+| `list_cameras()` | transforms.json | 训练视角列表 |
+| `render_from_pose(eye, target, up, fov, W, H)` | gsplat `rasterization` | VLM 看场景（RGB PNG） |
+| `get_depth_grid(eye, target, stride, W, H)` | gsplat `render_mode="RGB+ED"` | 下采样深度网格（JSON） |
+| `select_cluster(eye, target, bbox, [text_query], W, H)` | gsplat 投影 + SemanticQuerier | 2D box→3D 高斯；可选语义过滤 |
+| `query_semantics(text_query, [mode], [threshold], [percent])` | SemanticQuerier | 文本→高斯查询（dominant/threshold/top_percent） |
+| `render_semantic_overlay(eye, target, [text_query], W, H)` | gsplat + 颜色替换 | 语义着色渲染（匹配红/其余青，或全局调色板） |
+
+### Revit 侧（`mcp-servers-for-revit`，26 工具，复用）
+
+关键工具：`create_line_based_element`（墙）、`create_surface_based_element`（板）、`create_point_based_element`（门/窗）、`send_code_to_revit`（C# 代码执行）、`operate_element`（高亮/隔离/删除）等。
+
+### VLM 工作流（目标）
+1. `get_scene_info` → 了解场景规模
+2. `render_from_pose` / `render_semantic_overlay` → 巡视
+3. `query_semantics("wall")` → 拿到墙高斯子集 + AABB
+4. `get_depth_grid` → 推断墙距/房间尺寸
+5. `select_cluster(text_query="wall")` → 精确区域拾取
+6. → 墙拟合器（待实现）→ Revit `create_line_based_element`
+7. `render_from_pose` 重渲染叠合 → VLM 回看确认
 
 ---
 
