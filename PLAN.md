@@ -244,7 +244,7 @@ ender_from_pose：gsplat 渲染 RGB+深度
 |---|---|---|
 | `bim_recon/gs_scene.py` | 加载 3DGS 场景（PLY / SceneSplat .npy），gsplat 渲染（RGB+ED），语义查询 | 5/9 pytest 通过（4 个需 MSVC JIT） |
 | `bim_recon/semantics.py` | SemanticQuerier：加载 feat.pt + text_emb.pt，文本→高斯查询（dominant/threshold/top_percent 三模式）| 18/18 pytest 通过 |
-| `bim_recon/mcp_gs.py` | 3DGS MCP server（**7 工具**：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster / query_semantics / render_semantic_overlay）| demo 场景全工具 + 语义守卫通过 |
+| `bim_recon/mcp_gs.py` | 3DGS MCP server（**8 工具**：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster / query_semantics / render_semantic_overlay / fit_walls）| demo 场景全工具 + 语义守卫通过 |
 | `bim_recon/colmap_runner.py` | 包装 `ns-process-data images`，输出 transforms.json + images/ | dry-run 命令构造正确 |
 | `scripts/train_gs.py` | 包装 `ns-train splatfacto`，含室内深度正则 | dry-run 命令构造正确 |
 | `scripts/encode_bim_labels.py` | SigLIP2 文本嵌入生成器（9 类 BIM 词表 → bim_text_emb.pt）| 已生成 (9, 768) 嵌入 |
@@ -254,7 +254,9 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `data/bim_class_names.json` | 类名→索引映射 | 已生成 |
 | `tests/test_gs_scene.py` | GSScene 单元测试（相机工具、合成渲染、PLY 往返、mask 选择）| 9/9 通过（渲染类需 MSVC） |
 | `tests/test_semantics.py` | SemanticQuerier 单元测试（init/query/dominant/top_percent/label_at）| 18/18 通过 |
-| `scripts/test_mcp_gs.py` | MCP 工具集成测试（7 工具 + 语义守卫）| demo 场景通过 |
+| `scripts/test_mcp_gs.py` | MCP 工具集成测试（8 工具 + 语义守卫）| demo 场景通过 |
+| `bim_recon/wall_fitter.py` | WallFit + WallFitter（迭代 RANSAC + 去重合并 + 重力对齐 + 端点精修 + 高度提取）+ Revit 转换函数 | 16/16 pytest 通过 + 真实数据 9 墙验证 |
+| `tests/test_wall_fitter.py` | WallFitter 单元测试（basic/merge/align/refine/height/revit 转换）| 16/16 通过 |
 
 ### 关键技术决策
 
@@ -285,6 +287,7 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `select_cluster` | eye, target, bbox_xyxy, [text_query], W, H | JSON: 选中高斯数 + centroid + AABB | 2D box 到 3D 高斯桥接；text_query 可选语义过滤 |
 | `query_semantics` | text_query, [mode], [threshold], [percent] | JSON: 类别 + 高斯数 + centroid + AABB + 置信度 | 文本→3D 高斯查询（"哪些是墙？"）|
 | `render_semantic_overlay` | eye, target, [text_query], W, H | PNG (语义着色) | VLM 视觉确认语义分类 |
+| `fit_walls` | [text_query], [mode], [up_axis] | JSON: 墙线段列表 (p0/p1/height/thickness/length) | 从语义高斯自动提取墙线段 → Revit |
 
 ### 数据流
 
@@ -541,6 +544,29 @@ scene_splat env (用户管理)          bim-recon env (agent 管理)
 
 **新增模块**：`bim_recon/semantics.py`（SemanticQuerier）、`scripts/encode_bim_labels.py`、`data/bim_class_names.txt`（9 类）、GSScene 扩展（`from_npy`/`query_semantics(mode=)`）、MCP 新增 2 工具 + select_cluster 增强。
 
+### 12.6 [2026-06-30] 墙拟合器：RANSAC + 遮挡补全 + 端点精修 + Revit 接入
+
+**背景**：SceneSplat 集成（§12.5）后，query_semantics 能给出"哪些高斯是墙"，但 Revit create_line_based_element 需要的是墙的起止点坐标（几何数值）。墙拟合器补全这一跃。
+
+**管线**：`query_semantics("wall") → WallFitter.fit() → WallFit 列表 → wallfit_to_line_based_element() → Revit`
+
+WallFitter.fit() 内部：
+1. **迭代 RANSAC**：Open3D segment_plane，每次提取最大平面，移除 inliers，重复。distance_threshold=0.08m, min_inliers=500, max_thickness=1.0m（过滤非墙散布）。
+2. **重力对齐**：法向投影到水平面（去掉 up 分量），确保墙法向水平。
+3. **去重/合并（遮挡补全）**：法向夹角 <10° + 共面 <0.15m 的墙段合并。**关键**：3DGS 只重建可见表面，柜子/门洞后的墙无高斯 → 共面碎片合并为一条完整墙线段（端点取投影 min/max 横跨空洞）。合成测试验证：5m 墙中间 1.5m 空洞 → 1 条 ≈5m 完整墙。
+4. **端点精修**：相邻墙水平面投影的交点 = 角点。L 形墙角点坐标一致（合成测试验证）。
+5. **高度提取**：floor centroid.z → ceiling centroid.z（比 inlier 范围更稳定）。
+
+**真实数据验证**（1.5M Gaussians, ARKitScenes）：
+- 161252 wall 高斯 → 9 面墙
+- 长度 1.6-8.5m, 高度 2.54m（floor→ceiling）, 厚度 0.17-0.68m
+- wallfit_to_line_based_element 输出正确的毫米制 Revit 参数
+
+**关键设计决策**：
+- 新建 WallFit(3D) 而非改 WallSegment(2D)：WallSegment 是 FloorPlan 契约，保持稳定。
+- max_thickness=1.0m 过滤：厚度 >1m 的"平面"不是墙（是散布或地面/天花板残留）。
+- 遮挡补全测试用合成点云验证（mid-gap + door-gap），确保连续性。
+
 ## 附录 A：FloorPlan 契约（草案）
 
 ```python
@@ -597,7 +623,7 @@ class FloorPlanProvider:
 
 ## 附录 B：MCP 工具集（已实现）
 
-### 3DGS 侧（`bim-recon-gs`，7 工具）
+### 3DGS 侧（`bim-recon-gs`，8 工具）
 
 | 工具 | 底层 | 用途 |
 |---|---|---|
@@ -608,6 +634,7 @@ class FloorPlanProvider:
 | `select_cluster(eye, target, bbox, [text_query], W, H)` | gsplat 投影 + SemanticQuerier | 2D box→3D 高斯；可选语义过滤 |
 | `query_semantics(text_query, [mode], [threshold], [percent])` | SemanticQuerier | 文本→高斯查询（dominant/threshold/top_percent） |
 | `render_semantic_overlay(eye, target, [text_query], W, H)` | gsplat + 颜色替换 | 语义着色渲染（匹配红/其余青，或全局调色板） |
+| `fit_walls([text_query], [mode], [up_axis])` | WallFitter (RANSAC+merge+refine) | 语义高斯→墙线段（p0/p1/height/thickness）→ Revit |
 
 ### Revit 侧（`mcp-servers-for-revit`，26 工具，复用）
 
