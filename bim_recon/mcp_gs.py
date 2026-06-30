@@ -35,8 +35,10 @@ from PIL import Image as PILImage
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image as MCPImage
 
+from bim_recon.floorplan import ManualProvider
+from bim_recon.floorplan_registration import register_floorplan
 from bim_recon.gs_scene import CameraPose, GSScene, look_at_pose
-from bim_recon.wall_fitter import WallFitter
+from bim_recon.wall_fitter import FloorPlanGuidedFitter, WallFitter
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +494,101 @@ def build_server(state: ServerState) -> FastMCP:
         fitter = WallFitter()
         walls = fitter.fit(
             wall_means, up_axis=up_axis, floor_z=floor_z, ceiling_z=ceiling_z,
+        )
+
+        return json.dumps({
+            "walls": [w.to_dict() for w in walls],
+            "up_axis": up_axis,
+            "num_walls": len(walls),
+        }, indent=2)
+
+    @mcp.tool()
+    def fit_walls_guided(
+        floorplan_json: str,
+        text_query: str = "wall",
+        mode: str = "dominant",
+        up_axis: Optional[int] = None,
+        corridor_width: float = 0.5,
+    ) -> str:
+        """Fit walls constrained by a 2D floorplan.
+
+        Takes a floorplan JSON (ManualProvider format) and auto-registers it
+        to the 3DGS scene. For each floorplan wall segment, only wall Gaussians
+        within ``corridor_width`` meters of that line are kept, then a single
+        RANSAC plane is fit and checked against the expected wall normal.
+
+        The floorplan JSON can be a rectangle::
+
+            {"rectangle": {"width": 5.0, "depth": 4.0}}
+
+        or an explicit wall list::
+
+            {"walls": [{"x1": 0, "y1": 0, "x2": 5, "y2": 0}, ...]}
+
+        Requires semantic features (--feat --text-emb --class-names).
+        """
+        s = _require_state()
+        if not s.has_semantics:
+            raise RuntimeError(
+                "fit_walls_guided requires semantic features. "
+                "Start the server with --feat --text-emb --class-names."
+            )
+        scene = s.scene
+
+        # Parse floorplan
+        try:
+            data = json.loads(floorplan_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid floorplan_json: {e}")
+        floorplan = ManualProvider.from_dict(data).get_floorplan()
+
+        # Auto-detect up_axis from floor centroid
+        floor_result = scene.query_semantics("floor", mode="dominant")
+        if up_axis is None:
+            if floor_result["centroid"] is not None:
+                up_axis = int(np.argmin(floor_result["centroid"]))
+            else:
+                up_axis = 2
+
+        # Get wall/floor/ceiling Gaussian means
+        wall_result = scene.query_semantics(text_query, mode=mode)
+        wall_indices = wall_result["indices"]
+        if len(wall_indices) == 0:
+            return json.dumps({"walls": [], "up_axis": up_axis, "num_walls": 0})
+
+        wall_means = scene.means[
+            torch.as_tensor(wall_indices, dtype=torch.long)
+        ].cpu().numpy().astype(np.float64)
+
+        floor_z = float(floor_result["centroid"][up_axis]) if floor_result["centroid"] else None
+        ceiling_result = scene.query_semantics("ceiling", mode="dominant")
+        ceiling_z = float(ceiling_result["centroid"][up_axis]) if ceiling_result["centroid"] else None
+
+        # Auto-register floorplan to the 3DGS horizontal plane
+        h_axes = [i for i in range(3) if i != up_axis]
+        wall_means_2d = wall_means[:, h_axes]
+
+        floor_indices = floor_result["indices"]
+        floor_means = scene.means[
+            torch.as_tensor(floor_indices, dtype=torch.long)
+        ].cpu().numpy().astype(np.float64)
+        floor_means_2d = floor_means[:, h_axes]
+
+        registered_floorplan = register_floorplan(
+            floorplan,
+            wall_means_2d,
+            floor_means_2d=floor_means_2d,
+            corridor_width=corridor_width,
+        )
+
+        # Guided fit
+        fitter = FloorPlanGuidedFitter(corridor_width=corridor_width)
+        walls = fitter.fit_guided(
+            wall_means,
+            registered_floorplan,
+            up_axis=up_axis,
+            floor_z=floor_z,
+            ceiling_z=ceiling_z,
         )
 
         return json.dumps({

@@ -38,7 +38,7 @@ async def main_async() -> int:
         "get_scene_info", "list_cameras", "render_from_pose",
         "get_depth_grid", "select_cluster",
         "query_semantics", "render_semantic_overlay",
-        "fit_walls",
+        "fit_walls", "fit_walls_guided",
     }
     missing = expected - tool_names
     if missing:
@@ -145,6 +145,16 @@ async def main_async() -> int:
         return 1
     except (RuntimeError, ToolError) as e:
         print(f"      fit_walls rejected: {str(e)[:60]}...")
+
+    # fit_walls_guided without feat
+    try:
+        await tool_mgr.call_tool("fit_walls_guided", {
+            "floorplan_json": '{"rectangle": {"width": 5, "depth": 4}}',
+        })
+        print("      ERROR: fit_walls_guided should have raised without feat")
+        return 1
+    except (RuntimeError, ToolError) as e:
+        print(f"      fit_walls_guided rejected: {str(e)[:60]}...")
 
     print("\nALL TOOLS OK")
     return 0

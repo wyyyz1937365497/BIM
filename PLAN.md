@@ -244,7 +244,7 @@ ender_from_pose：gsplat 渲染 RGB+深度
 |---|---|---|
 | `bim_recon/gs_scene.py` | 加载 3DGS 场景（PLY / SceneSplat .npy），gsplat 渲染（RGB+ED），语义查询 | 5/9 pytest 通过（4 个需 MSVC JIT） |
 | `bim_recon/semantics.py` | SemanticQuerier：加载 feat.pt + text_emb.pt，文本→高斯查询（dominant/threshold/top_percent 三模式）| 18/18 pytest 通过 |
-| `bim_recon/mcp_gs.py` | 3DGS MCP server（**8 工具**：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster / query_semantics / render_semantic_overlay / fit_walls）| demo 场景全工具 + 语义守卫通过 |
+| `bim_recon/mcp_gs.py` | 3DGS MCP server（**9 工具**：get_scene_info / list_cameras / render_from_pose / get_depth_grid / select_cluster / query_semantics / render_semantic_overlay / fit_walls / **fit_walls_guided**）| demo 场景全工具 + 语义守卫通过 |
 | `bim_recon/colmap_runner.py` | 包装 `ns-process-data images`，输出 transforms.json + images/ | dry-run 命令构造正确 |
 | `scripts/train_gs.py` | 包装 `ns-train splatfacto`，含室内深度正则 | dry-run 命令构造正确 |
 | `scripts/encode_bim_labels.py` | SigLIP2 文本嵌入生成器（9 类 BIM 词表 → bim_text_emb.pt）| 已生成 (9, 768) 嵌入 |
@@ -255,8 +255,10 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `tests/test_gs_scene.py` | GSScene 单元测试（相机工具、合成渲染、PLY 往返、mask 选择）| 9/9 通过（渲染类需 MSVC） |
 | `tests/test_semantics.py` | SemanticQuerier 单元测试（init/query/dominant/top_percent/label_at）| 18/18 通过 |
 | `scripts/test_mcp_gs.py` | MCP 工具集成测试（8 工具 + 语义守卫）| demo 场景通过 |
-| `bim_recon/wall_fitter.py` | WallFit + WallFitter（迭代 RANSAC + 去重合并 + 重力对齐 + 端点精修 + 高度提取）+ Revit 转换函数 | 16/16 pytest 通过 + 真实数据 9 墙验证 |
+| `bim_recon/wall_fitter.py` | WallFit + WallFitter（迭代 RANSAC + 去重合并 + 重力对齐 + 端点精修 + 高度提取）+ **FloorPlanGuidedFitter**（走廊筛选 + 固定法向直方图峰值）+ Revit 转换函数 | 16/16 pytest 通过 + 真实数据 6/8 墙底图引导验证 |
+| `bim_recon/floorplan_registration.py` | FloorPlan→3DGS 自动配准（PCA 旋转 + 90° 候选搜索 + 平移网格搜索 + 地板多边形评分）| 3/3 pytest 通过 |
 | `tests/test_wall_fitter.py` | WallFitter 单元测试（basic/merge/align/refine/height/revit 转换）| 16/16 通过 |
+| `tests/test_floorplan_guided.py` | FloorPlanGuidedFitter + register_floorplan 单元测试（registration/corridor/noise/height）| 8/8 通过 |
 
 ### 关键技术决策
 
@@ -567,6 +569,40 @@ WallFitter.fit() 内部：
 - max_thickness=1.0m 过滤：厚度 >1m 的"平面"不是墙（是散布或地面/天花板残留）。
 - 遮挡补全测试用合成点云验证（mid-gap + door-gap），确保连续性。
 
+### 12.7 [2026-06-30] 底图引导墙拟合器：FloorPlanGuidedFitter + register_floorplan
+
+**背景**：盲拟合（§12.6）把 161252 个 wall 高斯（含大量柜子/家具误分类点）全部丢给迭代 RANSAC → 9 面散落假墙，方向/位置各不同，用户反馈"非常糟糕"。
+
+**根因**：query_semantics("wall") 的 161252 高斯中混入大量非墙垂直表面（柜子背面、门框等），RANSAC 给噪声也拟合平面。
+
+**解决方案**：底图引导。用户传入 2D 底图（JSON 墙线段列表），系统自动配准到 3DGS 坐标系，然后对每条底图墙线段只在 ±0.5m 走廊范围内筛选 wall 高斯，用**固定法向直方图峰值**拟合——彻底消除走廊外噪声。
+
+**管线**：`用户底图 JSON → register_floorplan() → FloorPlanGuidedFitter.fit_guided() → WallFit 列表 → Revit`
+
+**register_floorplan**（自动配准）：
+1. **平移**：地板 footprint AABB 中心对齐。
+2. **旋转**：地板 footprint PCA 主轴 vs 底图墙线段 PCA 主轴，±90°×4 候选搜索，用地板多边形内点数评分（比 wall-only 走廊评分更鲁棒）。
+3. **缩放**：默认 1.0（底图和 3DGS 均为米制），可选覆盖。
+4. **平移网格精修**：3m 半径 7×7 网格搜索，最大化地板点在底图多边形内的数量。
+
+**FloorPlanGuidedFitter.fit_guided**（单墙拟合）：
+1. **自适应走廊**：0.3m → 0.5m → 0.75m → 1.0m → 1.5m，依次放宽直到找到足够 inliers。
+2. **固定法向**：直接使用底图墙线段的法向作为硬约束（1 DOF），避免 RANSAC 在噪声中随机选错平面。
+3. **直方图峰值**：走廊内 wall 高斯沿法向投影 → 取最密集 bin 的中位数作为平面偏移。
+4. **端点约束**：墙端点 = 底图线段端点投影到拟合平面（保证墙长度/方向与底图一致）。
+5. **后处理**：复用 `_gravity_align` + `_refine_endpoints` + `_compute_heights`。
+
+**真实数据验证**（同 §12.6 数据）：
+- 用户底图：8 墙段（10m×8m 矩形 + 2.5m×2.5m 凹室），手量、准确度差
+- 自动配准后：底图中心/旋转/尺度与 3DGS 房间匹配
+- **拟合结果：6/8 墙段成功**（左/右/上 + 凹室三边），全部 axis-aligned，长度与底图一致
+- 厚度 0.08m（单面石膏板级），高度 2.54m（floor→ceiling）
+- **对比**：盲拟合 9 面散落墙 → 底图引导 6 面整齐墙
+
+**MCP 工具**：`fit_walls_guided(floorplan_json, ...)` 接收 ManualProvider 格式 JSON（矩形或显式墙线段），返回 Revit-ready 墙参数。
+
+---
+
 ## 附录 A：FloorPlan 契约（草案）
 
 ```python
@@ -623,7 +659,7 @@ class FloorPlanProvider:
 
 ## 附录 B：MCP 工具集（已实现）
 
-### 3DGS 侧（`bim-recon-gs`，8 工具）
+### 3DGS 侧（`bim-recon-gs`，9 工具）
 
 | 工具 | 底层 | 用途 |
 |---|---|---|
@@ -635,6 +671,7 @@ class FloorPlanProvider:
 | `query_semantics(text_query, [mode], [threshold], [percent])` | SemanticQuerier | 文本→高斯查询（dominant/threshold/top_percent） |
 | `render_semantic_overlay(eye, target, [text_query], W, H)` | gsplat + 颜色替换 | 语义着色渲染（匹配红/其余青，或全局调色板） |
 | `fit_walls([text_query], [mode], [up_axis])` | WallFitter (RANSAC+merge+refine) | 语义高斯→墙线段（p0/p1/height/thickness）→ Revit |
+| `fit_walls_guided(floorplan_json, [text_query], [mode], [up_axis], [corridor_width])` | FloorPlanGuidedFitter + register_floorplan | 底图 JSON → 自动配准 → 走廊筛选直方图峰值 → 墙线段（比盲拟合更稳定）→ Revit |
 
 ### Revit 侧（`mcp-servers-for-revit`，26 工具，复用）
 
@@ -646,8 +683,10 @@ class FloorPlanProvider:
 3. `query_semantics("wall")` → 拿到墙高斯子集 + AABB
 4. `get_depth_grid` → 推断墙距/房间尺寸
 5. `select_cluster(text_query="wall")` → 精确区域拾取
-6. → 墙拟合器（待实现）→ Revit `create_line_based_element`
+6. **`fit_walls_guided(floorplan_json)`** → 底图引导墙拟合（自动配准 + 走廊筛选 + 固定法向直方图峰值）→ Revit `create_line_based_element`
 7. `render_from_pose` 重渲染叠合 → VLM 回看确认
+
+> **底图引导优先于盲拟合**：`fit_walls_guided` 使用用户手量底图作为空间先验，彻底消除柜子/家具噪声导致的散落假墙；`fit_walls` 保留为无底图时的备用方案。
 
 ---
 

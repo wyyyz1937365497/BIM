@@ -21,7 +21,7 @@ import numpy as np
 import open3d as o3d
 
 if TYPE_CHECKING:
-    from bim_recon.floorplan import WallSegment
+    from bim_recon.floorplan import FloorPlan, WallSegment
 
 
 # ---------------------------------------------------------------------------
@@ -619,3 +619,222 @@ def wallfit_to_wall_segment(wall: WallFit, up_axis: int = 2):
         y2=float(wall.p1[h_axes[1]]),
         thickness=float(wall.thickness),
     )
+
+
+# ---------------------------------------------------------------------------
+# FloorPlanGuidedFitter: floorplan-constrained wall fitting
+# ---------------------------------------------------------------------------
+
+
+def _point_to_segment_distance_2d(
+    pts: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> np.ndarray:
+    """Return 2D point-to-segment distances for (N, 2) points and segment a->b."""
+    ab = b - a
+    ab_len_sq = float(np.dot(ab, ab))
+    if ab_len_sq < 1e-12:
+        return np.linalg.norm(pts - a, axis=1)
+    ap = pts - a
+    t = np.clip(np.dot(ap, ab) / ab_len_sq, 0.0, 1.0)
+    closest = a + t[:, None] * ab
+    return np.linalg.norm(pts - closest, axis=1)
+
+
+class FloorPlanGuidedFitter:
+    """Fit walls using a 2D floorplan as a spatial prior.
+
+    For each floorplan wall segment, only wall Gaussians within a horizontal
+    corridor around that line are kept. A single RANSAC plane is fit inside
+    the corridor, then checked against the expected wall normal direction.
+    This eliminates furniture/classification noise that would otherwise create
+    scattered phantom walls in unconstrained fitting.
+    """
+
+    def __init__(
+        self,
+        corridor_width: float = 0.5,
+        normal_angle_thresh: float = 20.0,
+        distance_threshold: float = 0.08,
+        num_iterations: int = 2000,
+        min_inliers: int = 100,
+        max_thickness: float = 1.0,
+    ):
+        self.corridor_width = corridor_width
+        self.normal_angle_thresh = normal_angle_thresh
+        self.distance_threshold = distance_threshold
+        self.num_iterations = num_iterations
+        self.min_inliers = min_inliers
+        self.max_thickness = max_thickness
+
+    def fit_guided(
+        self,
+        points: np.ndarray,
+        floorplan: "FloorPlan",
+        up_axis: int = 2,
+        floor_z: Optional[float] = None,
+        ceiling_z: Optional[float] = None,
+    ) -> List[WallFit]:
+        """Fit walls constrained by ``floorplan``.
+
+        Args:
+            points: (N, 3) wall-classified Gaussian means (meters).
+            floorplan: A FloorPlan already registered to the 3DGS horizontal plane.
+            up_axis: Vertical axis index (0=x, 1=y, 2=z).
+            floor_z: Optional floor level for height override.
+            ceiling_z: Optional ceiling level for height override.
+
+        Returns:
+            List of WallFit, one per successfully fitted floorplan wall.
+        """
+        from bim_recon.floorplan import WallSegment
+
+        points = np.asarray(points, dtype=np.float64)
+        if points.shape[0] == 0 or len(floorplan.walls) == 0:
+            return []
+
+        h_axes = [i for i in range(3) if i != up_axis]
+        footprint = points[:, h_axes]  # (N, 2)
+        total = points.shape[0]
+
+        walls: List[WallFit] = []
+        for segment in floorplan.walls:
+            wall_fit = self._fit_one_segment(
+                points=points,
+                footprint=footprint,
+                segment=segment,
+                h_axes=h_axes,
+                up_axis=up_axis,
+                total=total,
+                floor_z=floor_z,
+            )
+            if wall_fit is not None:
+                walls.append(wall_fit)
+
+        # Reuse WallFitter's gravity alignment, endpoint refinement, height logic.
+        fitter = WallFitter()
+        aligned = [fitter._gravity_align(w, up_axis) for w in walls]
+        refined = fitter._refine_endpoints(aligned, up_axis)
+        final = fitter._compute_heights(refined, floor_z, ceiling_z, up_axis)
+        return final
+
+    def _fit_one_segment(
+        self,
+        points: np.ndarray,
+        footprint: np.ndarray,
+        segment: "WallSegment",
+        h_axes: List[int],
+        up_axis: int,
+        total: int,
+        floor_z: Optional[float] = None,
+    ) -> Optional[WallFit]:
+        """Fit a single wall inside the corridor around one floorplan segment.
+
+        Instead of unconstrained RANSAC (which picks a random plane among the
+        corridor points), we use the floorplan wall normal as a hard constraint
+        and solve for the single free parameter: the plane offset along that
+        normal. This is deterministic, avoids phantom diagonal walls from
+        furniture noise, and respects the floorplan geometry exactly.
+
+        Algorithm:
+          1. Corridor filter (adaptive width).
+          2. Project corridor points onto the floorplan wall normal.
+          3. Find the dominant projection value via histogram peak.
+          4. Wall plane = fixed normal + dominant offset.
+          5. Endpoints = floorplan segment endpoints projected onto the plane.
+        """
+        a = np.array([segment.x1, segment.y1], dtype=np.float64)
+        b = np.array([segment.x2, segment.y2], dtype=np.float64)
+        seg_dir = b - a
+        seg_len = float(np.linalg.norm(seg_dir))
+        if seg_len < 1e-6:
+            return None
+
+        # Floorplan wall normal in 2D and 3D (vertical plane, normal horizontal).
+        seg_normal_2d = np.array([-seg_dir[1], seg_dir[0]], dtype=np.float64)
+        seg_normal_2d /= float(np.linalg.norm(seg_normal_2d))
+        normal_3d = np.zeros(3, dtype=np.float64)
+        normal_3d[h_axes[0]] = seg_normal_2d[0]
+        normal_3d[h_axes[1]] = seg_normal_2d[1]
+        # up_axis component stays 0 -> vertical plane
+
+        z_floor = floor_z if floor_z is not None else float(points[:, up_axis].min())
+
+        best: Optional[tuple[np.ndarray, np.ndarray, float, int]] = None
+        best_inliers = 0
+
+        # Adaptive corridor widths.
+        widths = [self.corridor_width * f for f in [0.5, 1.0, 1.5, 2.0, 3.0]]
+        for width in widths:
+            distances = _point_to_segment_distance_2d(footprint, a, b)
+            mask = distances <= width
+            corridor_points = points[mask]
+            if corridor_points.shape[0] < self.min_inliers:
+                continue
+
+            # Project corridor points onto the fixed wall normal.
+            proj = corridor_points @ normal_3d  # (N,)
+
+            # Histogram peak finding: bin width = distance_threshold.
+            # The wall Gaussian slab should form a narrow peak in projection space.
+            bin_width = max(self.distance_threshold, 0.02)
+            bins = np.arange(proj.min(), proj.max() + bin_width, bin_width)
+            if len(bins) < 2:
+                continue
+            counts, edges = np.histogram(proj, bins=bins)
+            peak_idx = int(np.argmax(counts))
+            peak_count = int(counts[peak_idx])
+            if peak_count < self.min_inliers:
+                continue
+
+            # Inliers = points in the peak bin.
+            lo, hi = edges[peak_idx], edges[peak_idx + 1]
+            inlier_mask = (proj >= lo) & (proj < hi)
+            inlier_pts = corridor_points[inlier_mask]
+
+            # Plane offset: median of inlier projections.
+            offset = float(np.median(proj[inlier_mask]))
+
+            if peak_count > best_inliers:
+                best_inliers = peak_count
+                best = (inlier_pts, normal_3d.copy(), offset, peak_count)
+
+        if best is None:
+            return None
+
+        inlier_pts, normal, offset, num_inliers = best
+
+        # Constrain endpoints to the floorplan segment projected onto the plane.
+        # Plane equation: normal · x = offset.
+        def project_point_to_plane(pt_2d: np.ndarray) -> np.ndarray:
+            pt_3d = np.zeros(3, dtype=np.float64)
+            for i, ax in enumerate(h_axes):
+                pt_3d[ax] = pt_2d[i]
+            pt_3d[up_axis] = z_floor
+            dist_to_plane = float(np.dot(pt_3d, normal) - offset)
+            return pt_3d - dist_to_plane * normal
+
+        p0 = project_point_to_plane(a)
+        p1 = project_point_to_plane(b)
+
+        # Thickness from inlier spread along the wall normal.
+        proj_thickness = inlier_pts @ normal
+        thickness = float(proj_thickness.max() - proj_thickness.min())
+        if thickness > self.max_thickness:
+            return None
+
+        # Height from overall point cloud up-axis range.
+        up_coords = points[:, up_axis]
+        height = float(up_coords.max() - up_coords.min())
+
+        return WallFit(
+            p0=p0,
+            p1=p1,
+            height=height,
+            normal=normal,
+            thickness=thickness,
+            num_inliers=num_inliers,
+            confidence=num_inliers / total if total > 0 else 0.0,
+            inlier_pts=inlier_pts,
+        )
