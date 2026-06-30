@@ -36,6 +36,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image as MCPImage
 
 from bim_recon.gs_scene import CameraPose, GSScene, look_at_pose
+from bim_recon.wall_fitter import WallFitter
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +436,69 @@ def build_server(state: ServerState) -> FastMCP:
 
         png = _png_from_rgb(result.colors)
         return MCPImage(data=png, format="png")
+
+    @mcp.tool()
+    def fit_walls(
+        text_query: str = "wall",
+        mode: str = "dominant",
+        up_axis: Optional[int] = None,
+    ) -> str:
+        """Fit wall segments from semantic Gaussian clusters.
+
+        Queries Gaussians by ``text_query``, runs iterative RANSAC +
+        occlusion-gap bridging + gravity alignment + endpoint refinement,
+        returns wall segments as JSON.
+
+        Each wall has: p0, p1 (3D endpoints at floor level, meters),
+        height, normal, thickness, length, num_inliers, confidence.
+
+        ``up_axis`` auto-detected from floor centroid if None (0=x,1=y,2=z).
+        Wall height computed from floor→ceiling centroid distance.
+
+        Requires semantic features (--feat --text-emb --class-names).
+        """
+        s = _require_state()
+        if not s.has_semantics:
+            raise RuntimeError(
+                "fit_walls requires semantic features. "
+                "Start the server with --feat --text-emb --class-names."
+            )
+        scene = s.scene
+
+        # Auto-detect up_axis from floor centroid (lowest axis = up)
+        floor_result = scene.query_semantics("floor", mode="dominant")
+        if up_axis is None:
+            if floor_result["centroid"] is not None:
+                up_axis = int(np.argmin(floor_result["centroid"]))
+            else:
+                up_axis = 2
+
+        # Get wall Gaussian means
+        wall_result = scene.query_semantics(text_query, mode=mode)
+        wall_indices = wall_result["indices"]
+        if len(wall_indices) == 0:
+            return json.dumps({"walls": [], "up_axis": up_axis, "num_walls": 0})
+
+        wall_means = scene.means[
+            torch.as_tensor(wall_indices, dtype=torch.long)
+        ].cpu().numpy().astype(np.float64)
+
+        # Floor/ceiling z for height extraction
+        floor_z = float(floor_result["centroid"][up_axis]) if floor_result["centroid"] else None
+        ceiling_result = scene.query_semantics("ceiling", mode="dominant")
+        ceiling_z = float(ceiling_result["centroid"][up_axis]) if ceiling_result["centroid"] else None
+
+        # Fit walls
+        fitter = WallFitter()
+        walls = fitter.fit(
+            wall_means, up_axis=up_axis, floor_z=floor_z, ceiling_z=ceiling_z,
+        )
+
+        return json.dumps({
+            "walls": [w.to_dict() for w in walls],
+            "up_axis": up_axis,
+            "num_walls": len(walls),
+        }, indent=2)
 
     return mcp
 
