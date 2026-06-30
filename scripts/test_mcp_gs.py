@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bim_recon.mcp_gs import ServerState, _build_demo_scene, build_server
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.types import Image as MCPImage
 
 
@@ -33,7 +34,11 @@ async def main_async() -> int:
     tool_mgr = mcp._tool_manager
     tool_names = {t.name for t in tool_mgr.list_tools()}
     print(f"      registered tools: {sorted(tool_names)}")
-    expected = {"get_scene_info", "list_cameras", "render_from_pose", "get_depth_grid", "select_cluster"}
+    expected = {
+        "get_scene_info", "list_cameras", "render_from_pose",
+        "get_depth_grid", "select_cluster",
+        "query_semantics", "render_semantic_overlay",
+    }
     missing = expected - tool_names
     if missing:
         print(f"ERROR: missing tools: {missing}")
@@ -95,6 +100,42 @@ async def main_async() -> int:
         print(f"      centroid: {[f'{v:.2f}' for v in cluster['centroid']]}")
         print(f"      bounds:   {cluster['bounds_min']} -> {cluster['bounds_max']}")
     assert cluster["num_gaussians"] > 0, "expected to hit the +z wall"
+    # Backward-compat: demo scene has no semantics, so semantic_filter is null
+    assert cluster.get("semantic_filter") is None, "demo has no semantics"
+
+    # --- 7. Semantic error handling (demo has no feat → all 3 tools reject) ---
+    print("\n[6/6] semantic error handling (no feat loaded)")
+
+    # query_semantics without feat
+    try:
+        await tool_mgr.call_tool("query_semantics", {"text_query": "wall"})
+        print("      ERROR: query_semantics should have raised without feat")
+        return 1
+    except (RuntimeError, ToolError) as e:
+        print(f"      query_semantics rejected: {str(e)[:60]}...")
+
+    # render_semantic_overlay without feat
+    try:
+        await tool_mgr.call_tool("render_semantic_overlay", {
+            "eye": eye, "target": target, "width": 100, "height": 100,
+        })
+        print("      ERROR: render_semantic_overlay should have raised without feat")
+        return 1
+    except (RuntimeError, ToolError) as e:
+        print(f"      render_semantic_overlay rejected: {str(e)[:60]}...")
+
+    # select_cluster with text_query without feat
+    try:
+        await tool_mgr.call_tool("select_cluster", {
+            "eye": eye, "target": target,
+            "bbox_xyxy": [150, 100, 250, 200],
+            "text_query": "wall",
+            "width": 400, "height": 300, "fov_degrees": 60.0,
+        })
+        print("      ERROR: select_cluster(text_query=) should have raised without feat")
+        return 1
+    except (RuntimeError, ToolError) as e:
+        print(f"      select_cluster(text_query=) rejected: {str(e)[:60]}...")
 
     print("\nALL TOOLS OK")
     return 0
