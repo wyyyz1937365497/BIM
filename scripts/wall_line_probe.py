@@ -1,7 +1,8 @@
 """Multi-height wall line extraction probe.
 
 Scans the SceneSplat scene at multiple heights, extracts wall lines via
-split-and-merge on wall-tagged points, and outputs:
+grid rasterization + morphological closing + contour extraction +
+Douglas-Peucker simplification, and outputs:
   - output/wall_lines.json: wall endpoints
   - output/wall_lines_topdown.png: top-down wall visualization
 
