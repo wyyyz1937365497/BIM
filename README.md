@@ -137,7 +137,6 @@ bim_recon/
 
 scripts/
 ├── run_pipeline.py          # 主流程：scene → walls → doors → windows → JSON（唯一入口）
-├── verify_elements.py       # 单独检测某类构件（--element door/window/furniture）
 ├── generate_walls.py        # 单独提取墙线
 ├── final_radar.py           # 可视化：4 面板管线结果图
 ├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器（工具）

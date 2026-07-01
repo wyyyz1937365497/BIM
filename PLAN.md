@@ -271,7 +271,6 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `scripts/wall_line_probe.py` | 墙线提取探针（多高度扫描 → 墙线 JSON + 俯视图 PNG）| 已验证 |
 | `bim_recon/candidate_extractor.py` | 元素候选提取：从多高度扫描 + feat.pt 语义标签提取候选构件位置（门/窗/家具），投影到墙线 + 间隙聚类 + 极坐标计算 | 17/17 pytest 通过 |
 | `bim_recon/vlm_verifier.py` | VLM 验证模块：极坐标→相机位姿映射（支持 X/Y/Z-up）→ 3DGS 渲染 → Ollama VLM（gemma4:12b）确认/排除 | 25/25 pytest 通过 |
-| `scripts/verify_elements.py` | 端到端 CLI：加载场景 → 扫描 → 候选提取 → 预过滤 → VLM 验证 → 结果 JSON | room0: 14 候选 → 5 过滤 → 2 确认门 |
 | `tests/test_candidate_extractor.py` | 候选提取单元测试（投影/聚类/提取/DBSCAN自由构件/过滤）| 17/17 通过 |
 | `tests/test_vlm_verifier.py` | VLM 验证单元测试（极坐标/视角映射 X-Y-Z-up/响应解析/prompt/Mock端到端）| 25/25 通过 |
 
@@ -665,7 +664,6 @@ fov    = 60°
 **实现模块**：
 - `candidate_extractor.py`：从 ScanResult + 墙线提取 Candidate[]（投影到墙 + 间隙聚类 + 极坐标计算）
 - `vlm_verifier.py`：Candidate → 相机位姿 → 3DGS 渲染 → Ollama gemma4:12b VLM 确认/排除
-- `verify_elements.py`：端到端 CLI
 
 **真实数据验证**（room0, 1,373,014 高斯, point_cloud_30000.ply 原始权重）：
 - feat.pt 产生 14 个门候选 → 预过滤（width≥0.7m, pts≥100）剩 5 个 → VLM 确认 2 个
@@ -692,12 +690,13 @@ fov    = 60°
 **统一管线**（`scripts/run_pipeline.py`）：
 - 唯一入口：`python scripts/run_pipeline.py --name room0`
 - 流程：加载场景 → 12 高度雷达扫描 → 墙线提取 → 门检测 → 窗检测 → JSON 输出
-- 可选参数：`--elements door window column`（指定检测类型）、`--skip-vlm`（跳过 VLM）、`--revit`（推送 Revit）
+- 可选参数：`--elements door window column`（指定检测类型）、`--skip-vlm`（跳过 VLM）
 - 输出：`pipeline_report.json` + `wall_lines_snapped.json` + `doors_verified.json` + `windows_verified.json`
+- （计划中）Revit MCP 推送：待 A 阶段实现，当前管线输出 JSON 供手动导入
 
 **脚本清理**：
 - 删除 15 个冗余探针/探索脚本（analyze_*, check_*, probe_*, *_probe.py 等）
-- 保留 8 个脚本：run_pipeline（主流程）、verify_elements（单独检测）、generate_walls（单独墙线）、final_radar（可视化）、encode_bim_labels（工具）、manual_to_revit_code（工具）、test_mcp_gs（测试）、train_gs（训练包装）
+- 保留 7 个脚本：run_pipeline（主流程）、generate_walls（单独墙线）、final_radar（可视化）、encode_bim_labels（工具）、manual_to_revit_code（工具）、test_mcp_gs（测试）、train_gs（训练包装）
 
 **项目约定**：
 - 永远不要在意字符/字体警告（emoji 缺失、CJK glyph 等），程序能正常运行即可

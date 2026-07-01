@@ -1,7 +1,7 @@
 """3DGS → BIM unified pipeline.
 
 Single entry point: provide original 3DGS scene + feat.pt, get walls + doors +
-windows detected and ready for Revit.
+windows detected.
 
 Pipeline stages:
   1. Load scene (point_cloud.ply + feat.pt)
@@ -10,12 +10,13 @@ Pipeline stages:
   4. Element detection per type (door, window):
      feat.pt candidates → pre-filter → VLM verify (Ollama)
   5. Output JSON files
-  6. (Optional) Push to Revit via MCP tools
+
+  (Planned) Stage 6: Push to Revit via MCP tools — not yet implemented.
 
 Usage:
     cmd /c "...\\vcvars64.bat && python scripts/run_pipeline.py --name room0"
     cmd /c "...\\vcvars64.bat && python scripts/run_pipeline.py --name room0 --skip-vlm"
-    cmd /c "...\\vcvars64.bat && python scripts/run_pipeline.py --name room0 --revit"
+    cmd /c "...\\vcvars64.bat && python scripts/run_pipeline.py --name room0 --elements door window column"
 
 Outputs:
     output/<name>/wall_lines_snapped.json     — wall endpoints (closed polygon)
@@ -205,6 +206,7 @@ def detect_elements(
         element_class=cfg.name,
         ollama_model=ollama_model,
         up_axis=up_axis,
+        vlm_hint=cfg.vlm_hint,
         skip_vlm=skip_vlm,
     )
 

@@ -188,11 +188,17 @@ def query_ollama(
     return result.get("response", "")
 
 
-def _build_prompt(element_class: str) -> str:
-    """Build a structured VLM verification prompt."""
+def _build_prompt(element_class: str, vlm_hint: str = "") -> str:
+    """Build a structured VLM verification prompt.
+
+    Args:
+        element_class: Element name (e.g. "door").
+        vlm_hint: Extra context to help the VLM (e.g. "a door with frame and handle").
+    """
+    hint_clause = f" ({vlm_hint})" if vlm_hint else ""
     return (
         f"This image is rendered from inside a room. "
-        f"Is there a {element_class.upper()} visible in this image? "
+        f"Is there a {element_class.upper()}{hint_clause} visible in this image? "
         f"Answer with CONFIRMED or REJECTED on the first line, "
         f"then briefly describe what you see."
     )
@@ -229,6 +235,7 @@ def verify_candidates(
     image_height: int = 600,
     fov: float = 60.0,
     up_axis: int = 2,
+    vlm_hint: str = "",
     skip_vlm: bool = False,
     progress_callback: Optional[Any] = None,
 ) -> List[VerificationResult]:
@@ -264,7 +271,7 @@ def verify_candidates(
     up_vec = [0.0, 0.0, 0.0]
     up_vec[up_axis] = 1.0
 
-    prompt = _build_prompt(element_class)
+    prompt = _build_prompt(element_class, vlm_hint)
     results: List[VerificationResult] = []
 
     for i, cand in enumerate(candidates):

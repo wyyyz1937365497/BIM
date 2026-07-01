@@ -29,7 +29,6 @@ class ElementConfig:
     structural: bool        # True = project to walls, False = free-standing DBSCAN
     min_width: float        # minimum candidate width (meters)
     min_points: int         # minimum scan points per candidate
-    typical_height: float   # typical element height (meters), used for scan targeting
     vlm_hint: str           # extra context for VLM prompt (appended to element name)
 
     @property
@@ -54,7 +53,6 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         structural=True,
         min_width=0.7,
         min_points=100,
-        typical_height=2.1,
         vlm_hint="a door (passage between rooms, usually has a frame and handle)",
     ),
     "window": ElementConfig(
@@ -63,7 +61,6 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         structural=True,
         min_width=0.5,
         min_points=50,
-        typical_height=1.2,
         vlm_hint="a window (glass opening in a wall, may have blinds or curtains)",
     ),
     "column": ElementConfig(
@@ -72,7 +69,6 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         structural=True,
         min_width=0.2,
         min_points=80,
-        typical_height=2.5,
         vlm_hint="a structural column (vertical load-bearing pillar)",
     ),
     "furniture": ElementConfig(
@@ -81,7 +77,6 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         structural=False,   # free-standing → DBSCAN clustering
         min_width=0.3,
         min_points=50,
-        typical_height=0.8,
         vlm_hint="a piece of furniture (e.g. bed, sofa, cabinet, table)",
     ),
 }
