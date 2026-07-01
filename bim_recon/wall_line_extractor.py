@@ -512,94 +512,204 @@ def _remove_isolated_walls(
     return result
 
 
+def _close_loop_via_intersections(
+    lines: List[WallLine],
+    max_corner_dist: float = 1.5,
+) -> List[WallLine]:
+    """Snap each wall endpoint to the nearest wall-wall line intersection.
+
+    For each endpoint of each wall, finds the nearest OTHER wall, computes
+    the infinite-line intersection, and if it's within ``max_corner_dist``
+    of the current endpoint, snaps the endpoint to that intersection.
+
+    This creates proper corners where walls meet, forming a closed loop.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    def line_intersection(
+        p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Intersection of two infinite 2D lines. Returns None if parallel."""
+        det = d1[0] * (-d2[1]) - (-d2[0]) * d1[1]
+        if abs(det) < 1e-8:
+            return None
+        diff = p2 - p1
+        t = (diff[0] * (-d2[1]) - (-d2[0]) * diff[1]) / det
+        return p1 + t * d1
+
+    result: List[WallLine] = []
+    for i, wl in enumerate(lines):
+        p0 = np.array([wl.x1, wl.y1])
+        p1 = np.array([wl.x2, wl.y2])
+        wall_dir = p1 - p0
+        dir_norm = float(np.linalg.norm(wall_dir))
+        if dir_norm < 1e-6:
+            result.append(wl)
+            continue
+        wall_dir_unit = wall_dir / dir_norm
+
+        # For each endpoint, find best intersection with another wall.
+        new_p0 = p0.copy()
+        new_p1 = p1.copy()
+
+        for endpoint, other_end, label in [
+            (p0, p1, "p0"), (p1, p0, "p1"),
+        ]:
+            best_pt = endpoint.copy()
+            best_dist = max_corner_dist
+            for j, other in enumerate(lines):
+                if i == j:
+                    continue
+                op0 = np.array([other.x1, other.y1])
+                op1 = np.array([other.x2, other.y2])
+                other_dir = op1 - op0
+                other_norm = float(np.linalg.norm(other_dir))
+                if other_norm < 1e-6:
+                    continue
+                other_dir_unit = other_dir / other_norm
+                intersection = line_intersection(
+                    endpoint, wall_dir_unit, op0, other_dir_unit,
+                )
+                if intersection is None:
+                    continue
+                dist = float(np.linalg.norm(intersection - endpoint))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pt = intersection
+            if label == "p0":
+                new_p0 = best_pt
+            else:
+                new_p1 = best_pt
+
+        new_len = float(np.linalg.norm(new_p1 - new_p0))
+        if new_len >= 0.1:
+            result.append(WallLine(
+                x1=float(new_p0[0]), y1=float(new_p0[1]),
+                x2=float(new_p1[0]), y2=float(new_p1[1]),
+                length=new_len, num_points=wl.num_points,
+            ))
+    return result
+
+
 def extract_wall_lines(
     scans: List[ScanResult],
     wall_class_idx: int = 0,
     exclude_classes: Optional[List[int]] = None,
     center: Optional[np.ndarray] = None,
+    # New pipeline parameters
+    grid_resolution: float = 0.05,
+    morph_kernel_size: int = 7,
+    dbscan_eps: float = 0.15,
+    dbscan_min_samples: int = 10,
+    dp_epsilon_factor: float = 0.012,
+    min_wall_length: float = 0.3,
+    # Legacy parameters (ignored, kept for API compat)
     split_threshold: float = 0.08,
     min_segment_points: int = 8,
     angle_bin_deg: float = 0.5,
 ) -> Tuple[List[WallLine], np.ndarray]:
-    """Extract wall line segments from multi-height semantic scans.
+    """Extract wall lines via grid rasterization + morphology + contour + Douglas-Peucker.
 
-    Algorithm:
-      1. Collect wall-surface points (broadened: exclude floor/ceiling/furniture).
-      2. Sort by azimuth angle around scan center.
-      3. Bin into uniform angle bins (median distance per bin).
-      4. Apply split-and-merge on the ordered Cartesian points.
-      5. Convert segments to WallLine with endpoints.
+    Replaces the previous polar split-and-merge pipeline. The new pipeline:
+
+      1. Collect wall-surface points (exclude floor/ceiling/furniture).
+      2. DBSCAN clustering to remove noise outliers.
+      3. Rasterize points to an occupancy grid (``grid_resolution`` m/px).
+      4. Morphological closing (dilate+erode) to bridge gaps from occlusion.
+      5. Extract the largest external contour (guaranteed closed polygon).
+      6. Douglas-Peucker simplification → corner vertices.
+      7. Convert consecutive corners to WallLine segments (closed loop).
 
     Args:
         scans: Multi-height scan results with semantic labels.
         wall_class_idx: Class index for "wall" (used when exclude_classes is None).
-        exclude_classes: If given, keep all points except these classes.
-            Default [1, 2, 8] = floor, ceiling, furniture (broadens wall
-            detection to include misclassified surfaces like door/window).
-        center: Scan center (auto from first scan if None).
-        split_threshold: Max point-line distance for splitting.
-        min_segment_points: Min points per wall segment.
-        angle_bin_deg: Angular resolution for polar binning.
+        exclude_classes: Keep all points except these classes.
+            Default [1, 2, 8] = floor, ceiling, furniture.
+        grid_resolution: Occupancy grid resolution in meters per pixel.
+        morph_kernel_size: Closing kernel size in pixels (bridges gaps of
+            approximately ``morph_kernel_size * grid_resolution`` meters).
+        dbscan_eps: DBSCAN neighborhood radius for noise removal.
+        dbscan_min_samples: DBSCAN minimum cluster size.
+        dp_epsilon_factor: Douglas-Peucker tolerance as fraction of perimeter.
+        min_wall_length: Minimum wall segment length in meters.
 
     Returns:
         (wall_lines, all_wall_points) — extracted walls and raw points.
     """
+    import cv2
+    from sklearn.cluster import DBSCAN
+
+    # --- Step 1: Collect wall points ---
     if exclude_classes is None:
         exclude_classes = [1, 2, 8]  # floor, ceiling, furniture
     wall_pts, _ = extract_wall_points(scans, wall_class_idx, exclude_classes)
     if len(wall_pts) < 10:
         return [], wall_pts
 
-    if center is None:
-        center = scans[0].center_2d
-
-    # Polar sort + bin.
-    angles, dists, _ = _polar_sort(wall_pts, center)
-    bin_angles, bin_dists = _bin_polar(angles, dists, angle_bin_deg)
-    if len(bin_angles) < 4:
+    # --- Step 2: DBSCAN noise removal ---
+    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(wall_pts)
+    labels = clustering.labels_
+    unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+    if len(unique_labels) == 0:
+        return [], wall_pts
+    # Keep clusters with ≥10% of the largest cluster's size.
+    size_threshold = counts.max() * 0.1
+    valid_labels = set(unique_labels[counts >= size_threshold].tolist())
+    mask = np.isin(labels, list(valid_labels))
+    clean_pts = wall_pts[mask]
+    if len(clean_pts) < 10:
         return [], wall_pts
 
-    bin_pts = _polar_to_cartesian(bin_angles, bin_dists, center)
+    # --- Step 3: Rasterize to occupancy grid ---
+    x_min, y_min = clean_pts[:, 0].min(), clean_pts[:, 1].min()
+    x_max, y_max = clean_pts[:, 0].max(), clean_pts[:, 1].max()
+    grid_w = int(np.ceil((x_max - x_min) / grid_resolution)) + 1
+    grid_h = int(np.ceil((y_max - y_min) / grid_resolution)) + 1
 
-    # Split-and-merge.
-    seg_indices = _split_and_merge(
-        bin_pts,
-        dist_threshold=split_threshold,
-        min_points=min_segment_points,
+    grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    px = ((clean_pts[:, 0] - x_min) / grid_resolution).astype(np.int32)
+    py = ((clean_pts[:, 1] - y_min) / grid_resolution).astype(np.int32)
+    px = np.clip(px, 0, grid_w - 1)
+    py = np.clip(py, 0, grid_h - 1)
+    grid[py, px] = 255
+
+    # --- Step 4: Morphological closing ---
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (morph_kernel_size, morph_kernel_size),
     )
+    grid_closed = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, kernel)
 
-    # Convert to WallLine, handling wraparound (0°/360° boundary).
+    # --- Step 5: Extract largest contour ---
+    contours, _ = cv2.findContours(grid_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return [], wall_pts
+    largest = max(contours, key=cv2.contourArea)
+
+    # --- Step 6: Douglas-Peucker simplification ---
+    perimeter = cv2.arcLength(largest, True)
+    epsilon = max(dp_epsilon_factor * perimeter, 2.0)  # at least 2 pixels
+    simplified = cv2.approxPolyDP(largest, epsilon, True)
+
+    # --- Step 7: Convert pixel corners → world coords → WallLine ---
+    corners_px = simplified.reshape(-1, 2)
+    world_corners = np.zeros_like(corners_px, dtype=np.float64)
+    world_corners[:, 0] = corners_px[:, 0] * grid_resolution + x_min
+    world_corners[:, 1] = corners_px[:, 1] * grid_resolution + y_min
+
+    n = len(world_corners)
     wall_lines: List[WallLine] = []
-    for s, e in seg_indices:
-        p0 = bin_pts[s]
-        p1 = bin_pts[e]
+    for i in range(n):
+        p0 = world_corners[i]
+        p1 = world_corners[(i + 1) % n]  # closed loop
         length = float(np.linalg.norm(p1 - p0))
-        if length < 0.3:  # skip very short segments
-            continue
-        wall_lines.append(WallLine(
-            x1=float(p0[0]), y1=float(p0[1]),
-            x2=float(p1[0]), y2=float(p1[1]),
-            length=length,
-            num_points=e - s + 1,
-        ))
-
-    # Post-process: merge fragmented collinear segments.
-    wall_lines = _merge_wall_lines(wall_lines, angle_thresh_deg=12.0, gap_thresh=1.5)
-
-    # Flatten short deviations back onto nearby long walls.
-    wall_lines = _flatten_deviations(wall_lines, short_threshold=1.0, deviation_threshold=0.2)
-
-    # Remove isolated walls (likely false positives).
-    wall_lines = _remove_isolated_walls(wall_lines, isolation_threshold=2.0)
-
-    # Re-merge after flattening may have aligned segments.
-    wall_lines = _merge_wall_lines(wall_lines, angle_thresh_deg=12.0, gap_thresh=1.5)
-
-    # Snap endpoints to form a closed loop.
-    wall_lines = _snap_endpoints_to_loop(wall_lines, snap_threshold=0.8)
-
-    # Final cleanup: remove walls that collapsed to near-zero length after snapping.
-    wall_lines = [wl for wl in wall_lines if wl.length >= 0.3]
+        if length >= min_wall_length:
+            wall_lines.append(WallLine(
+                x1=float(p0[0]), y1=float(p0[1]),
+                x2=float(p1[0]), y2=float(p1[1]),
+                length=length,
+                num_points=0,
+            ))
 
     return wall_lines, wall_pts
 
