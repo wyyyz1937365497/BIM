@@ -1,9 +1,0 @@
-wall
-floor
-ceiling
-door
-window
-column
-beam
-stairs
-furniture

@@ -25,12 +25,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bim_recon.candidate_extractor import (
-    BIM_CLASS_INDICES,
-    BIM_STRUCTURAL_CLASSES,
     Candidate,
     extract_candidates,
     prefilter_candidates,
 )
+from bim_recon.element_config import get_element_config, list_element_types
 from bim_recon.gs_scene import GSScene
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
@@ -61,11 +60,11 @@ def main() -> int:
     )
     parser.add_argument("--name", required=True, help="Scene name (data/<name>)")
     parser.add_argument("--element", default="door",
-                        help="Element class: door, window, furniture, ...")
-    parser.add_argument("--min-width", type=float, default=0.7,
-                        help="Min width to keep candidate (m)")
-    parser.add_argument("--min-points", type=int, default=100,
-                        help="Min scan points to keep candidate")
+                        help=f"Element class: {', '.join(list_element_types())}")
+    parser.add_argument("--min-width", type=float, default=None,
+                        help="Min width to keep candidate (m). Default: per-type from config.")
+    parser.add_argument("--min-points", type=int, default=None,
+                        help="Min scan points to keep candidate. Default: per-type from config.")
     parser.add_argument("--ollama-model", default="gemma4:12b")
     parser.add_argument("--skip-vlm", action="store_true",
                         help="Only render images, skip VLM verification")
@@ -74,10 +73,16 @@ def main() -> int:
     args = parser.parse_args()
 
     element = args.element.lower()
-    if element not in BIM_CLASS_INDICES:
+    try:
+        cfg = get_element_config(element)
+    except KeyError:
         print(f"ERROR: Unknown element '{element}'. "
-              f"Valid: {list(BIM_CLASS_INDICES.keys())}")
+              f"Valid: {list_element_types()}")
         return 1
+
+    # Use CLI override or config default
+    min_width: float = args.min_width if args.min_width is not None else cfg.min_width
+    min_points: int = args.min_points if args.min_points is not None else cfg.min_points
 
     data_dir = ROOT / "data" / args.name
     out_dir = ROOT / "output" / args.name
@@ -141,8 +146,8 @@ def main() -> int:
     total_pts = sum(len(s.angles_deg) for s in scans)
     print(f"  Total scan points: {total_pts}")
 
-    class_idx = BIM_CLASS_INDICES[element]
-    is_structural = element in BIM_STRUCTURAL_CLASSES
+    class_idx = cfg.class_idx
+    is_structural = cfg.structural
 
     # --- Extract candidates ---
     candidates = extract_candidates(
@@ -159,9 +164,9 @@ def main() -> int:
 
     # --- Pre-filter ---
     filtered = prefilter_candidates(
-        candidates, args.min_width, args.min_points,
+        candidates, min_width, min_points,
     )
-    print(f"\nAfter pre-filter (width≥{args.min_width}m, pts≥{args.min_points}): "
+    print(f"\nAfter pre-filter (width>={min_width}m, pts>={min_points}): "
           f"{len(filtered)}")
 
     if not filtered:
@@ -169,7 +174,7 @@ def main() -> int:
         return 0
 
     # --- VLM verification ---
-    verify_dir = out_dir / f"verify_{element}"
+    verify_dir = out_dir / cfg.verify_dir_name
     print(f"\nVLM verification ({'Ollama ' + args.ollama_model if not args.skip_vlm else 'SKIP'})...")
 
     def progress(i: int, total: int, r: VerificationResult) -> None:
@@ -202,17 +207,17 @@ def main() -> int:
         "errors": len(errors),
         "results": [r.to_dict() for r in results],
     }
-    out_path = out_dir / f"{element}s_verified.json"
+    out_path = out_dir / cfg.output_json_name
     out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
     print(f"\n{'='*60}")
     print(f"Results: {len(confirmed)} confirmed, {len(rejected)} rejected, "
           f"{len(errors)} errors")
     for r in results:
-        status = "✅" if r.confirmed else "❌" if r.confirmed is False else "⚠️"
+        status = "[OK]" if r.confirmed else "[X]" if r.confirmed is False else "[?]"
         preview = r.vlm_response[:80].replace("\n", " ") if r.vlm_response else ""
         print(f"  {status} Wall {r.candidate.wall_idx}, "
-              f"θ={r.theta:.1f}°, width={r.candidate.width_m:.2f}m  {preview}")
+              f"theta={r.theta:.1f}, width={r.candidate.width_m:.2f}m  {preview}")
     print(f"\nSaved: {out_path}")
     return 0
 
