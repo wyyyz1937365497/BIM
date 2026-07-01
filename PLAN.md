@@ -263,6 +263,11 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `bim_recon/wall_line_extractor.py` | 多高度扫描 → 栅格化 + 形态学闭运算 + 轮廓提取 + Douglas-Peucker + RANSAC/PCA 精修 → 闭合墙线多边形 | 真实数据 11 墙闭合多边形 + 点云中心拟合 |
 | `scripts/virtual_scan_probe.py` | 虚拟扫描探针（加载 feat.pt → 多高度扫描 → 雷达 PNG + JSON）| 已验证 |
 | `scripts/wall_line_probe.py` | 墙线提取探针（多高度扫描 → 墙线 JSON + 俯视图 PNG）| 已验证 |
+| `bim_recon/candidate_extractor.py` | 元素候选提取：从多高度扫描 + feat.pt 语义标签提取候选构件位置（门/窗/家具），投影到墙线 + 间隙聚类 + 极坐标计算 | 16/16 pytest 通过 |
+| `bim_recon/vlm_verifier.py` | VLM 验证模块：极坐标→相机位姿映射 → 3DGS 渲染 → Ollama VLM（gemma4:12b）确认/排除 | 18/18 pytest 通过 |
+| `scripts/verify_elements.py` | 端到端 CLI：加载场景 → 扫描 → 候选提取 → 预过滤 → VLM 验证 → 结果 JSON | room0: 14 候选 → 5 过滤 → 2 确认门 |
+| `tests/test_candidate_extractor.py` | 候选提取单元测试（投影/聚类/提取/过滤）| 16/16 通过 |
+| `tests/test_vlm_verifier.py` | VLM 验证单元测试（极坐标计算/视角映射/响应解析/prompt 构建）| 18/18 通过 |
 
 ### 关键技术决策
 
@@ -633,6 +638,38 @@ WallFitter.fit() 内部：
 **关键设计决策**：
 - 栅格轮廓仅用于**拓扑**（确定"哪段是哪面墙"），不作为最终几何——RANSAC/PCA 拟合才决定墙线位置。
 - 形态学闭运算桥接遮挡间隙——这是极坐标 split-and-merge 无法做到的。
+
+### 12.9 [2026-07-01] VLM 验证元素提取（雷达扫描 + Ollama VLM 两阶段检测）
+
+**背景**：§12.8 的栅格化墙线提取能找到墙，但 feat.pt 语义标签对门/窗等构件存在大量误报（room0: 14 个门候选中仅 2 个是真的）。硬编码过滤换房间就失效。
+
+**核心方案**：两阶段检测，每阶段做它最擅长的事：
+1. **Stage 1 — feat.pt 候选生成**（高召回）：雷达扫描的语义标签找到所有"像门"的位置
+2. **Stage 2 — 3DGS 渲染 + VLM 验证**（高精度）：对每个候选位置渲染一张针对性图像，让 VLM 判定是否真的是门
+
+**极坐标 → 渲染视角映射**（关键数学）：
+雷达扫描的每个点本身就是从房间中心渲染出来的——极角 θ = 从中心看向该点的方位角，距离 r = 到表面的物理距离。给定候选的 (θ_c, r_c, h_range)：
+
+```python
+eye    = (cx, cy, floor_z + 1.5)    # 房间中心，人眼高度
+target = (cx + r_c·cos(θ_c), cy + r_c·sin(θ_c), floor_z + h_mid)  # 构件中心
+fov    = 60°
+```
+
+**实现模块**：
+- `candidate_extractor.py`：从 ScanResult + 墙线提取 Candidate[]（投影到墙 + 间隙聚类 + 极坐标计算）
+- `vlm_verifier.py`：Candidate → 相机位姿 → 3DGS 渲染 → Ollama gemma4:12b VLM 确认/排除
+- `verify_elements.py`：端到端 CLI
+
+**真实数据验证**（room0, 1,373,014 高斯, point_cloud_30000.ply 原始权重）：
+- feat.pt 产生 14 个门候选 → 预过滤（width≥0.7m, pts≥100）剩 5 个 → VLM 确认 2 个
+- 排除的 3 个误报：2 个实为窗（百叶窗），1 个实为墙面装饰画
+- VLM 不仅排除误报，还自动说出实际是什么（可顺带修正分类）
+
+**关键决策**：
+- 固定使用 Ollama gemma4:12b 作为 VLM 后端（本地部署，无 API 成本）
+- 偏好 `point_cloud_*.ply` 原始权重渲染（颜色准确），而非 `_feat_vis_3dgs.ply`（PCA 染色）
+- VLM prompt 要求首行输出 CONFIRMED/REJECTED，便于自动解析
 
 ---
 
