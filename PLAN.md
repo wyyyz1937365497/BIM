@@ -263,11 +263,11 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `bim_recon/wall_line_extractor.py` | 多高度扫描 → 栅格化 + 形态学闭运算 + 轮廓提取 + Douglas-Peucker + RANSAC/PCA 精修 → 闭合墙线多边形 | 真实数据 11 墙闭合多边形 + 点云中心拟合 |
 | `scripts/virtual_scan_probe.py` | 虚拟扫描探针（加载 feat.pt → 多高度扫描 → 雷达 PNG + JSON）| 已验证 |
 | `scripts/wall_line_probe.py` | 墙线提取探针（多高度扫描 → 墙线 JSON + 俯视图 PNG）| 已验证 |
-| `bim_recon/candidate_extractor.py` | 元素候选提取：从多高度扫描 + feat.pt 语义标签提取候选构件位置（门/窗/家具），投影到墙线 + 间隙聚类 + 极坐标计算 | 16/16 pytest 通过 |
-| `bim_recon/vlm_verifier.py` | VLM 验证模块：极坐标→相机位姿映射 → 3DGS 渲染 → Ollama VLM（gemma4:12b）确认/排除 | 18/18 pytest 通过 |
+| `bim_recon/candidate_extractor.py` | 元素候选提取：从多高度扫描 + feat.pt 语义标签提取候选构件位置（门/窗/家具），投影到墙线 + 间隙聚类 + 极坐标计算 | 17/17 pytest 通过 |
+| `bim_recon/vlm_verifier.py` | VLM 验证模块：极坐标→相机位姿映射（支持 X/Y/Z-up）→ 3DGS 渲染 → Ollama VLM（gemma4:12b）确认/排除 | 25/25 pytest 通过 |
 | `scripts/verify_elements.py` | 端到端 CLI：加载场景 → 扫描 → 候选提取 → 预过滤 → VLM 验证 → 结果 JSON | room0: 14 候选 → 5 过滤 → 2 确认门 |
-| `tests/test_candidate_extractor.py` | 候选提取单元测试（投影/聚类/提取/过滤）| 16/16 通过 |
-| `tests/test_vlm_verifier.py` | VLM 验证单元测试（极坐标计算/视角映射/响应解析/prompt 构建）| 18/18 通过 |
+| `tests/test_candidate_extractor.py` | 候选提取单元测试（投影/聚类/提取/DBSCAN自由构件/过滤）| 17/17 通过 |
+| `tests/test_vlm_verifier.py` | VLM 验证单元测试（极坐标/视角映射 X-Y-Z-up/响应解析/prompt/Mock端到端）| 25/25 通过 |
 
 ### 关键技术决策
 
