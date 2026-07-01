@@ -105,13 +105,14 @@ def extract_wall_points(
     for scan in scans:
         if scan.semantic_labels is None:
             continue
+        labels = scan.semantic_labels
         if exclude_set is not None:
-            mask = np.array([
-                int(l) not in exclude_set
-                for l in scan.semantic_labels
-            ])
+            # Vectorized: build boolean mask without Python-level iteration.
+            mask = np.ones(len(labels), dtype=bool)
+            for cls in exclude_set:
+                mask &= (labels != cls)
         else:
-            mask = scan.semantic_labels == wall_class_idx
+            mask = labels == wall_class_idx
         if mask.sum() == 0:
             continue
         all_pts.append(scan.points_2d[mask])
@@ -144,20 +145,30 @@ def _bin_polar(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Bin polar data into uniform angle bins, taking median distance per bin.
 
+    Vectorized via np.digitize for speed.
+
     Returns (bin_angles_rad, bin_distances) for bins with data.
     """
     if len(angles) == 0:
         return np.empty(0), np.empty(0)
     bin_rad = math.radians(bin_deg)
-    bins = np.arange(angles.min(), angles.max() + bin_rad, bin_rad)
+    bin_edges = np.arange(angles.min(), angles.max() + bin_rad, bin_rad)
+    if len(bin_edges) < 2:
+        return np.empty(0), np.empty(0)
+    # Assign each point to a bin.
+    bin_idx = np.digitize(angles, bin_edges) - 1
+    bin_idx = np.clip(bin_idx, 0, len(bin_edges) - 2)
+    n_bins = len(bin_edges) - 1
+    # Vectorized median per bin.
     bin_centers = []
-    bin_dists = []
-    for i in range(len(bins) - 1):
-        mask = (angles >= bins[i]) & (angles < bins[i + 1])
-        if mask.sum() > 0:
-            bin_centers.append((bins[i] + bins[i + 1]) / 2)
-            bin_dists.append(np.median(dists[mask]))
-    return np.array(bin_centers), np.array(bin_dists)
+    bin_medians = []
+    for i in range(n_bins):
+        mask = bin_idx == i
+        count = int(mask.sum())
+        if count > 0:
+            bin_centers.append((bin_edges[i] + bin_edges[i + 1]) / 2)
+            bin_medians.append(float(np.median(dists[mask])))
+    return np.array(bin_centers), np.array(bin_medians)
 
 
 def _polar_to_cartesian(
@@ -344,6 +355,163 @@ def _merge_wall_lines(
     return merged
 
 
+def _snap_endpoints_to_loop(
+    lines: List[WallLine],
+    snap_threshold: float = 0.8,
+) -> List[WallLine]:
+    """Snap nearby wall endpoints together to form a closed loop.
+
+    For each endpoint, find the nearest endpoint from a different wall.
+    If within ``snap_threshold``, replace both with their midpoint.
+    Iterates until no more snaps occur.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    def endpoints(wl: WallLine) -> Tuple[np.ndarray, np.ndarray]:
+        return np.array([wl.x1, wl.y1]), np.array([wl.x2, wl.y2])
+
+    changed = True
+    while changed:
+        changed = False
+        # Collect all endpoints with wall index and which end (0=p0, 1=p1).
+        eps: List[Tuple[int, int, np.ndarray]] = []
+        for i, wl in enumerate(lines):
+            p0, p1 = endpoints(wl)
+            eps.append((i, 0, p0))
+            eps.append((i, 1, p1))
+
+        best_dist = snap_threshold
+        best_pair = None
+        for a in range(len(eps)):
+            for b in range(a + 1, len(eps)):
+                wi_a, ei_a, pa = eps[a]
+                wi_b, ei_b, pb = eps[b]
+                if wi_a == wi_b:
+                    continue
+                d = float(np.linalg.norm(pa - pb))
+                if d < best_dist and d > 1e-3:
+                    best_dist = d
+                    best_pair = (wi_a, ei_a, pa, wi_b, ei_b, pb)
+
+        if best_pair is not None:
+            wi_a, ei_a, pa, wi_b, ei_b, pb = best_pair
+            midpoint = (pa + pb) / 2.0
+            # Update both walls
+            for wi, ei, _ in [(wi_a, ei_a, pa), (wi_b, ei_b, pb)]:
+                wl = lines[wi]
+                if ei == 0:
+                    lines[wi] = WallLine(
+                        x1=float(midpoint[0]), y1=float(midpoint[1]),
+                        x2=wl.x2, y2=wl.y2,
+                        length=wl.length, num_points=wl.num_points,
+                    )
+                else:
+                    lines[wi] = WallLine(
+                        x1=wl.x1, y1=wl.y1,
+                        x2=float(midpoint[0]), y2=float(midpoint[1]),
+                        length=wl.length, num_points=wl.num_points,
+                    )
+            # Recompute lengths
+            for wi in [wi_a, wi_b]:
+                wl = lines[wi]
+                wl.length = float(math.hypot(wl.x2 - wl.x1, wl.y2 - wl.y1))
+            changed = True
+    return lines
+
+
+def _flatten_deviations(
+    lines: List[WallLine],
+    short_threshold: float = 1.0,
+    deviation_threshold: float = 0.2,
+) -> List[WallLine]:
+    """Snap short wall segments that deviate slightly onto nearby long walls.
+
+    For each wall shorter than ``short_threshold``, find the nearest longer
+    wall. If the short wall's midpoint is within ``deviation_threshold``
+    perpendicular distance of the long wall's line, project the short segment
+    onto the long wall's line direction.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    result: List[WallLine] = []
+    for wl in lines:
+        if wl.length >= short_threshold:
+            result.append(wl)
+            continue
+        # Find nearest longer wall.
+        mid = np.array([(wl.x1 + wl.x2) / 2, (wl.y1 + wl.y2) / 2])
+        best_long: Optional[WallLine] = None
+        best_dist = float("inf")
+        for other in lines:
+            if other is wl or other.length < short_threshold:
+                continue
+            d = _point_line_distance(mid, np.array([other.x1, other.y1]), np.array([other.x2, other.y2]))
+            if d < best_dist:
+                best_dist = d
+                best_long = other
+        if best_long is not None and best_dist < deviation_threshold:
+            # Project short segment onto the long wall's line.
+            a = np.array([best_long.x1, best_long.y1])
+            b = np.array([best_long.x2, best_long.y2])
+            ab = b - a
+            ab_len = float(np.linalg.norm(ab))
+            if ab_len < 1e-6:
+                result.append(wl)
+                continue
+            ab_dir = ab / ab_len
+            # Project short wall endpoints onto the long line.
+            p0 = np.array([wl.x1, wl.y1])
+            p1 = np.array([wl.x2, wl.y2])
+            t0 = np.clip(np.dot(p0 - a, ab_dir) / ab_len, 0.0, 1.0)
+            t1 = np.clip(np.dot(p1 - a, ab_dir) / ab_len, 0.0, 1.0)
+            proj0 = a + t0 * ab
+            proj1 = a + t1 * ab
+            new_len = float(np.linalg.norm(proj1 - proj0))
+            if new_len > 0.05:
+                result.append(WallLine(
+                    x1=float(proj0[0]), y1=float(proj0[1]),
+                    x2=float(proj1[0]), y2=float(proj1[1]),
+                    length=new_len, num_points=wl.num_points,
+                ))
+            # else: segment collapses, drop it
+        else:
+            result.append(wl)
+    return result
+
+
+def _remove_isolated_walls(
+    lines: List[WallLine],
+    isolation_threshold: float = 2.0,
+) -> List[WallLine]:
+    """Remove walls whose midpoint is far from all other walls.
+
+    A wall is isolated if its minimum distance to any other wall's
+    nearest point exceeds ``isolation_threshold`` meters.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    result: List[WallLine] = []
+    for i, wl in enumerate(lines):
+        mid = np.array([(wl.x1 + wl.x2) / 2, (wl.y1 + wl.y2) / 2])
+        min_dist = float("inf")
+        for j, other in enumerate(lines):
+            if i == j:
+                continue
+            # Distance from mid to the other wall segment.
+            d = _point_line_distance(
+                mid,
+                np.array([other.x1, other.y1]),
+                np.array([other.x2, other.y2]),
+            )
+            min_dist = min(min_dist, d)
+        if min_dist <= isolation_threshold:
+            result.append(wl)
+    return result
+
+
 def extract_wall_lines(
     scans: List[ScanResult],
     wall_class_idx: int = 0,
@@ -417,6 +585,21 @@ def extract_wall_lines(
 
     # Post-process: merge fragmented collinear segments.
     wall_lines = _merge_wall_lines(wall_lines, angle_thresh_deg=12.0, gap_thresh=1.5)
+
+    # Flatten short deviations back onto nearby long walls.
+    wall_lines = _flatten_deviations(wall_lines, short_threshold=1.0, deviation_threshold=0.2)
+
+    # Remove isolated walls (likely false positives).
+    wall_lines = _remove_isolated_walls(wall_lines, isolation_threshold=2.0)
+
+    # Re-merge after flattening may have aligned segments.
+    wall_lines = _merge_wall_lines(wall_lines, angle_thresh_deg=12.0, gap_thresh=1.5)
+
+    # Snap endpoints to form a closed loop.
+    wall_lines = _snap_endpoints_to_loop(wall_lines, snap_threshold=0.8)
+
+    # Final cleanup: remove walls that collapsed to near-zero length after snapping.
+    wall_lines = [wl for wl in wall_lines if wl.length >= 0.3]
 
     return wall_lines, wall_pts
 

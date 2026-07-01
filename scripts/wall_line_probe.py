@@ -69,7 +69,7 @@ def main() -> int:
         num_heights=num_heights,
         num_views=8,
         fov=60.0,
-        width=1024,
+        width=512,
     )
     total_pts = sum(len(s.angles_deg) for s in scans)
     print(f"Total scan points across all heights: {total_pts}")
