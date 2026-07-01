@@ -259,6 +259,10 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `bim_recon/floorplan_registration.py` | FloorPlan→3DGS 自动配准（PCA 旋转 + 90° 候选搜索 + 平移网格搜索 + 地板多边形评分）| 3/3 pytest 通过 |
 | `tests/test_wall_fitter.py` | WallFitter 单元测试（basic/merge/align/refine/height/revit 转换）| 16/16 通过 |
 | `tests/test_floorplan_guided.py` | FloorPlanGuidedFitter + register_floorplan 单元测试（registration/corridor/noise/height）| 8/8 通过 |
+| `bim_recon/virtual_scanner.py` | VirtualScanner：从 3DGS 深度渲染模拟 2D 激光扫描（多视角拼接 360° 极坐标扫描 + feat.pt 语义标签）| 真实数据 7820 点 + 7 类语义标签验证 |
+| `bim_recon/wall_line_extractor.py` | 多高度扫描 → 栅格化 + 形态学闭运算 + 轮廓提取 + Douglas-Peucker + RANSAC/PCA 精修 → 闭合墙线多边形 | 真实数据 11 墙闭合多边形 + 点云中心拟合 |
+| `scripts/virtual_scan_probe.py` | 虚拟扫描探针（加载 feat.pt → 多高度扫描 → 雷达 PNG + JSON）| 已验证 |
+| `scripts/wall_line_probe.py` | 墙线提取探针（多高度扫描 → 墙线 JSON + 俯视图 PNG）| 已验证 |
 
 ### 关键技术决策
 
@@ -600,6 +604,35 @@ WallFitter.fit() 内部：
 - **对比**：盲拟合 9 面散落墙 → 底图引导 6 面整齐墙
 
 **MCP 工具**：`fit_walls_guided(floorplan_json, ...)` 接收 ManualProvider 格式 JSON（矩形或显式墙线段），返回 Revit-ready 墙参数。
+
+### 12.8 [2026-07-01] 虚拟激光扫描 + 栅格化墙线提取
+
+**背景**：底图引导（§12.7）依赖用户提供准确底图。用户希望从 3DGS 场景**自动提取墙线**，无需底图输入。核心洞察：gsplat 深度渲染可模拟激光扫描——从房间中心在特定高度渲染深度图，取水平切片即为 2D 极坐标扫描线，等效于真实 LiDAR。
+
+**虚拟扫描器**（`bim_recon/virtual_scanner.py`）：
+1. 在房间中心放置 N 个虚拟相机（8 视角 × 60° FOV = 480° 覆盖），每个在特定高度水平渲染。
+2. 提取深度图中间行（水平面切片），反投影到世界 XY 坐标 → 极坐标 (θ, r) 序列。
+3. 拼接 N 视角为完整 360° 扫描。
+4. **语义标签**：第二渲染通道将 feat.pt dominant class 编码到高斯 R 通道，渲染后解码每个扫描点的语义类别。
+
+**多高度墙线提取**（`bim_recon/wall_line_extractor.py`）：
+1. **多高度扫描**：从地板到天花板 8 个高度，每个高度独立扫描 → 融合（高处的扫描能看到矮家具后面的墙面）。
+2. **语义过滤**：排除 floor/ceiling/furniture 类别，保留所有结构垂直表面（wall+door+window+column+beam）。
+3. **DBSCAN 去噪**：eps=0.15m，min_samples=10，保留大簇。
+4. **栅格化 + 形态学闭运算**：0.05m/px 占据栅格 → 7×7 闭运算核桥接 0.35m 间隙（解决遮挡断裂）。
+5. **轮廓提取**：`cv2.findContours` 提取最大外轮廓（天然闭合多边形）。
+6. **Douglas-Peucker 简化**：`cv2.approxPolyDP`（周长 1.2%）→ 墙角顶点。
+7. **RANSAC/PCA 精修**：每面 DP 墙段筛选 ±0.3m 带宽内的原始扫描点，PCA 主成分拟合直线穿过点云几何中心，投影原始端点到拟合线（解决"线在边缘"问题）。
+
+**真实数据验证**：
+- 8 高度扫描 × 8 视角 × 2 通道 = 128 次渲染 → 31271 扫描点
+- 23608 墙表面点 → 11 面墙形成闭合多边形
+- 最长墙 5.49m（左）、5.10m（顶）、4.51m（底）
+- 每面墙携带 PCA 拟合点数（3357–3575 pts）
+
+**关键设计决策**：
+- 栅格轮廓仅用于**拓扑**（确定"哪段是哪面墙"），不作为最终几何——RANSAC/PCA 拟合才决定墙线位置。
+- 形态学闭运算桥接遮挡间隙——这是极坐标 split-and-merge 无法做到的。
 
 ---
 

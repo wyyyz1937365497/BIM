@@ -1,256 +1,225 @@
-# 3DGS -> BIM 自动重建系统
+# 3DGS → BIM 自动重建系统
 
-本仓库是 `PLAN.md` 的工程落地目录。目前完成的是 P0 阶段的一部分基础设施：`FloorPlan` 契约、手量底图 Provider、Revit C# 代码生成、差异报告与 3DGS MCP 工具边界脚手架。
+从消费级手机视频/RGB-D 数据，通过 3D Gaussian Splatting + SceneSplat 语义特征 + 虚拟激光扫描，自动提取墙体几何并导入 Revit。
 
-注意：这不是完整项目交付，也还没有在 Windows + Revit 环境中验证原生 BIM 图元创建。
+## 系统架构
 
-## 当前文件说明
-
-| 路径 | 作用 |
-| --- | --- |
-| `PLAN.md` | 项目总计划与架构事实来源。包含 24 周路线、技术栈、风险和历史决策记录。 |
-| `README.md` | 当前仓库状态说明，记录已经完成和未完成的内容。 |
-| `bim_recon/__init__.py` | Python 包导出入口。 |
-| `bim_recon/floorplan.py` | `FloorPlan` 契约、`WallSegment`、`Opening`、`FrameMeta`、`ManualProvider` 和合法性校验。 |
-| `bim_recon/revit_code.py` | 将 `FloorPlan` 转成 Revit API C# 代码，用于 `mcp-servers-for-revit` 的 `send_code_to_revit` 工具。 |
-| `bim_recon/diff_report.py` | 底图墙线与 3DGS/VLM 检出墙线的差异报告模块。MVP 策略是只报告，不自动改底图。 |
-| `bim_recon/gs_mcp_scaffold.py` | 3DGS 侧 MCP 工具边界脚手架，定义 `render_from_pose`、`get_depth`、`select_cluster`、`report_diff` 等工具规格。 |
-| `scripts/manual_to_revit_code.py` | CLI：读取手量 JSON，输出可交给 Revit MCP 执行的 C# 脚本。 |
-| `examples/manual-room.json` | 手量矩形房间示例，包含 4 面墙、1 个门洞、1 个窗洞。 |
-| `tests/test_floorplan.py` | Python 单元测试，覆盖 FloorPlan、ManualProvider、Revit C# 生成、差异报告和 3DGS MCP facade。 |
-| `a.py` | 早期 IfcOpenShell 几何内核检查脚本。当前主线已转向 Revit API，不属于新主链路。 |
-| `mcp-servers-for-revit/` | 计划使用的 C#/TypeScript Revit MCP 子模块目录。当前本地目录为空或未初始化，尚未接入。 |
-| `mcp-server-for-revit-python/` | 旧 pyRevit/IronPython 路线遗留目录。根据 `PLAN.md` 后续决策，该路线已被 C# MCP 方案替代。 |
-
-## 已完成内容
-
-### 1. FloorPlan 契约
-
-对应 `PLAN.md`：
-
-- `§4.1 去耦：FloorPlan Provider`
-- `§8 第 1 周可执行任务清单` 的第 3 项
-- `附录 A：FloorPlan 契约`
-
-完成情况：
-
-- 定义了 `WallType`、`OpeningKind`、`WallSegment`、`Opening`、`FrameMeta`、`FloorPlan`。
-- 实现了 `FloorPlanProvider` 抽象接口。
-- 实现了 `ManualProvider`。
-- 支持直接给 `walls/openings`。
-- 支持通过 `rectangle.width/depth` 快速生成矩形房间。
-- 支持 JSON 文件读取。
-- 增加了墙长、墙厚、洞口宽度、洞口位置、窗台高度、门窗类型等合法性校验。
-- 墙厚默认规则：承重墙 `0.24m`，隔墙 `0.12m`，未知墙按 `0.24m` 兜底。
-
-### 2. 手量 JSON 示例
-
-对应 `PLAN.md`：
-
-- `§8 第 1 周可执行任务清单` 的第 3 项
-
-完成情况：
-
-- 新增 `examples/manual-room.json`。
-- 示例描述一个 `5m x 4m` 的矩形房间。
-- 包含 1 个门洞和 1 个窗洞。
-
-### 3. Revit API C# 代码生成
-
-对应 `PLAN.md`：
-
-- 开头架构变更：从 IFC 改为 Revit API 原生图元。
-- `§3 系统架构` 的 Revit MCP 服务器部分。
-- `§12.3` 和 `§12.4` 中关于 `mcp-servers-for-revit` 的 C# MCP 路线。
-
-完成情况：
-
-- 新增 `bim_recon/revit_code.py`。
-- 能把 `FloorPlan` 转成 Revit API C# 脚本。
-- 生成逻辑包含：
-- 创建或复用 Level。
-- 创建 Wall。
-- 根据墙厚尝试复制 WallType。
-- 创建 Floor 作为地板。
-- 创建 Floor 作为天花板占位表达。
-- 通过 `doc.Create.NewOpening` 创建门窗洞口。
-- 可选尝试放置宿主门窗族。
-
-限制：
-
-- 还没有在 Windows + Revit 中实机执行。
-- 生成代码默认假设 MCP 执行上下文提供 `uiapp` 变量。
-- 门窗族放置依赖当前 Revit 项目是否已加载对应族。
-
-### 4. CLI：手量 JSON -> Revit C# 脚本
-
-对应 `PLAN.md`：
-
-- `§8 第 1 周可执行任务清单` 的第 2、3 项之间的桥接工具。
-
-完成情况：
-
-可以运行：
-
-```bash
-python scripts/manual_to_revit_code.py examples/manual-room.json
+```
+手机视频 → COLMAP → nerfstudio 3DGS训练 → gsplat场景
+                                                  │
+                                    SceneSplat PT-v3 推理 → feat.pt
+                                                  │
+                           ┌──────────────────────┼──────────────────────┐
+                           ▼                      ▼                      ▼
+                    虚拟激光扫描            语义高斯查询            底图引导拟合
+                 (virtual_scanner)       (query_semantics)      (fit_walls_guided)
+                           │                      │                      │
+                           ▼                      ▼                      ▼
+                    墙线提取管线            WallFitter RANSAC       FloorPlanGuidedFitter
+                 (wall_line_extractor)     (盲拟合，无底图)         (走廊+直方图峰值)
+                           │                      │                      │
+                           └──────────┬───────────┴──────────┬───────────┘
+                                      ▼                      ▼
+                              wall_lines.json          Revit MCP 工具
+                              wall_lines_topdown.png   create_line_based_element
 ```
 
-常用输出到文件：
+## 已实现功能
+
+### P0：基础设施
+- **FloorPlan 契约**（`bim_recon/floorplan.py`）：WallSegment、Opening、ManualProvider，支持 JSON 输入和矩形房间快速生成。
+- **Revit C# 代码生成**（`bim_recon/revit_code.py`）：FloorPlan → Revit API C#（墙、板、门窗洞口）。
+- **差异报告**（`bim_recon/diff_report.py`）：底图墙线 vs 检测墙线的匹配与差异输出。
+
+### P1：3DGS + 语义
+- **GSScene**（`bim_recon/gs_scene.py`）：加载 PLY / SceneSplat .npy 场景，gsplat 渲染（RGB+ED），语义查询。支持 `from_npy()` 加载 post-activation 格式数据。
+- **SemanticQuerier**（`bim_recon/semantics.py`）：加载 SceneSplat `feat.pt` + SigLIP2 文本嵌入，三种查询模式（dominant/threshold/top_percent）。9 类 BIM 词表（wall/floor/ceiling/door/window/column/beam/stairs/furniture）。
+- **MCP Server**（`bim_recon/mcp_gs.py`）：**9 个工具**暴露 3DGS 场景给 VLM/Agent——get_scene_info、list_cameras、render_from_pose、get_depth_grid、select_cluster、query_semantics、render_semantic_overlay、fit_walls、fit_walls_guided。
+- **COLMAP + 训练包装**（`bim_recon/colmap_runner.py`、`scripts/train_gs.py`）：包装 nerfstudio 命令。
+
+### P2：墙体重建
+- **WallFitter**（`bim_recon/wall_fitter.py`）：迭代 RANSAC + 遮挡补全合并 + 重力对齐 + 端点精修 + 高度提取。无底图盲拟合。
+- **FloorPlanGuidedFitter**（`bim_recon/wall_fitter.py`）：走廊筛选 + 固定法向直方图峰值拟合。需用户提供底图 JSON。
+- **FloorPlan 自动配准**（`bim_recon/floorplan_registration.py`）：PCA 旋转 + 90° 候选搜索 + 平移网格搜索 + 地板多边形评分。
+- **虚拟激光扫描器**（`bim_recon/virtual_scanner.py`）：从 3DGS 深度渲染模拟 2D 激光扫描，多视角拼接 360° 极坐标扫描，每个扫描点携带 feat.pt 语义标签。
+- **栅格化墙线提取**（`bim_recon/wall_line_extractor.py`）：多高度扫描 → DBSCAN 去噪 → 栅格化 + 形态学闭运算 → 轮廓提取 → Douglas-Peucker → RANSAC/PCA 精修 → 闭合墙线多边形。
+
+### Revit 集成
+- 通过 `mcp-servers-for-revit` 的 MCP 工具（26 个），直接在 Revit 中创建墙、板、门窗等原生图元。
+- 已验证：`revit_create_line_based_element` 成功创建墙体（6 面底图引导墙 + 4 面正方形测试房间）。
+
+## 快速开始
+
+### 环境要求
+- Python 3.11+（conda 环境 `bim-recon`）
+- PyTorch 2.7+ with CUDA 12.8
+- gsplat 1.4.0（首次运行需 MSVC JIT 编译）
+- OpenCV、scikit-learn、shapely、open3d、matplotlib
+- **Windows** + Visual Studio 2022（gsplat JIT 编译需要 vcvars64）
+- Revit + `mcp-servers-for-revit`（可选，用于 Revit 图元创建）
+
+### 1. 启动 3DGS MCP Server
+
+```powershell
+# 方法 A：使用启动脚本（自动配置 vcvars64 + conda）
+scripts\run_mcp_gs.bat
+
+# 方法 B：手动启动（需要先初始化 vcvars64）
+python -m bim_recon.mcp_gs ^
+    --data-dir data ^
+    --feat output/data_feat.pt ^
+    --text-emb data/bim_text_emb.pt ^
+    --class-names data/bim_class_names.json
+```
+
+MCP Server 暴露 9 个工具，可在 opencode/Claude Desktop 中配置使用。
+
+### 2. 虚拟激光扫描（从 3DGS 提取 2D 雷达图）
+
+```powershell
+# 需要先初始化 vcvars64（gsplat JIT）
+cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && python scripts/virtual_scan_probe.py"
+```
+
+**输出**：
+- `output/virtual_scan_h1.5m.png` — 雷达极坐标图 + 俯视散点图（语义颜色编码）
+- `output/virtual_scan_h1.5m.json` — 原始扫描数据（含 semantic_labels）
+
+### 3. 多高度墙线提取（从扫描点自动提取闭合墙线）
+
+```powershell
+cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && python scripts/wall_line_probe.py"
+```
+
+**输出**：
+- `output/wall_lines.json` — 墙线端点坐标（闭合多边形）
+- `output/wall_lines_topdown.png` — 俯视墙线图（红色墙线 + 蓝色扫描点）
+
+**管线**：8 高度扫描 → 23K 语义过滤点 → DBSCAN 去噪 → 0.05m/px 栅格化 → 7×7 闭运算 → findContours → Douglas-Peucker → RANSAC/PCA 精修 → 11 面闭合墙线
+
+### 4. 底图引导墙拟合（用户提供底图 JSON）
+
+将底图保存为 JSON（ManualProvider 格式）：
+
+```json
+{"walls": [
+    {"x1": 0, "y1": 0, "x2": 10.0, "y2": 0},
+    {"x1": 10.0, "y1": 0, "x2": 10.0, "y2": 8.0},
+    {"x1": 10.0, "y1": 8.0, "x2": 0, "y2": 8.0},
+    {"x1": 0, "y1": 8.0, "x2": 0, "y2": 0}
+]}
+```
+
+通过 MCP 工具 `fit_walls_guided(floorplan_json=...)` 调用，或运行探针：
+
+```powershell
+cmd /c "\"...\vcvars64.bat\" && python scripts/fit_walls_guided_probe.py"
+```
+
+### 5. 在 Revit 中创建墙体
+
+通过 `mcp-servers-for-revit` MCP 工具，将提取的墙线创建为 Revit 原生墙体：
+
+```python
+# 通过 MCP 工具调用（每面墙逐个创建避免超时）
+revit_create_line_based_element(data=[{
+    "category": "OST_Walls",
+    "locationLine": {"p0": {"x": 1569, "y": 8226, "z": 35}, "p1": {"x": 1597, "y": -1922, "z": 35}},
+    "thickness": 200,
+    "height": 2540,
+    "baseLevel": 0,
+    "baseOffset": 0
+}])
+# 坐标单位：毫米（米 × 1000）
+```
+
+### 6. 手量底图 → Revit C# 脚本
 
 ```bash
 python scripts/manual_to_revit_code.py examples/manual-room.json -o output/manual-room.cs
 ```
 
-只开洞、不尝试放置门窗族：
+生成的 C# 脚本可通过 `send_code_to_revit` 工具在 Revit 中执行。
 
-```bash
-python scripts/manual_to_revit_code.py examples/manual-room.json --no-hosted-families
-```
-
-### 5. 差异报告模块
-
-对应 `PLAN.md`：
-
-- `§2.3 已锁定的关键决策` 中“3DGS 有墙 / 底图没有：仅报告，不自动采纳”
-- `§4.5 差异仅报告`
-- `§13-14 P2 差异报告模块`
-
-完成情况：
-
-- 新增 `bim_recon/diff_report.py`。
-- 输入：底图 `FloorPlan` 和检测出的墙线列表。
-- 输出：底图中未被检测匹配的墙、检测中多出来但底图没有的墙。
-- 匹配依据：中点距离 + 墙线方向夹角。
-- 不自动修改 `FloorPlan`。
-
-### 6. 3DGS MCP 工具边界脚手架
-
-对应 `PLAN.md`：
-
-- `§3 VLM 决策循环`
-- `§5 技术栈与依赖清单`
-- `附录 B：MCP 工具集`
-
-完成情况：
-
-- 新增 `bim_recon/gs_mcp_scaffold.py`。
-- 定义了 3DGS 后端需要实现的最小协议：
-- `render_from_pose`
-- `get_depth`
-- `select_cluster`
-- 定义了工具规格：
-- `render_from_pose`
-- `get_depth`
-- `select_cluster`
-- `report_diff`
-
-限制：
-
-- 目前只是接口边界，不包含真实 `gsplat`、SAGA 或 Gaussian Grouping 实现。
-- 没有加载 3DGS 模型。
-- 没有启动 MCP server。
-
-### 7. 本地测试
-
-对应 `PLAN.md`：
-
-- 属于 P0 工程质量保障，不等价于 Revit 实机验收。
-
-当前测试命令：
+## 运行测试
 
 ```bash
 pytest -q
 ```
 
-当前结果：
+当前 65 个测试（1 个需 MSVC 环境跳过）：
 
-```text
-14 passed
+| 测试文件 | 覆盖 | 状态 |
+|---|---|---|
+| `tests/test_floorplan.py` | FloorPlan 契约、ManualProvider、Revit C# 生成、差异报告 | 14/14 通过 |
+| `tests/test_gs_scene.py` | GSScene 相机工具、合成渲染、PLY 往返 | 8/9 通过（1 需 MSVC） |
+| `tests/test_semantics.py` | SemanticQuerier init/query/dominant/top_percent | 18/18 通过 |
+| `tests/test_wall_fitter.py` | WallFitter RANSAC/merge/align/refine/height | 16/16 通过 |
+| `tests/test_floorplan_guided.py` | FloorPlanGuidedFitter + register_floorplan | 8/8 通过 |
+
+MCP 工具集成测试（需 MSVC）：
+
+```powershell
+cmd /c "\"...\vcvars64.bat\" && python scripts/test_mcp_gs.py"
 ```
 
-## 尚未完成内容
+## 项目结构
 
-以下是 `PLAN.md` 中仍未完成的主要部分。
+```
+bim_recon/
+├── gs_scene.py              # 3DGS 场景加载 + gsplat 渲染 + 语义查询
+├── semantics.py             # SemanticQuerier (feat.pt + SigLIP2 文本嵌入)
+├── mcp_gs.py                # MCP Server (9 工具)
+├── wall_fitter.py           # WallFitter + FloorPlanGuidedFitter
+├── floorplan_registration.py # 底图→3DGS 自动配准
+├── virtual_scanner.py       # 虚拟 2D 激光扫描器
+├── wall_line_extractor.py   # 栅格化+形态学+轮廓+DP+RANSAC 墙线提取
+├── floorplan.py             # FloorPlan 契约 + ManualProvider
+├── revit_code.py            # FloorPlan → Revit C# 代码生成
+├── diff_report.py           # 底图 vs 检测差异报告
+└── colmap_runner.py         # COLMAP 包装
 
-### P0 未完成
+scripts/
+├── virtual_scan_probe.py    # 虚拟扫描探针 → 雷达 PNG + JSON
+├── wall_line_probe.py       # 墙线提取探针 → 墙线 JSON + 俯视图
+├── fit_walls_guided_probe.py # 底图引导拟合探针
+├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器
+├── train_gs.py              # nerfstudio 训练包装
+├── test_mcp_gs.py           # MCP 工具集成测试
+└── run_mcp_gs.bat           # MCP Server 启动器
 
-- 未安装或验证 COLMAP。
-- 未安装或验证 nerfstudio / splatfacto。
-- 未安装或验证 gsplat。
-- 未安装或验证 open3d。
-- 未从手机视频跑通 COLMAP。
-- 未训练 3DGS。
-- 未用 gsplat 渲染 RGB+ED。
-- 未做 Open3D RANSAC 墙面拟合。
-- 未在 Windows + Revit 中通过 MCP 执行生成的 C#。
-- 未验证 Revit 中墙、板、门窗洞口是否真实可编辑。
-
-### P1 未完成
-
-- 未接入 SAGA 或 Gaussian Grouping。
-- 未实现 2D mask 到 3D Gaussian cluster 的真实选择。
-- 未实现真正的 3DGS MCP server。
-- 未接入 Claude / GPT-4o / Gemini 的 VLM 决策循环。
-- 未实现 VLM 找墙、确认墙、回看 validate 的闭环。
-
-### P2 未完成
-
-- 未完成确定性墙拟合器。
-- 未做重力对齐与拉伸。
-- 未完善地板、天花板、门窗全要素的 Revit 实机验证。
-- 未做 2-3 个房间复测。
-- 未完成算法 MVP。
-
-### P3 未完成
-
-- 未实现 LiDARProvider。
-- 未接入 ROS2 `/scan`。
-- 未实现 split-and-merge 墙线提取。
-- 未做 2D LiDAR 到 3DGS/FloorPlan 的配准。
-- 未比较有无 LiDAR 的质量差异。
-
-### P4 未完成
-
-- 未做难例测试。
-- 未做精度报告。
-- 未做多房间接口占位之外的真实拼接。
-- 未做演示视频、论文、报告或 Slides。
-
-## 当前进度判断
-
-当前完成度应理解为：
-
-```text
-P0 基础工程骨架完成一部分
+data/                        # SceneSplat .npy 数据 + BIM 词表
+output/                      # feat.pt + 生成的扫描图/墙线
 ```
 
-不是：
+## 关键技术栈
 
-```text
-PLAN.md 全部完成
-```
+| 组件 | 技术 | 用途 |
+|---|---|---|
+| 3DGS 训练 | nerfstudio / splatfacto | 从图像训练 3D 高斯场景 |
+| 渲染引擎 | gsplat 1.4.0 | CUDA 加速光栅化（RGB+Depth） |
+| 语义特征 | SceneSplat (ICCV'25 Oral) | PT-v3 预训练编码器 → per-Gaussian 768 维语言特征 |
+| 文本对齐 | SigLIP2 | BIM 词表文本嵌入，与 feat.pt 零样本对齐 |
+| 虚拟扫描 | gsplat depth rendering | 从任意位姿渲染深度 → 模拟 LiDAR |
+| 墙线提取 | OpenCV + scikit-learn | 栅格化 + 形态学 + 轮廓 + Douglas-Peucker + PCA |
+| Revit 桥接 | mcp-servers-for-revit | C# MCP Server，26 个工具直接操作 Revit API |
+| VLM 决策 | Claude / GPT-4o | 通过 MCP 工具巡视场景、提取墙体 |
 
-也不是：
+## 当前限制
 
-```text
-算法 MVP 达成
-```
+- **单房间 MVP**：仅支持单房间墙体提取，不支持多房间拼接。
+- **COLMAP + nerfstudio 训练**：需用户手动运行（agent 不代跑）。
+- **gsplat JIT**：首次运行需 MSVC（vcvars64）环境。
+- **精度**：厘米级（依赖 SfM 度量对齐质量），非施工级。
+- **LiDAR Provider**：P3 规划中，尚未实现。
 
-当前最接近完成的计划项是：
+## 下一步
 
-- `FloorPlan` 契约
-- `ManualProvider`
-- 手量输入到 Revit C# 代码生成
-- 差异报告的纯 Python 版本
-- 3DGS MCP 工具边界定义
+- 实现门窗洞口检测（在闭合墙线上分析扫描点的语义间隙）
+- 多房间拼接
+- LiDARProvider（ROS2 `/scan` → split-and-merge 墙线）
+- 精度评估报告
 
-## 下一步建议
+---
 
-推荐下一步优先级：
-
-1. 在 Windows + Revit 环境中初始化 `mcp-servers-for-revit`，确认 `send_code_to_revit` 的真实执行上下文变量名。
-2. 用 `examples/manual-room.json` 生成 C#，在 Revit 中实测墙、板、洞口能否创建。
-3. 根据实测结果修正 `bim_recon/revit_code.py`。
-4. 再推进 COLMAP / nerfstudio / gsplat 的 3DGS 链路。
-
+详见 `PLAN.md` 获取完整架构设计、24 周路线图和技术决策记录。
