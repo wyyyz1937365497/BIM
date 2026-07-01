@@ -209,8 +209,8 @@ def extract_candidates(
                     wall_idx=wi,
                     t_min=op["t_min"], t_max=op["t_max"],
                     theta_center=theta,
-                    theta_span=abs(op["t_max"] - op["t_min"])
-                    / wd["length"] * 57.3 if wd["length"] > 0 else 0.0,
+                    theta_span=op["width_m"] / r * 57.2958
+                    if r > 1e-6 else 0.0,
                     r_mean=r,
                     h_min=op["h_min"], h_max=op["h_max"],
                     width_m=op["width_m"],

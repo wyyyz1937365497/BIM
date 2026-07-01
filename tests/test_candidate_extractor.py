@@ -217,6 +217,32 @@ class TestExtractCandidates:
         assert 0 in wall_indices
         assert 1 in wall_indices
 
+    def test_free_standing_furniture(self):
+        """DBSCAN branch: furniture points not projected to walls."""
+        wall = _make_wall(0, 0, 5, 0)
+        floor_z = 0.0
+        center = (2.5, 2.0)
+
+        rng = np.random.default_rng(42)
+        # A furniture cluster at (1.5, 1.5) — away from wall
+        furn_pts = np.column_stack([
+            rng.uniform(1.2, 1.8, 30),
+            rng.uniform(1.2, 1.8, 30),
+        ])
+        labels = np.full(30, 8)  # furniture class
+        scan = _make_scan(furn_pts, labels, height=0.5, center=center)
+
+        candidates = extract_candidates(
+            [scan], [wall], floor_z, center,
+            element_class="furniture", class_idx=8,
+            project_to_walls=False,
+        )
+        assert len(candidates) >= 1
+        c = candidates[0]
+        assert c.element_class == "furniture"
+        assert c.wall_idx is None  # free-standing
+        assert c.num_points >= 10
+
 
 # ---------------------------------------------------------------------------
 # prefilter_candidates

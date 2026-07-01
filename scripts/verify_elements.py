@@ -180,6 +180,7 @@ def main() -> int:
         filtered, scene, (cx, cy), floor_z, verify_dir,
         element_class=element,
         ollama_model=args.ollama_model,
+        up_axis=up_axis,
         skip_vlm=args.skip_vlm,
         progress_callback=progress,
     )

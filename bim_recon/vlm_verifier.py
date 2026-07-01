@@ -99,27 +99,41 @@ def candidate_to_viewpoint(
     floor_z: float,
     eye_height: float = 1.5,
     fov: float = 60.0,
+    up_axis: int = 2,
 ) -> Tuple[List[float], List[float], float]:
     """Map a candidate's polar position to a 3DGS camera pose.
 
     The camera is placed at the scan center (room center) at human eye
     height, aimed at the candidate's world position at its mid-height.
+    Supports any up-axis (0=x, 1=y, 2=z) by building eye/target/up
+    via axis-index assignment, consistent with VirtualScanner.
 
     Args:
-        world_x, world_y: Candidate center in world XY.
+        world_x, world_y: Candidate center in world horizontal plane.
         h_min, h_max: Candidate height range above floor (meters).
-        scan_center: (cx, cy) room center.
-        floor_z: Floor level world coordinate.
+        scan_center: (cx, cy) room center in horizontal plane.
+        floor_z: Floor level world coordinate (on the up-axis).
         eye_height: Camera height above floor (default 1.5m).
         fov: Field of view degrees.
+        up_axis: Which world axis is vertical (0=x, 1=y, 2=z).
 
     Returns:
         (eye, target, fov) — eye=[x,y,z], target=[x,y,z], fov=float.
     """
     cx, cy = scan_center
     h_mid = (h_min + h_max) / 2.0
-    eye = [cx, cy, floor_z + eye_height]
-    target = [world_x, world_y, floor_z + h_mid]
+    h_axes = [i for i in range(3) if i != up_axis]
+
+    eye = [0.0, 0.0, 0.0]
+    eye[h_axes[0]] = cx
+    eye[h_axes[1]] = cy
+    eye[up_axis] = floor_z + eye_height
+
+    target = [0.0, 0.0, 0.0]
+    target[h_axes[0]] = world_x
+    target[h_axes[1]] = world_y
+    target[up_axis] = floor_z + h_mid
+
     return eye, target, fov
 
 
@@ -214,6 +228,7 @@ def verify_candidates(
     image_width: int = 800,
     image_height: int = 600,
     fov: float = 60.0,
+    up_axis: int = 2,
     skip_vlm: bool = False,
     progress_callback: Optional[Any] = None,
 ) -> List[VerificationResult]:
@@ -228,11 +243,12 @@ def verify_candidates(
     Args:
         candidates: List of :class:`Candidate` objects.
         scene: :class:`GSScene` with original weights loaded.
-        scan_center: (cx, cy) room center.
-        floor_z: Floor level world coordinate.
+        scan_center: (cx, cy) room center in horizontal plane.
+        floor_z: Floor level world coordinate (on the up-axis).
         output_dir: Directory to save rendered images.
         element_class: Element type for VLM prompt (e.g. "door").
         ollama_model: Ollama model name.
+        up_axis: Which world axis is vertical (0=x, 1=y, 2=z).
         skip_vlm: If True, only render images without VLM queries.
 
     Returns:
@@ -244,6 +260,10 @@ def verify_candidates(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build up vector based on up_axis (consistent with VirtualScanner)
+    up_vec = [0.0, 0.0, 0.0]
+    up_vec[up_axis] = 1.0
+
     prompt = _build_prompt(element_class)
     results: List[VerificationResult] = []
 
@@ -252,12 +272,13 @@ def verify_candidates(
             cand.world_x, cand.world_y,
             cand.h_min, cand.h_max,
             scan_center, floor_z, fov=fov,
+            up_axis=up_axis,
         )
 
         pose = look_at_pose(
             (eye[0], eye[1], eye[2]),
             (target[0], target[1], target[2]),
-            up=(0.0, 0.0, 1.0),
+            up=(up_vec[0], up_vec[1], up_vec[2]),
         )
         render_result = scene.render(
             pose, width=image_width, height=image_height,

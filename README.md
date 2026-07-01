@@ -167,7 +167,7 @@ python scripts/manual_to_revit_code.py examples/manual-room.json -o output/manua
 pytest -q
 ```
 
-当前 99 个测试（1 个需 MSVC 环境跳过）：
+当前 107 个测试（1 个需 MSVC 环境跳过）：
 
 | 测试文件 | 覆盖 | 状态 |
 |---|---|---|
@@ -176,8 +176,8 @@ pytest -q
 | `tests/test_semantics.py` | SemanticQuerier init/query/dominant/top_percent | 18/18 通过 |
 | `tests/test_wall_fitter.py` | WallFitter RANSAC/merge/align/refine/height | 16/16 通过 |
 | `tests/test_floorplan_guided.py` | FloorPlanGuidedFitter + register_floorplan | 8/8 通过 |
-| `tests/test_candidate_extractor.py` | 候选提取（投影/聚类/多墙/过滤）| 16/16 通过 |
-| `tests/test_vlm_verifier.py` | 极坐标计算/视角映射/VLM 响应解析/prompt 构建 | 18/18 通过 |
+| `tests/test_candidate_extractor.py` | 候选提取（投影/聚类/多墙/DBSCAN自由构件/过滤）| 17/17 通过 |
+| `tests/test_vlm_verifier.py` | 极坐标/视角映射(X/Y/Z-up)/VLM响应解析/prompt/Mock端到端 | 25/25 通过 |
 
 MCP 工具集成测试（需 MSVC）：
 

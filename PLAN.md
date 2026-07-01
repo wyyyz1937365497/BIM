@@ -670,6 +670,8 @@ fov    = 60°
 - 固定使用 Ollama gemma4:12b 作为 VLM 后端（本地部署，无 API 成本）
 - 偏好 `point_cloud_*.ply` 原始权重渲染（颜色准确），而非 `_feat_vis_3dgs.ply`（PCA 染色）
 - VLM prompt 要求首行输出 CONFIRMED/REJECTED，便于自动解析
+- **up_axis 全局支持**：`candidate_to_viewpoint` 和 `verify_candidates` 接受 `up_axis` 参数，通过轴索引构建 eye/target/up 向量，与 VirtualScanner 一致。支持 X-up/Y-up/Z-up 场景（42/42 测试覆盖含 Y-up 和 X-up 用例）。
+- 输出路径：`output/<scene>/verify_<element>/` 目录存放验证图，`output/<scene>/<element>s_verified.json` 存放结果。
 
 ---
 
