@@ -129,6 +129,69 @@ def extract_wall_points(
     return np.concatenate(all_pts), np.array(all_h)
 
 
+def _ransac_refine_wall(
+    wall: WallLine,
+    all_pts: np.ndarray,
+    band_width: float = 0.3,
+) -> WallLine:
+    """Refine a wall line by fitting PCA through nearby raw points.
+
+    Uses the DP-derived wall topology to select which raw points belong
+    to this wall (within ``band_width`` perpendicular distance), then fits
+    a principal-component line through their geometric center. The original
+    endpoints are projected onto this fitted line, preserving connectivity.
+
+    This fixes the "line on the edge" problem: the fitted line passes
+    through the point cloud's center, not its outer boundary.
+    """
+    a = np.array([wall.x1, wall.y1], dtype=np.float64)
+    b = np.array([wall.x2, wall.y2], dtype=np.float64)
+    ab = b - a
+    ab_len = float(np.linalg.norm(ab))
+    if ab_len < 0.1 or len(all_pts) < 5:
+        return wall
+    ab_dir = ab / ab_len
+
+    # Perpendicular distance from each point to the wall line.
+    ap = all_pts - a
+    proj_along = ap @ ab_dir
+    perp_vec = ap - np.outer(proj_along, ab_dir)
+    perp_dist = np.linalg.norm(perp_vec, axis=1)
+
+    # Keep points within band AND along the segment extent (with margin).
+    margin = 0.5
+    near_mask = (perp_dist <= band_width) & (proj_along >= -margin) & (proj_along <= ab_len + margin)
+    near_pts = all_pts[near_mask]
+
+    if len(near_pts) < 5:
+        return wall
+
+    # PCA: principal direction = line through point cloud center.
+    center = near_pts.mean(axis=0)
+    centered = near_pts - center
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    main_dir = eigvecs[:, -1]  # largest eigenvalue = wall direction
+
+    # Ensure main_dir points roughly same way as ab_dir (avoid sign flip).
+    if np.dot(main_dir, ab_dir) < 0:
+        main_dir = -main_dir
+
+    # Project original endpoints onto the fitted line.
+    new_p0 = center + np.dot(a - center, main_dir) * main_dir
+    new_p1 = center + np.dot(b - center, main_dir) * main_dir
+    new_len = float(np.linalg.norm(new_p1 - new_p0))
+    if new_len < 0.1:
+        return wall
+
+    return WallLine(
+        x1=float(new_p0[0]), y1=float(new_p0[1]),
+        x2=float(new_p1[0]), y2=float(new_p1[1]),
+        length=new_len,
+        num_points=int(near_mask.sum()),
+    )
+
+
 def extract_wall_lines(
     scans: List[ScanResult],
     wall_class_idx: int = 0,
@@ -229,18 +292,21 @@ def extract_wall_lines(
     world_corners[:, 1] = corners_px[:, 1] * grid_resolution + y_min
 
     n = len(world_corners)
-    wall_lines: List[WallLine] = []
+    dp_walls: List[WallLine] = []
     for i in range(n):
         p0 = world_corners[i]
         p1 = world_corners[(i + 1) % n]  # closed loop
         length = float(np.linalg.norm(p1 - p0))
         if length >= min_wall_length:
-            wall_lines.append(WallLine(
+            dp_walls.append(WallLine(
                 x1=float(p0[0]), y1=float(p0[1]),
                 x2=float(p1[0]), y2=float(p1[1]),
                 length=length,
                 num_points=0,
             ))
+
+    # --- Step 8: RANSAC/PCA refinement — fit lines through raw point centers ---
+    wall_lines = [_ransac_refine_wall(wl, clean_pts) for wl in dp_walls]
 
     return wall_lines, wall_pts
 
