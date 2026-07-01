@@ -60,106 +60,36 @@
 - PyTorch 2.7+ with CUDA 12.8
 - gsplat 1.4.0（首次运行需 MSVC JIT 编译）
 - OpenCV、scikit-learn、shapely、open3d、matplotlib
+- Ollama + gemma4:12b（VLM 验证，本地部署）
 - **Windows** + Visual Studio 2022（gsplat JIT 编译需要 vcvars64）
 - Revit + `mcp-servers-for-revit`（可选，用于 Revit 图元创建）
 
-### 1. 启动 3DGS MCP Server
+### 1. 一键运行完整管线（推荐）
 
 ```powershell
-# 方法 A：使用启动脚本（自动配置 vcvars64 + conda）
-scripts\run_mcp_gs.bat
-
-# 方法 B：手动启动（需要先初始化 vcvars64）
-python -m bim_recon.mcp_gs ^
-    --data-dir data ^
-    --feat output/data_feat.pt ^
-    --text-emb data/bim_text_emb.pt ^
-    --class-names data/bim_class_names.json
+cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && python scripts/run_pipeline.py --name room0"
 ```
 
-MCP Server 暴露 9 个工具，可在 opencode/Claude Desktop 中配置使用。
+**输入**：`data/room0/point_cloud_30000.ply` + `data/room0/room0_feat.pt`
 
-### 2. 虚拟激光扫描（从 3DGS 提取 2D 雷达图）
+**输出**（`output/room0/`）：
+- `wall_lines_snapped.json` — 墙线端点（闭合多边形）
+- `doors_verified.json` — VLM 确认的门
+- `windows_verified.json` — VLM 确认的窗
+- `pipeline_report.json` — 完整管线报告
+- `wall_lines_topdown.png` — 墙线俯视图
 
+**管线流程**：加载场景 → 12 高度雷达扫描 → 墙线提取（栅格+形态学+轮廓+PCA）→ 门检测（feat.pt 候选 → 预过滤 → Ollama VLM 验证）→ 窗检测 → 结果 JSON
+
+**跳过 VLM（仅渲染）**：
 ```powershell
-# 需要先初始化 vcvars64（gsplat JIT）
-cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && python scripts/virtual_scan_probe.py"
+cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0 --skip-vlm"
 ```
 
-**输出**：
-- `output/virtual_scan_h1.5m.png` — 雷达极坐标图 + 俯视散点图（语义颜色编码）
-- `output/virtual_scan_h1.5m.json` — 原始扫描数据（含 semantic_labels）
-
-### 3. 多高度墙线提取（从扫描点自动提取闭合墙线）
-
+**指定检测的构件类型**：
 ```powershell
-cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && python scripts/wall_line_probe.py"
+python scripts/run_pipeline.py --name room0 --elements door window column
 ```
-
-**输出**：
-- `output/wall_lines.json` — 墙线端点坐标（闭合多边形）
-- `output/wall_lines_topdown.png` — 俯视墙线图（红色墙线 + 蓝色扫描点）
-
-**管线**：8 高度扫描 → 23K 语义过滤点 → DBSCAN 去噪 → 0.05m/px 栅格化 → 7×7 闭运算 → findContours → Douglas-Peucker → RANSAC/PCA 精修 → 11 面闭合墙线
-
-### 4. 底图引导墙拟合（用户提供底图 JSON）
-
-将底图保存为 JSON（ManualProvider 格式）：
-
-```json
-{"walls": [
-    {"x1": 0, "y1": 0, "x2": 10.0, "y2": 0},
-    {"x1": 10.0, "y1": 0, "x2": 10.0, "y2": 8.0},
-    {"x1": 10.0, "y1": 8.0, "x2": 0, "y2": 8.0},
-    {"x1": 0, "y1": 8.0, "x2": 0, "y2": 0}
-]}
-```
-
-通过 MCP 工具 `fit_walls_guided(floorplan_json=...)` 调用，或运行探针：
-
-```powershell
-cmd /c "\"...\vcvars64.bat\" && python scripts/fit_walls_guided_probe.py"
-```
-
-### 5. VLM 验证元素提取（门/窗检测）
-
-两阶段检测：feat.pt 语义标签找候选 → 3DGS 渲染 → Ollama VLM 确认。
-
-```powershell
-# 需要 vcvars64 + Ollama gemma4:12b 运行中
-cmd /c "\"...\vcvars64.bat\" && python scripts/verify_elements.py --name room0 --element door"
-```
-
-**输出**：
-- `output/room0/doors_verified.json` — 确认/排除结果 + VLM 描述
-- `output/room0/verify_door/*.png` — 每个候选的针对性渲染图
-
-**room0 实测**：14 个 feat.pt 门候选 → 预过滤 5 个 → VLM 确认 2 个真门，排除 3 个（2 个实为窗，1 个实为画）
-
-### 6. 在 Revit 中创建墙体
-
-通过 `mcp-servers-for-revit` MCP 工具，将提取的墙线创建为 Revit 原生墙体：
-
-```python
-# 通过 MCP 工具调用（每面墙逐个创建避免超时）
-revit_create_line_based_element(data=[{
-    "category": "OST_Walls",
-    "locationLine": {"p0": {"x": 1569, "y": 8226, "z": 35}, "p1": {"x": 1597, "y": -1922, "z": 35}},
-    "thickness": 200,
-    "height": 2540,
-    "baseLevel": 0,
-    "baseOffset": 0
-}])
-# 坐标单位：毫米（米 × 1000）
-```
-
-### 7. 手量底图 → Revit C# 脚本
-
-```bash
-python scripts/manual_to_revit_code.py examples/manual-room.json -o output/manual-room.cs
-```
-
-生成的 C# 脚本可通过 `send_code_to_revit` 工具在 Revit 中执行。
 
 ## 运行测试
 
@@ -167,7 +97,7 @@ python scripts/manual_to_revit_code.py examples/manual-room.json -o output/manua
 pytest -q
 ```
 
-当前 107 个测试（1 个需 MSVC 环境跳过）：
+当前 120 个测试（1 个需 MSVC 环境跳过）：
 
 | 测试文件 | 覆盖 | 状态 |
 |---|---|---|
@@ -178,6 +108,7 @@ pytest -q
 | `tests/test_floorplan_guided.py` | FloorPlanGuidedFitter + register_floorplan | 8/8 通过 |
 | `tests/test_candidate_extractor.py` | 候选提取（投影/聚类/多墙/DBSCAN自由构件/过滤）| 17/17 通过 |
 | `tests/test_vlm_verifier.py` | 极坐标/视角映射(X/Y/Z-up)/VLM响应解析/prompt/Mock端到端 | 25/25 通过 |
+| `tests/test_element_config.py` | 元素类型配置注册表（查找/属性/输出名/frozen）| 14/14 通过 |
 
 MCP 工具集成测试（需 MSVC）：
 
@@ -198,21 +129,21 @@ bim_recon/
 ├── wall_line_extractor.py   # 栅格化+形态学+轮廓+DP+RANSAC 墙线提取
 ├── candidate_extractor.py   # 元素候选提取（门/窗/家具，feat.pt 语义+墙线投影）
 ├── vlm_verifier.py          # VLM 验证（极坐标→渲染→Ollama gemma4:12b 确认/排除）
+├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
 ├── diff_report.py           # 底图 vs 检测差异报告
 └── colmap_runner.py         # COLMAP 包装
 
 scripts/
-├── verify_elements.py       # 端到端 VLM 验证 CLI（扫描→候选→VLM 判定）
-├── generate_walls.py        # 通用墙线生成（扫描→栅格化→墙线 JSON+PNG）
-├── virtual_scan_probe.py    # 虚拟扫描探针 → 雷达 PNG + JSON
-├── wall_line_probe.py       # 墙线提取探针 → 墙线 JSON + 俯视图
-├── fit_walls_guided_probe.py # 底图引导拟合探针
-├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器
-├── train_gs.py              # nerfstudio 训练包装
+├── run_pipeline.py          # 主流程：scene → walls → doors → windows → JSON（唯一入口）
+├── verify_elements.py       # 单独检测某类构件（--element door/window/furniture）
+├── generate_walls.py        # 单独提取墙线
+├── final_radar.py           # 可视化：4 面板管线结果图
+├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器（工具）
+├── manual_to_revit_code.py  # 手量底图 → Revit C# 脚本（工具）
 ├── test_mcp_gs.py           # MCP 工具集成测试
-└── run_mcp_gs.bat           # MCP Server 启动器
+└── train_gs.py              # nerfstudio 训练包装
 
 data/                        # SceneSplat .npy 数据 + BIM 词表
 output/                      # feat.pt + 生成的扫描图/墙线

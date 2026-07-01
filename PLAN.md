@@ -679,6 +679,29 @@ fov    = 60°
 - **up_axis 全局支持**：`candidate_to_viewpoint` 和 `verify_candidates` 接受 `up_axis` 参数，通过轴索引构建 eye/target/up 向量，与 VirtualScanner 一致。支持 X-up/Y-up/Z-up 场景（42/42 测试覆盖含 Y-up 和 X-up 用例）。
 - 输出路径：`output/<scene>/verify_<element>/` 目录存放验证图，`output/<scene>/<element>s_verified.json` 存放结果。
 
+### 12.10 [2026-07-01] 统一管线 + 元素类型注册表 + 脚本清理
+
+**背景**：项目积累了 23 个脚本（探针、原型、工具），用户要求最终只保留一个主流程脚本：输入 3DGS 场景，自动输出墙+门+窗。
+
+**元素类型注册表**（`bim_recon/element_config.py`）：
+- `ElementConfig` frozen dataclass：name, class_idx, structural, min_width, min_points, typical_height, vlm_hint
+- 注册了 4 种构件类型：door（宽≥0.7m，结构构件）、window（宽≥0.5m，结构构件）、column（宽≥0.2m，结构构件）、furniture（宽≥0.3m，自由构件 DBSCAN）
+- 添加新构件类型 = 字典加一行
+- `get_element_config("window")` 查找配置，`list_element_types()` 列出所有可用类型
+
+**统一管线**（`scripts/run_pipeline.py`）：
+- 唯一入口：`python scripts/run_pipeline.py --name room0`
+- 流程：加载场景 → 12 高度雷达扫描 → 墙线提取 → 门检测 → 窗检测 → JSON 输出
+- 可选参数：`--elements door window column`（指定检测类型）、`--skip-vlm`（跳过 VLM）、`--revit`（推送 Revit）
+- 输出：`pipeline_report.json` + `wall_lines_snapped.json` + `doors_verified.json` + `windows_verified.json`
+
+**脚本清理**：
+- 删除 15 个冗余探针/探索脚本（analyze_*, check_*, probe_*, *_probe.py 等）
+- 保留 8 个脚本：run_pipeline（主流程）、verify_elements（单独检测）、generate_walls（单独墙线）、final_radar（可视化）、encode_bim_labels（工具）、manual_to_revit_code（工具）、test_mcp_gs（测试）、train_gs（训练包装）
+
+**项目约定**：
+- 永远不要在意字符/字体警告（emoji 缺失、CJK glyph 等），程序能正常运行即可
+
 ---
 
 ## 附录 A：FloorPlan 契约（草案）
