@@ -78,12 +78,9 @@ def main() -> int:
     print("\nExtracting wall lines...")
     wall_lines, wall_pts = extract_wall_lines(
         scans,
-        wall_class_idx=0,  # "wall" is class 0 in bim_class_names.json
-        exclude_classes=[1, 2, 8],  # exclude floor, ceiling, furniture
+        wall_class_idx=0,
+        exclude_classes=[1, 2, 8],
         center=np.array([center_x, center_y]),
-        split_threshold=0.15,
-        min_segment_points=12,
-        angle_bin_deg=0.5,
     )
     print(f"Wall points (semantic=wall): {len(wall_pts)}")
     print(f"Extracted {len(wall_lines)} wall lines:")
