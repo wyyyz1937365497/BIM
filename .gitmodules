@@ -4,3 +4,6 @@
 [submodule "Falcon-Perception"]
 	path = Falcon-Perception
 	url = https://github.com/wyyyz1937365497/Falcon-Perception.git
+[submodule "SceneSplat"]
+	path = SceneSplat
+	url = https://github.com/wyyyz1937365497/SceneSplat.git
