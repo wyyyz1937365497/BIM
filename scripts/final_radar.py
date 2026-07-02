@@ -1,15 +1,16 @@
-"""Generate the final radar plot showing the complete VLM-verified door pipeline.
+"""Generate the final radar plot showing the complete VLM-verified element pipeline.
 
 Pipeline stages visualized:
-  1. Radar scan at door height (floor + 1.0m) — semantic-colored polar points
+  1. Radar scan at element height (floor + 1.0m) — semantic-colored polar points
   2. Wall lines from wall_line_extractor — blue polygon
-  3. feat.pt candidates — yellow markers
-  4. VLM-verified doors — green arcs (confirmed) vs red arcs (rejected)
+  3. feat.pt candidates — element-class-colored markers
+  4. VLM-verified elements — green arcs (confirmed) vs red arcs (rejected)
 
-Output: output/room0/final_radar.png
+Output: output/room0/final_radar_<element>.png
 
 Run with vcvars64:
-    cmd /c "...\\vcvars64.bat && python scripts/final_radar.py --name room0"
+    cmd /c "...\\vcvars64.bat && python scripts/final_radar.py --name room0 --element door"
+    cmd /c "...\\vcvars64.bat && python scripts/final_radar.py --name room0 --element window"
 """
 from __future__ import annotations
 
@@ -27,13 +28,19 @@ sys.path.insert(0, str(ROOT))
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", default="room0")
+    parser.add_argument("--element", default="door",
+                        help="Element type (door/window/column/furniture)")
     args = parser.parse_args()
+
+    from bim_recon.element_config import get_element_config
+    cfg = get_element_config(args.element)
+    elem_name = cfg.name
 
     out_dir = ROOT / "output" / args.name
 
     # Load existing results
     walls = json.load(open(out_dir / "wall_lines_snapped.json"))
-    verified = json.load(open(out_dir / "doors_verified.json"))
+    verified = json.load(open(out_dir / cfg.output_json_name))
     summary = json.load(open(out_dir / "summary.json"))
 
     scan_center = tuple(summary["center"])
@@ -56,11 +63,11 @@ def main() -> int:
         class_names_path=str(ROOT / "data" / "0" / "bim_class_names.json"),
     )
 
-    door_height = floor_z + 1.0  # 1m above floor = mid-door
-    print(f"Scanning at door height: z={door_height:.2f}m (floor+1.0m)")
+    scan_height = floor_z + 1.0  # 1m above floor = mid-element
+    print(f"Scanning at {elem_name} height: z={scan_height:.2f}m (floor+1.0m)")
     scanner = VirtualScanner(scene, up_axis=up_axis)
     scan = scanner.scan(
-        center_2d=scan_center, height=door_height,
+        center_2d=scan_center, height=scan_height,
         num_views=8, fov=60.0, width=512,
     )
     print(f"Scan points: {len(scan.angles_deg)}")
@@ -90,10 +97,10 @@ def main() -> int:
         for l in labels
     ])
 
-    # Plot non-door, non-wall points faintly
-    other_mask = ~((labels == 0) | (labels == 3))
+    # Plot non-target, non-wall points faintly
+    other_mask = ~((labels == 0) | (labels == cfg.class_idx))
     wall_mask = labels == 0
-    door_mask = labels == 3
+    target_mask = labels == cfg.class_idx
 
     if other_mask.sum() > 0:
         ax_polar.scatter(angles_rad[other_mask], dists[other_mask],
@@ -101,11 +108,11 @@ def main() -> int:
     if wall_mask.sum() > 0:
         ax_polar.scatter(angles_rad[wall_mask], dists[wall_mask],
                          s=0.5, c=colors[wall_mask], alpha=0.4)
-    if door_mask.sum() > 0:
-        ax_polar.scatter(angles_rad[door_mask], dists[door_mask],
+    if target_mask.sum() > 0:
+        ax_polar.scatter(angles_rad[target_mask], dists[target_mask],
                          s=3.0, c="red", alpha=0.8, zorder=5)
 
-    # Mark confirmed doors with green arcs
+    # Mark confirmed elements with green arcs
     for r in verified["results"]:
         theta_c = np.radians(r["theta"])
         r_dist = r["r"]
@@ -118,7 +125,7 @@ def main() -> int:
             )
             ax_polar.plot(theta_range, [r_dist] * len(theta_range),
                           "g-", linewidth=4, alpha=0.8, zorder=10)
-            ax_polar.annotate("[DOOR]", (theta_c, r_dist + 0.3),
+            ax_polar.annotate(f"[{elem_name.upper()}]", (theta_c, r_dist + 0.3),
                               fontsize=8, ha="center", fontweight="bold",
                               color="green")
         else:
@@ -127,8 +134,10 @@ def main() -> int:
                              marker="x", zorder=10, linewidths=2)
 
     ax_polar.set_ylim(0, max(dists.max() + 1, 6))
-    ax_polar.set_title("Polar Radar Scan\n(floor+1.0m, red=door pts, green=VLM confirmed)",
-                       pad=20, fontsize=11)
+    ax_polar.set_title(
+        f"Polar Radar Scan\n(floor+1.0m, red={elem_name} pts, green=VLM confirmed)",
+        pad=20, fontsize=11,
+    )
     ax_polar.grid(True, alpha=0.3)
 
     # ==== Panel 2: Top-down with walls + VLM results ====
@@ -139,9 +148,9 @@ def main() -> int:
     if wall_mask.sum() > 0:
         wall_pts = pts[wall_mask]
         ax_td.scatter(wall_pts[:, 0], wall_pts[:, 1], s=0.3, c="gray", alpha=0.2)
-    if door_mask.sum() > 0:
-        door_pts = pts[door_mask]
-        ax_td.scatter(door_pts[:, 0], door_pts[:, 1], s=2.0, c="red", alpha=0.5)
+    if target_mask.sum() > 0:
+        target_pts = pts[target_mask]
+        ax_td.scatter(target_pts[:, 0], target_pts[:, 1], s=2.0, c="red", alpha=0.5)
 
     # Plot wall lines
     for i, w in enumerate(walls):
@@ -167,7 +176,7 @@ def main() -> int:
             ax_td.plot([p0[0], p1[0]], [p0[1], p1[1]],
                        "g-", linewidth=5, alpha=0.9, zorder=10)
             ax_td.annotate(
-                f"[OK] Door\n{c['width_m']:.1f}m",
+                f"[OK] {elem_name.capitalize()}\n{c['width_m']:.1f}m",
                 (pc[0], pc[1]), fontsize=7, ha="center", fontweight="bold",
                 color="white",
                 bbox=dict(boxstyle="round,pad=0.2", fc="green", alpha=0.85),
@@ -198,14 +207,15 @@ def main() -> int:
     h0, h1 = [i for i in range(3) if i != up_axis]
     ax_td.set_xlabel(f"World {'XYZ'[h0]} (m)")
     ax_td.set_ylabel(f"World {'XYZ'[h1]} (m)")
-    ax_td.set_title("Top-Down: Walls + VLM-Verified Doors\n(green=✅confirmed, red dashed=❌rejected)",
+    ax_td.set_title(f"Top-Down: Walls + VLM-Verified {elem_name.capitalize()}s\n(green=✅confirmed, red dashed=❌rejected)",
                     fontsize=11)
     ax_td.grid(True, alpha=0.3)
 
     # ==== Panel 3: VLM Verification Summary Table ====
     ax_tbl = fig.add_subplot(2, 2, 3)
     ax_tbl.axis("off")
-    ax_tbl.set_title("VLM Verification Results (Ollama gemma4:12b)", fontsize=11, pad=10)
+    ax_tbl.set_title(f"VLM Verification Results: {elem_name.capitalize()}s (Ollama gemma4:12b)",
+                     fontsize=11, pad=10)
 
     table_data = []
     for i, r in enumerate(verified["results"]):
@@ -246,19 +256,20 @@ def main() -> int:
     flow_text = (
         f"Pipeline: radar scan -> feat.pt candidates -> VLM verify\n\n"
         f"  Stage 1: Multi-height scan\n"
-        f"    -> {len(scan.angles_deg)} points at door height\n"
+        f"    -> {len(scan.angles_deg)} points at {elem_name} height\n"
         f"    -> Semantic labels from feat.pt\n\n"
-        f"  Stage 2: Candidate extraction (class=door)\n"
+        f"  Stage 2: Candidate extraction (class={elem_name})\n"
         f"    -> {verified['total_candidates']} raw candidates\n"
         f"    -> {verified['after_prefilter']} after pre-filter\n"
-        f"       (width>=0.7m, pts>=100)\n\n"
+        f"       (width>={cfg.min_width}m, pts>={cfg.min_points})\n\n"
         f"  Stage 3: 3DGS render + Ollama VLM\n"
-        f"    -> {verified['confirmed']} confirmed doors\n"
+        f"    -> {verified['confirmed']} confirmed {elem_name}s\n"
         f"    -> {verified['rejected']} rejected (false positives)\n"
-        f"    -> VLM: {verified['errors']} errors\n\n"
+        f"    -> VLM: {verified.get('errors', 0)} errors\n\n"
         f"  Scene: {verified['ply_used']}\n"
         f"  Model: {verified['ollama_model']}\n"
-        f"  Result: 14 -> 5 -> 2 confirmed doors"
+        f"  Result: {verified['total_candidates']} -> "
+        f"{verified['after_prefilter']} -> {verified['confirmed']} confirmed {elem_name}s"
     )
     ax_flow.text(0.05, 0.95, flow_text, transform=ax_flow.transAxes,
                  fontsize=9, verticalalignment="top", fontfamily="monospace",
@@ -268,15 +279,16 @@ def main() -> int:
     legend_elems = [
         Patch(facecolor="gray", alpha=0.4, label="Wall points"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="red",
-               markersize=6, label="Door points (feat.pt)"),
+               markersize=6, label=f"{elem_name.capitalize()} points (feat.pt)"),
         Line2D([0], [0], color="blue", linewidth=2, label="Wall lines"),
-        Line2D([0], [0], color="green", linewidth=4, label="[OK] VLM-confirmed door"),
+        Line2D([0], [0], color="green", linewidth=4,
+               label=f"[OK] VLM-confirmed {elem_name}"),
         Line2D([0], [0], color="red", linewidth=2, linestyle="--", label="[X] VLM-rejected"),
     ]
     fig.legend(handles=legend_elems, loc="lower center", ncol=5, fontsize=9)
 
     plt.tight_layout(rect=(0, 0.04, 1, 1))
-    png_path = str(out_dir / "final_radar.png")
+    png_path = str(out_dir / f"final_radar_{elem_name}.png")
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"\nFinal radar saved to: {png_path}")
