@@ -1,3 +1,6 @@
 [submodule "mcp-servers-for-revit"]
 	path = mcp-servers-for-revit
 	url = https://github.com/mcp-servers-for-revit/mcp-servers-for-revit.git
+[submodule "Falcon-Perception"]
+	path = Falcon-Perception
+	url = https://github.com/wyyyz1937365497/Falcon-Perception.git

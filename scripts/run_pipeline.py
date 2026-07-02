@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -41,8 +42,10 @@ from bim_recon.candidate_extractor import (
     prefilter_candidates,
 )
 from bim_recon.element_config import ElementConfig, get_element_config, list_element_types
+from bim_recon.falcon_client import FalconClient
 from bim_recon.gs_scene import GSScene
 from bim_recon.height_detector import detect_element_heights
+from bim_recon.spatial_extractor import extract_spatial
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
 from bim_recon.wall_line_extractor import (
@@ -170,8 +173,15 @@ def detect_elements(
     out_dir: Path,
     ollama_model: str,
     skip_vlm: bool = False,
+    falcon: FalconClient | None = None,
 ) -> dict:
-    """Detect elements of one type from scan data + VLM verification."""
+    """Detect elements of one type from scan data + VLM verification.
+
+    If ``falcon`` is provided and reachable, uses Falcon-Perception
+    segmentation for precise spatial extraction (sill/header/width).
+    Falls back to depth-probing (:mod:`bim_recon.height_detector`)
+    when Falcon is unavailable or returns no result.
+    """
     center = coords["center"]
     floor_z = coords["floor_z"]
     up_axis = coords["up_axis"]
@@ -215,31 +225,66 @@ def detect_elements(
     rejected = [r for r in results if r.confirmed is False]
     print(f"  [{cfg.name}] {len(confirmed)} confirmed, {len(rejected)} rejected")
 
-    # Height detection for confirmed wall-mounted elements
+    # Spatial extraction for confirmed wall-mounted elements.
+    # Try Falcon-Perception segmentation first (precise bbox → metric coords);
+    # fall back to depth-probing when Falcon is unavailable or finds nothing.
     height_results: list[dict | None] = [None] * len(results)
     if cfg.height_detection and confirmed:
         ceiling_z = coords["ceiling_z"]
+        falcon_tag = "Falcon" if falcon is not None else "depth-probe"
+        print(f"  [{cfg.name}] spatial extraction ({falcon_tag})")
         for i, r in enumerate(results):
             if not r.confirmed:
                 continue
             wi = r.candidate.wall_idx
             if wi is None or wi >= len(walls):
                 continue
-            hr = detect_element_heights(
-                scene, r.candidate, walls[wi],
-                floor_z, ceiling_z, center,
-                class_idx=cfg.class_idx,
-                up_axis=up_axis,
-            )
-            height_results[i] = {
-                "sill_height": hr.sill_height,
-                "header_height": hr.header_height,
-                "element_height": hr.element_height,
-                "confidence": hr.confidence,
-                "method": hr.method,
-            }
-            print(f"    [{cfg.name}] height: sill={hr.sill_height:.3f}m "
-                  f"header={hr.header_height:.3f}m ({hr.method})")
+
+            spatial_dict: dict | None = None
+
+            # --- Primary: Falcon segmentation ---
+            if falcon is not None:
+                elev_path = str(out_dir / f"{cfg.name}_{i}_elevation.png")
+                spatial = extract_spatial(
+                    falcon, scene, r.candidate, walls[wi],
+                    floor_z, ceiling_z, center,
+                    element_name=cfg.name,
+                    up_axis=up_axis,
+                    save_image_path=elev_path,
+                )
+                if spatial is not None:
+                    spatial_dict = {
+                        "sill_height": spatial.sill_height,
+                        "header_height": spatial.header_height,
+                        "element_height": spatial.element_height,
+                        "width_m": spatial.width_m,
+                        "t_min": spatial.t_min,
+                        "t_max": spatial.t_max,
+                        "confidence": spatial.confidence,
+                        "method": spatial.method,
+                    }
+
+            # --- Fallback: depth-probing ---
+            if spatial_dict is None:
+                hr = detect_element_heights(
+                    scene, r.candidate, walls[wi],
+                    floor_z, ceiling_z, center,
+                    class_idx=cfg.class_idx,
+                    up_axis=up_axis,
+                )
+                spatial_dict = {
+                    "sill_height": hr.sill_height,
+                    "header_height": hr.header_height,
+                    "element_height": hr.element_height,
+                    "confidence": hr.confidence,
+                    "method": hr.method,
+                }
+
+            height_results[i] = spatial_dict
+            sd = spatial_dict
+            print(f"    [{cfg.name}] #{i}: sill={sd['sill_height']:.3f}m "
+                  f"header={sd['header_height']:.3f}m "
+                  f"h={sd['element_height']:.3f}m ({sd['method']})")
 
     result_dicts = []
     for i, r in enumerate(results):
@@ -278,11 +323,29 @@ def main() -> int:
                         help="Skip VLM verification (render only)")
     parser.add_argument("--snap-threshold", type=float, default=0.5,
                         help="Wall endpoint snap threshold (m)")
+    parser.add_argument("--falcon-host", default="127.0.0.1",
+                        help="Falcon inference server host")
+    parser.add_argument("--falcon-port", type=int, default=8390,
+                        help="Falcon inference server port")
+    parser.add_argument("--no-falcon", action="store_true",
+                        help="Disable Falcon spatial extraction (use depth-probing only)")
     args = parser.parse_args()
 
+    # === Falcon client (optional) ===
+    falcon: FalconClient | None = None
+    if not args.no_falcon:
+        falcon = FalconClient(host=args.falcon_host, port=args.falcon_port)
+        if falcon.health():
+            print(f"  Falcon server: connected ({args.falcon_host}:{args.falcon_port})")
+        else:
+            print(f"  Falcon server: unreachable, using depth-probing fallback")
+            falcon = None
+
     data_dir = ROOT / "data" / args.name
-    out_dir = ROOT / "output" / args.name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = ROOT / "output" / args.name / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Output directory: {out_dir}")
 
     # === Stage 1: Load scene ===
     ply_path, feat_path = find_scene_files(data_dir)
@@ -342,6 +405,7 @@ def main() -> int:
         result = detect_elements(
             cfg, scans, walls_snapped, coords, scene,
             out_dir, args.ollama_model, args.skip_vlm,
+            falcon=falcon,
         )
         all_results[elem_type] = result
 
