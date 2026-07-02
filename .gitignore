@@ -34,3 +34,7 @@ env/
 # OS
 Thumbs.db
 .DS_Store
+
+# Model weights (large files)
+weight/
+
