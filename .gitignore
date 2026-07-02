@@ -38,6 +38,3 @@ Thumbs.db
 # Model weights (large files)
 weight/
 
-# Submodules (managed externally)
-Falcon-Perception/
-
