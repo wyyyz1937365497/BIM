@@ -758,6 +758,67 @@ room0 场景（4 墙 + 2 门 + 3 窗）全部在 Revit 中成功创建：
 
 **规范化**：旧 `reqeriments.txt`（拼写错误）替换为标准 `requirements.txt`（完整依赖清单 + 安装顺序）。
 
+### 12.12 [2026-07-02] Falcon-Perception 分割替代深度探测提取空间位置
+
+**背景**：§12.11 的高度检测（深度探测）在真实数据上效果差——room0 三扇确认窗的 header 全部检测为 1.97m（天花板高度），W0 的 sill 检测为 0.05m（地板）。根因：
+1. **透明玻璃**：深度渲染穿过玻璃，返回的深度是窗后的墙/物体，不是窗框 → 深度突变信号失效。
+2. **语义泄漏**：feat.pt 的语义标签在垂直方向有泄漏（窗的语义标签扩散到上下墙面）→ 语义匹配信号也不可靠。
+
+用户提出用**专门的分割模型**（Falcon-Perception）替代深度探测，直接在立面渲染图上分割出门/窗的精确 bbox，再线性映射回墙坐标。
+
+**方案**：Falcon-Perception（0.3B 多模态自回归模型）在垂直立面图上做开放词表分割，返回每个构件的紧致 mask bbox + 面积比例。垂直相机（正视墙面）保证像素→米制的线性映射（无透视畸变）。
+
+**架构**：HTTP 桥接（两个 conda 环境不可合并）：
+```
+transformerv 环境 (Falcon-Perception, torch 2.11+cu128)
+  falcon_inference_server.py  ← FastAPI, POST /segment
+       ↕ HTTP (port 8390)
+
+bim-recon 环境 (gsplat, torch 2.7+cu128)
+  falcon_client.py             ← FalconClient.segment(image, query)
+  spatial_extractor.py         ← render_elevation + bbox_to_wall_coords
+  run_pipeline.py              ← detect_elements() 调用
+```
+
+**核心模块**：
+
+| 文件 | 职责 |
+|---|---|
+| `Falcon-Perception/falcon_inference_server.py` | FastAPI server，加载 Falcon 模型，`POST /segment` 返回 `{detections:[{bbox, mask_bbox, mask_area_ratio}]}` |
+| `bim_recon/falcon_client.py` | HTTP client，`FalconClient.segment(image, query)` → `List[FalconDetection]` |
+| `bim_recon/spatial_extractor.py` | `render_elevation()` 渲染垂直立面 + `bbox_to_wall_coords()` 归一化 bbox → 墙局部坐标 + `extract_spatial()` 端到端 |
+
+**空间映射数学**（垂直相机，线性映射）：
+- `extent_h = extent_v = 2 * camera_dist * tan(fov/2)`（方形图像）
+- `along_wall = target_along + (norm_x - 0.5) * extent_h`
+- `height = cam_h + (0.5 - norm_y) * extent_v`（norm_y 翻转，图像 y 向下增加）
+
+**pipeline 集成**：`detect_elements()` 在 VLM 确认后：
+1. **优先** Falcon 分割（精确 bbox + mask）→ `method="falcon_segmentation"`
+2. **降级** Falcon 仅检测（无 mask）→ `method="falcon_detection"`
+3. **回退** 深度探测（server 不可达或无结果）→ `method="depth_*"`
+
+**CLI 新增参数**：`--falcon-host`、`--falcon-port`、`--no-falcon`（禁用 Falcon，仅用深度探测）。
+
+**测试**：`tests/test_spatial_extractor.py` 14 个测试覆盖：
+- 墙法向/方向计算（4 例）
+- bbox → 墙坐标纯数学（6 例：中心映射、高度方向、宽度映射、左偏、退化、钳制）
+- Mock Falcon 端到端（4 例：正常分割、无检测、仅检测降级、最大 mask 选取）
+
+全量测试 149/150 通过（1 个预存 MSVC 渲染失败，非本次修改引入）。
+
+**关键设计决策**：
+- **HTTP 桥接而非跨环境调用**：两环境 torch 版本差距大（2.7 vs 2.11），无法共存；FastAPI 轻量、跨语言。
+- **垂直相机（perpendicular elevation view）**：像素→米制线性映射，无透视畸变；FOV 覆盖全墙高+0.3m margin。
+- **Server 返回 mask_bbox 而非原始 RLE mask**：减少传输量，bim-recon 客户端不需要 pycocotools。
+- **保留深度探测为 fallback**：Falcon server 未启动/无结果时自动回退，pipeline 始终可用。
+- **保留 Ollama VLM 语义确认**：Falcon 只做空间提取，"这是不是窗"的判定仍由 gemma4:12b VLM 完成。
+
+**基线对比**（深度探测结果，Falcon 预期改善）：
+- W0: sill=0.05m ❌（玻璃透明）, header=1.97m ❌（天花板）
+- W1: sill=0.71m ⚠️, header=1.97m ❌
+- W2: sill=0.71m ⚠️, header=1.97m ❌
+
 ---
 
 ## 附录 A：FloorPlan 契约（草案）

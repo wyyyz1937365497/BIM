@@ -60,6 +60,13 @@
 ### P3：高度检测
 - **高度检测器**（`bim_recon/height_detector.py`）：VLM 确认后，对墙挂构件（门/窗）做垂直深度探测，精修 sill/header 高度。两阶段扫描（粗扫 0.2m 间距 → 精扫 0.02m 迭代逼近），双信号判据（深度突变 + 语义匹配）。集成到 `run_pipeline.py`，对 `height_detection=True` 的构件类型自动启用。
 
+### P3.5：Falcon-Perception 分割提取空间位置
+- **深度探测的局限**：透明玻璃导致深度渲染穿过玻璃（深度突变信号失效）；feat.pt 语义标签垂直泄漏（语义匹配信号也不可靠）。room0 三扇窗 header 全部检测为天花板高度。
+- **Falcon-Perception 分割**（`bim_recon/spatial_extractor.py`）：渲染垂直立面图 → Falcon-Perception 开放词表分割 → 紧致 mask bbox → 线性映射回墙局部坐标（sill/header/width）。垂直相机保证像素→米制映射无透视畸变。
+- **HTTP 桥接**（`Falcon-Perception/falcon_inference_server.py` + `bim_recon/falcon_client.py`）：Falcon-Perception 需要 torch 2.11（transformerv 环境），gsplat 需要 torch 2.7（bim-recon 环境），两环境不可合并 → FastAPI HTTP 桥接。
+- **深度探测保留为 fallback**：Falcon server 不可达或无结果时自动回退到深度探测，pipeline 始终可用。
+- **CLI 参数**：`--falcon-host`（默认 127.0.0.1）、`--falcon-port`（默认 8390）、`--no-falcon`（禁用 Falcon，仅用深度探测）。
+
 ### SceneSplat Windows 原生推理（commit `8e25991`）
 
 SceneSplat（ICCV'25 Oral）官方仓库仅验证 Linux，我们在 Windows 11 + Python 3.10 + PyTorch 2.5.1+cu124 上完成**无 WSL 原生推理**，三条核心命令全部通过：
@@ -143,6 +150,7 @@ python -m scripts.pca_colorize_features `
 - Ollama + gemma4:12b（VLM 验证，本地部署）
 - **Windows** + Visual Studio 2022（gsplat JIT 编译需要 vcvars64）
 - Revit + `mcp-servers-for-revit`（可选，用于 Revit 图元创建）
+- **Falcon-Perception**（可选，conda 环境 `transformerv`）：空间位置精修。权重在 `Falcon-Perception/weight/Falcon-Perception/`。
 
 ### 1. 一键运行完整管线（推荐）
 
@@ -159,7 +167,20 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\
 - `pipeline_report.json` — 完整管线报告
 - `wall_lines_topdown.png` — 墙线俯视图
 
-**管线流程**：加载场景 → 12 高度雷达扫描 → 墙线提取（栅格+形态学+轮廓+PCA）→ 门检测（feat.pt 候选 → 预过滤 → Ollama VLM 验证）→ 窗检测 → 结果 JSON
+**管线流程**：加载场景 → 12 高度雷达扫描 → 墙线提取（栅格+形态学+轮廓+PCA）→ 门检测（feat.pt 候选 → 预过滤 → Ollama VLM 验证 → **Falcon 分割/深度探测空间精修**）→ 窗检测 → 结果 JSON
+
+**启用 Falcon 空间提取（需另开终端启动 server）**：
+```powershell
+# 终端 1：启动 Falcon server（transformerv 环境）
+conda activate transformerv
+cd G:\TJ\BIM\Falcon-Perception
+python falcon_inference_server.py --port 8390
+
+# 终端 2：运行 pipeline（bim-recon 环境，自动检测 server）
+cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0"
+```
+
+> Falcon server 未启动时 pipeline 自动回退到深度探测，不影响正常运行。
 
 **跳过 VLM（仅渲染）**：
 ```powershell
@@ -177,7 +198,7 @@ python scripts/run_pipeline.py --name room0 --elements door window column
 pytest -q
 ```
 
-当前 136 个测试（1 个需 MSVC 环境跳过）：
+当前 150 个测试（1 个需 MSVC 环境跳过）：
 
 | 测试文件 | 覆盖 | 状态 |
 |---|---|---|
@@ -190,6 +211,7 @@ pytest -q
 | `tests/test_vlm_verifier.py` | 极坐标/视角映射(X/Y/Z-up)/VLM响应解析/prompt/Mock端到端 | 25/25 通过 |
 | `tests/test_element_config.py` | 元素类型配置注册表（查找/属性/输出名/frozen）| 14/14 通过 |
 | `tests/test_height_detector.py` | 高度检测（法向计算/开口判定/双信号/Mock场景端到端/回退）| 16/16 通过 |
+| `tests/test_spatial_extractor.py` | Falcon 空间提取（墙法向/bbox映射/Mock端到端/降级回退）| 14/14 通过 |
 
 MCP 工具集成测试（需 MSVC）：
 
@@ -211,11 +233,18 @@ bim_recon/
 ├── candidate_extractor.py   # 元素候选提取（门/窗/家具，feat.pt 语义+墙线投影）
 ├── vlm_verifier.py          # VLM 验证（极坐标→渲染→Ollama gemma4:12b 确认/排除）
 ├── height_detector.py       # 高度检测（垂直深度探测 + 双信号 sill/header 精修）
+├── spatial_extractor.py     # Falcon 空间提取（垂直立面渲染 + bbox→墙坐标映射）
+├── falcon_client.py         # Falcon HTTP 客户端（跨环境桥接）
 ├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
 ├── diff_report.py           # 底图 vs 检测差异报告
 └── colmap_runner.py         # COLMAP 包装
+
+Falcon-Perception/           # transformerv 环境（独立 conda env）
+├── falcon_inference_server.py # FastAPI server (POST /segment → bbox + mask_bbox)
+├── falcon_detector.py       # FalconPerceptionModel wrapper (PagedInferenceEngine)
+└── weight/Falcon-Perception/ # 模型权重 (model.safetensors 2.5GB)
 
 scripts/
 ├── run_pipeline.py          # 主流程：scene → walls → doors → windows → JSON（唯一入口）
@@ -249,13 +278,14 @@ output/                      # feat.pt + 生成的扫描图/墙线
 - **COLMAP + nerfstudio 训练**：需用户手动运行（agent 不代跑）。
 - **gsplat JIT**：首次运行需 MSVC（vcvars64）环境。
 - **精度**：厘米级（依赖 SfM 度量对齐质量），非施工级。
-- **高度检测**：依赖渲染深度质量，透明玻璃/百叶窗可能误判。全高门（无过梁参考）依赖语义信号。
+- **深度探测限制**：透明玻璃/百叶窗可能误判（已由 Falcon 分割改善，需 `transformerv` 环境）。
 - **LiDAR Provider**：P3 规划中，尚未实现。
 
 ## 下一步
 
 - ~~实现门窗洞口检测（在闭合墙线上分析扫描点的语义间隙）~~ ✅ 已完成（P2.5）
 - ~~高度精修检测~~ ✅ 已完成（P3）
+- ~~Falcon-Perception 分割提取空间位置~~ ✅ 已完成（P3.5）
 - 多房间拼接
 - LiDARProvider（ROS2 `/scan` → split-and-merge 墙线）
 - 精度评估报告
