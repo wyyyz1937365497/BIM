@@ -271,8 +271,11 @@ ender_from_pose：gsplat 渲染 RGB+深度
 | `scripts/wall_line_probe.py` | 墙线提取探针（多高度扫描 → 墙线 JSON + 俯视图 PNG）| 已验证 |
 | `bim_recon/candidate_extractor.py` | 元素候选提取：从多高度扫描 + feat.pt 语义标签提取候选构件位置（门/窗/家具），投影到墙线 + 间隙聚类 + 极坐标计算 | 17/17 pytest 通过 |
 | `bim_recon/vlm_verifier.py` | VLM 验证模块：极坐标→相机位姿映射（支持 X/Y/Z-up）→ 3DGS 渲染 → Ollama VLM（gemma4:12b）确认/排除 | 25/25 pytest 通过 |
+| `bim_recon/height_detector.py` | 高度检测器：VLM 确认后对墙挂构件做垂直深度探测，两阶段（粗扫 0.2m → 精扫 0.02m）精修 sill/header 高度，双信号（深度突变 + 语义匹配）| 16/16 pytest 通过 |
+| `bim_recon/element_config.py` | 元素类型注册表：ElementConfig（name/class_idx/structural/min_width/min_points/vlm_hint/height_detection），door/window/column/furniture 四种 | 14/14 pytest 通过 |
 | `tests/test_candidate_extractor.py` | 候选提取单元测试（投影/聚类/提取/DBSCAN自由构件/过滤）| 17/17 通过 |
 | `tests/test_vlm_verifier.py` | VLM 验证单元测试（极坐标/视角映射 X-Y-Z-up/响应解析/prompt/Mock端到端）| 25/25 通过 |
+| `tests/test_height_detector.py` | 高度检测单元测试（法向计算/开口判定/双信号/Mock场景端到端/回退路径）| 16/16 通过 |
 
 ### 关键技术决策
 
@@ -682,7 +685,7 @@ fov    = 60°
 **背景**：项目积累了 23 个脚本（探针、原型、工具），用户要求最终只保留一个主流程脚本：输入 3DGS 场景，自动输出墙+门+窗。
 
 **元素类型注册表**（`bim_recon/element_config.py`）：
-- `ElementConfig` frozen dataclass：name, class_idx, structural, min_width, min_points, typical_height, vlm_hint
+- `ElementConfig` frozen dataclass：name, class_idx, structural, min_width, min_points, vlm_hint, height_detection
 - 注册了 4 种构件类型：door（宽≥0.7m，结构构件）、window（宽≥0.5m，结构构件）、column（宽≥0.2m，结构构件）、furniture（宽≥0.3m，自由构件 DBSCAN）
 - 添加新构件类型 = 字典加一行
 - `get_element_config("window")` 查找配置，`list_element_types()` 列出所有可用类型
@@ -692,7 +695,7 @@ fov    = 60°
 - 流程：加载场景 → 12 高度雷达扫描 → 墙线提取 → 门检测 → 窗检测 → JSON 输出
 - 可选参数：`--elements door window column`（指定检测类型）、`--skip-vlm`（跳过 VLM）
 - 输出：`pipeline_report.json` + `wall_lines_snapped.json` + `doors_verified.json` + `windows_verified.json`
-- （计划中）Revit MCP 推送：待 A 阶段实现，当前管线输出 JSON 供手动导入
+- ✅ **Revit MCP 推送已验证**：room0 完整建模链路（4 墙 + 2 门 + 3 窗）全部在 Revit 中创建成功
 
 **脚本清理**：
 - 删除 15 个冗余探针/探索脚本（analyze_*, check_*, probe_*, *_probe.py 等）
@@ -700,6 +703,60 @@ fov    = 60°
 
 **项目约定**：
 - 永远不要在意字符/字体警告（emoji 缺失、CJK glyph 等），程序能正常运行即可
+
+### 12.11 [2026-07-02] 高度检测 + Revit 完整建模验证 + SceneSplat Windows 原生化
+
+**背景**：三个里程碑同时完成：(1) VLM 确认后的构件高度精修、(2) room0 完整 Revit 建模链路验证、(3) SceneSplat 推理 Windows 原生运行（无 WSL）。
+
+#### 高度检测（`bim_recon/height_detector.py`）
+
+**问题**：候选提取器给出的 `h_min/h_max` 来自 12 高度粗扫的语义标签范围，精度有限（0.2m 间距）。窗的 h_min=0.15m 不可能是真实窗台高——是语义标签的垂直泄漏。
+
+**方案**：VLM 确认后，对 `height_detection=True` 的构件（door/window）做局部垂直深度探测：
+1. **粗扫**（0.2m 间距）：从 floor+0.05 到 ceiling-0.05，每个高度渲染 64×64 小图（相机在墙内侧 1m 处垂直看向墙面），提取中心像素深度 + 语义标签
+2. **参考深度**：取所有非语义匹配深度的**最小值**（=墙表面 = 最近几何体）。用 min 而非 median 的原因：全高门的开口深度可能占多数，median 会偏向开口深度导致判据反转
+3. **开口判定**：`|depth - ref_depth| > threshold`（深度突变）OR `label == class_idx`（语义匹配）→ 判为开口
+4. **精扫**（0.02m 间距）：在粗扫 sill±0.2m / header±0.2m 范围内线性搜索精确边界
+
+**关键设计决策**：
+- `ref_depth = min(wall_depths)`：全高门场景下 median 会反转判据（测试验证）
+- 双信号 OR 逻辑：透明玻璃可能深度不突变但语义匹配；纯深度场景可能语义缺失
+- fallback：无开口检测到时回退到候选的粗扫 h_min/h_max（confidence=0.3）
+- ElementConfig 新增 `height_detection: bool`：door/window=True，column/furniture=False
+
+**集成**：`run_pipeline.py` 的 `detect_elements()` 在 VLM 确认后自动调用，结果写入 JSON 的 `height_detection` 字段。
+
+**测试**：16 个单元测试覆盖纯逻辑（法向/开口判定 6 例）+ Mock 场景（窗/门/纯语义/回退 4 例）+ HeightResult 结构（1 例）。
+
+#### Revit 完整建模链路验证
+
+room0 场景（4 墙 + 2 门 + 3 窗）全部在 Revit 中成功创建：
+
+| 构件 | Revit 类型 | 数量 | Revit IDs | 坐标转换 |
+|---|---|---|---|---|
+| 墙 | 常规 - 200mm - 实心 (18921) | 4 | 337595–337598 | 3DGS m → Revit mm, +6000 X / +4000 Y 偏移 |
+| 门 | 单扇 750×2000mm (94654) | 2 | 337599, 337602 | world_x/y → Revit XY，hostWallId 映射 |
+| 窗 | 固定 0915×1220mm (93310) | 3 | 337604, 337607, 337609 | 同上，sill=900mm |
+
+**流程**：读取 `wall_lines_snapped.json`（4 墙闭合多边形）+ `doors_verified.json`（2 确认门）+ `windows_verified.json`（3 确认窗）→ `pipeline_report.json`（floor_z/ceiling_z/center）→ 坐标转换 → `create_level` → `create_line_based_element`×4 → `create_point_based_element`×2+3。
+
+#### SceneSplat Windows 原生推理（commit `8e25991`）
+
+**目标**：SceneSplat 三条命令在 Windows 上原生运行（Python 3.10 / PyTorch 2.5.1+cu124），无需 WSL。
+
+**兼容性修复**（5 处）：
+1. `pointcept/utils/cache.py`：SharedArray `try/except` 优雅降级（Windows 无 shared memory）
+2. `libs/pointops/setup.py`：`if opt:` 守卫防止空参数传递 + MSVC `/O2` 编译 flag
+3. `libs/pointgroup_ops/setup.py`：同上
+4. `libs/pointgroup_ops/src/bfs_cluster.cpp`：删除死引入 `#include <google/dense_hash_map>`（Windows 无此依赖）
+5. 同上：VLA `int visited[nPoint]` → `std::vector<int>` + `.data()`（MSVC 不支持 VLA）
+
+**验证结果**：
+- `preprocess_gs.py` → 5 npy（1,373,014 高斯）
+- `lang_inference.py` → `room0_feat.pt`（1373014×768），393/393 权重加载
+- `pca_colorize_features.py` → PCA PLY 可视化
+
+**规范化**：旧 `reqeriments.txt`（拼写错误）替换为标准 `requirements.txt`（完整依赖清单 + 安装顺序）。
 
 ---
 

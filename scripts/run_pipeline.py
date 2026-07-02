@@ -42,6 +42,7 @@ from bim_recon.candidate_extractor import (
 )
 from bim_recon.element_config import ElementConfig, get_element_config, list_element_types
 from bim_recon.gs_scene import GSScene
+from bim_recon.height_detector import detect_element_heights
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
 from bim_recon.wall_line_extractor import (
@@ -214,13 +215,46 @@ def detect_elements(
     rejected = [r for r in results if r.confirmed is False]
     print(f"  [{cfg.name}] {len(confirmed)} confirmed, {len(rejected)} rejected")
 
+    # Height detection for confirmed wall-mounted elements
+    height_results: list[dict | None] = [None] * len(results)
+    if cfg.height_detection and confirmed:
+        ceiling_z = coords["ceiling_z"]
+        for i, r in enumerate(results):
+            if not r.confirmed:
+                continue
+            wi = r.candidate.wall_idx
+            if wi is None or wi >= len(walls):
+                continue
+            hr = detect_element_heights(
+                scene, r.candidate, walls[wi],
+                floor_z, ceiling_z, center,
+                class_idx=cfg.class_idx,
+                up_axis=up_axis,
+            )
+            height_results[i] = {
+                "sill_height": hr.sill_height,
+                "header_height": hr.header_height,
+                "element_height": hr.element_height,
+                "confidence": hr.confidence,
+                "method": hr.method,
+            }
+            print(f"    [{cfg.name}] height: sill={hr.sill_height:.3f}m "
+                  f"header={hr.header_height:.3f}m ({hr.method})")
+
+    result_dicts = []
+    for i, r in enumerate(results):
+        d = r.to_dict()
+        if height_results[i] is not None:
+            d["height_detection"] = height_results[i]
+        result_dicts.append(d)
+
     return {
         "element": cfg.name,
         "total_candidates": len(candidates),
         "after_prefilter": len(filtered),
         "confirmed": len(confirmed),
         "rejected": len(rejected),
-        "results": [r.to_dict() for r in results],
+        "results": result_dicts,
     }
 
 

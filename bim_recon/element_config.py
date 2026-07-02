@@ -30,6 +30,7 @@ class ElementConfig:
     min_width: float        # minimum candidate width (meters)
     min_points: int         # minimum scan points per candidate
     vlm_hint: str           # extra context for VLM prompt (appended to element name)
+    height_detection: bool  # True = refine sill/header heights after VLM confirm
 
     @property
     def output_json_name(self) -> str:
@@ -54,6 +55,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         min_width=0.7,
         min_points=100,
         vlm_hint="a door (passage between rooms, usually has a frame and handle)",
+        height_detection=True,
     ),
     "window": ElementConfig(
         name="window",
@@ -62,6 +64,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         min_width=0.5,
         min_points=50,
         vlm_hint="a window (glass opening in a wall, may have blinds or curtains)",
+        height_detection=True,
     ),
     "column": ElementConfig(
         name="column",
@@ -70,6 +73,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         min_width=0.2,
         min_points=80,
         vlm_hint="a structural column (vertical load-bearing pillar)",
+        height_detection=False,
     ),
     "furniture": ElementConfig(
         name="furniture",
@@ -78,6 +82,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
         min_width=0.3,
         min_points=50,
         vlm_hint="a piece of furniture (e.g. bed, sofa, cabinet, table)",
+        height_detection=False,
     ),
 }
 

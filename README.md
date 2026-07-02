@@ -25,19 +25,24 @@
 ```
 
 ## 已实现功能
-
+![alt text](image.png)
 ### P0：基础设施
 - **FloorPlan 契约**（`bim_recon/floorplan.py`）：WallSegment、Opening、ManualProvider，支持 JSON 输入和矩形房间快速生成。
 - **Revit C# 代码生成**（`bim_recon/revit_code.py`）：FloorPlan → Revit API C#（墙、板、门窗洞口）。
+![alt text](assest/{EA244921-B149-4C72-988E-28DAC7701278}.png)
 - **差异报告**（`bim_recon/diff_report.py`）：底图墙线 vs 检测墙线的匹配与差异输出。
 
 ### P1：3DGS + 语义
-- **GSScene**（`bim_recon/gs_scene.py`）：加载 PLY / SceneSplat .npy 场景，gsplat 渲染（RGB+ED），语义查询。支持 `from_npy()` 加载 post-activation 格式数据。
+- **GSScene**（`bim_recon/gs_scene.py`）：为Windows平台做了适配能加载 PLY / SceneSplat .npy 场景，gsplat 渲染（RGB+ED），语义查询。支持 `from_npy()` 加载 post-activation 格式数据。
+![alt text](assest/{BC9B55B5-6178-42AE-ACA9-3242CF04A69C}.png)
 - **SemanticQuerier**（`bim_recon/semantics.py`）：加载 SceneSplat `feat.pt` + SigLIP2 文本嵌入，三种查询模式（dominant/threshold/top_percent）。9 类 BIM 词表（wall/floor/ceiling/door/window/column/beam/stairs/furniture）。
+![alt text](assest/{54AB37EB-51DF-42A9-AEB8-91AF25DCC3F6}.png)
+![alt text](assest/image.png)
 - **MCP Server**（`bim_recon/mcp_gs.py`）：**9 个工具**暴露 3DGS 场景给 VLM/Agent——get_scene_info、list_cameras、render_from_pose、get_depth_grid、select_cluster、query_semantics、render_semantic_overlay、fit_walls、fit_walls_guided。
 - **COLMAP + 训练包装**（`bim_recon/colmap_runner.py`、`scripts/train_gs.py`）：包装 nerfstudio 命令。
 
 ### P2：墙体重建
+![alt text](assest/wall_lines_topdown.png)
 - **WallFitter**（`bim_recon/wall_fitter.py`）：迭代 RANSAC + 遮挡补全合并 + 重力对齐 + 端点精修 + 高度提取。无底图盲拟合。
 - **FloorPlanGuidedFitter**（`bim_recon/wall_fitter.py`）：走廊筛选 + 固定法向直方图峰值拟合。需用户提供底图 JSON。
 - **FloorPlan 自动配准**（`bim_recon/floorplan_registration.py`）：PCA 旋转 + 90° 候选搜索 + 平移网格搜索 + 地板多边形评分。
@@ -45,13 +50,88 @@
 - **栅格化墙线提取**（`bim_recon/wall_line_extractor.py`）：多高度扫描 → DBSCAN 去噪 → 栅格化 + 形态学闭运算 → 轮廓提取 → Douglas-Peucker → RANSAC/PCA 精修 → 闭合墙线多边形。
 
 ### P2.5：VLM 验证元素提取
+![alt text](assest/final_radar.png)
+![alt text](assest/final_radar_window.png)
 - **候选提取器**（`bim_recon/candidate_extractor.py`）：从多高度扫描 + feat.pt 语义标签提取门/窗/家具候选位置。投影到墙线 + 间隙聚类 + 极坐标 (θ, r) 计算。支持结构构件（投影到墙）和自由构件（DBSCAN 聚类）。
-- **VLM 验证器**（`bim_recon/vlm_verifier.py`）：极坐标→相机位姿映射 → 3DGS 渲染针对性图像 → Ollama gemma4:12b VLM 确认/排除。两阶段检测：feat.pt 高召回找候选，VLM 高精度做判定。
-- **端到端 CLI**（`scripts/verify_elements.py`）：加载场景 → 扫描 → 候选提取 → 预过滤 → VLM 验证 → 结果 JSON。
+- **VLM 验证器**（`bim_recon/vlm_verifier.py`）：极坐标→相机位姿映射 → 3DGS 渲染针对性图像 → Ollama gemma4:12b VLM 确认/排除。两阶段检测：feat.pt 高召回找候选，VLM 高精度做判定。支持 `vlm_hint` 提示词注入。
+- **元素类型注册表**（`bim_recon/element_config.py`）：`ElementConfig` frozen dataclass（name/class_idx/structural/min_width/min_points/vlm_hint/height_detection），注册 door/window/column/furniture 四种类型。
+- **端到端 CLI**（`scripts/run_pipeline.py`）：唯一入口——加载场景 → 12 高度雷达扫描 → 墙线提取 → 多类型元素检测（feat.pt 候选 → 预过滤 → Ollama VLM 验证 → **高度精修**）→ JSON 输出。
+
+### P3：高度检测
+- **高度检测器**（`bim_recon/height_detector.py`）：VLM 确认后，对墙挂构件（门/窗）做垂直深度探测，精修 sill/header 高度。两阶段扫描（粗扫 0.2m 间距 → 精扫 0.02m 迭代逼近），双信号判据（深度突变 + 语义匹配）。集成到 `run_pipeline.py`，对 `height_detection=True` 的构件类型自动启用。
+
+### SceneSplat Windows 原生推理（commit `8e25991`）
+
+SceneSplat（ICCV'25 Oral）官方仓库仅验证 Linux，我们在 Windows 11 + Python 3.10 + PyTorch 2.5.1+cu124 上完成**无 WSL 原生推理**，三条核心命令全部通过：
+
+| 命令 | 输入 | 输出 | 验证结果 |
+|---|---|---|---|
+| `scripts/preprocess_gs.py` | `point_cloud_30000.ply` | `coord/color/opacity/scale/quat.npy` | 1,373,014 高斯 |
+| `tools/lang_inference.py` | 5 npy + model_best.pth | `room0_feat.pt` (N, 768) | 1373014×768，393/393 权重 |
+| `scripts/pca_colorize_features.py` | `feat.pt` + npy | PCA PLY | 可视化通过 |
+
+**Windows 兼容性修复（5 处，commit `8e25991`）**：
+
+1. **`pointcept/utils/cache.py`** — SharedArray `try/except` 优雅降级：Windows 无 `sys/mman.h`，捕获 `OSError` 后跳过 shared memory 缓存。
+2. **`libs/pointops/setup.py`** — MSVC 兼容：`if opt:` 守卫防止 `None` 参数传递；追加 `/O2` 编译 flag（MSVC 无 `-O3`）。
+3. **`libs/pointgroup_ops/setup.py`** — 同上 MSVC 兼容处理。
+4. **`libs/pointgroup_ops/src/bfs_cluster.cpp`** — 删除死引入 `#include <google/dense_hash_map>`（Windows 无此依赖）。
+5. **`libs/pointgroup_ops/src/bfs_cluster.cpp`** — VLA `int visited[nPoint]` → `std::vector<int> visited(nPoint)` + `.data()`（MSVC 不支持 C99 VLA）。
+
+**环境安装（SceneSplat ）**：
+
+```powershell
+# 2. 安装 PyTorch（CUDA 12.4）
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+
+# 3. 安装其余依赖（在 SceneSplat 目录下）
+cd SceneSplat
+pip install -r requirements.txt
+
+# 4. 编译 CUDA 扩展（cl.exe 需在 PATH，但不要在 vcvars64 shell 中运行 pip）
+pip install ./libs/pointops -v --no-build-isolation
+pip install ./libs/pointgroup_ops -v --no-build-isolation
+```
+
+> 注意：`requirements.txt` 已规范化（原 `reqeriments.txt` 拼写错误），含完整依赖清单和安装顺序。
+
+**生成 `feat.pt` 三步命令链（已验证）**：
+
+```powershell
+# Step 1: PLY → npy（预处理）
+python -m scripts.preprocess_gs `
+  --input data/room0/point_cloud_30000.ply `
+  --output data/room0/preprocessed
+# 产出：data/room0/preprocessed/{coord,color,opacity,scale,quat}.npy
+
+# Step 2: PT-v3 推理 → feat.pt（核心）
+python -m tools.lang_inference `
+  --config configs/inference/lang-pretrain-pt-v3m1-3dgs.py `
+  --checkpoint ckpt/lang-pretrain-concat-scan-ppv2-matt-mcmc-wo-normal-contrastive.pth `
+  --input-root data/room0/preprocessed `
+  --output-dir output/room0 `
+  --scene-name room0
+# 产出：output/room0/room0_feat.pt  (N, 768)
+
+# Step 3: PCA 可视化（可选）
+python -m scripts.pca_colorize_features `
+  --feature-path output/room0/room0_feat.pt `
+  --input-root data/room0/preprocessed `
+  --output-dir output/room0 `
+  --scene-name room0 `
+  --device cuda
+# 产出：output/room0/room0_pca_colored.ply（点云）
+#       output/room0/room0_feat_vis_3dgs.ply（可渲染 3DGS）
+```
+
+**与 bim-recon 环境对接**：
+- `feat.pt` 为 post-normalization float16，bim-recon 环境用 `torch.load(..., map_location="cpu")` 后 `.float()`。
+- `.npy` 为 post-activation（opacity 已 sigmoid、scale 已 exp），bim-recon 用 `GSScene.from_npy()` 直接加载，不再重复激活。
+- 高斯顺序一致性：`preprocess_gs.py` 按 PLY vertex 顺序读取，`lang_inference.py` 用 `inverse_map` 恢复原始顺序，确保 `feat.pt` 与 PLY 一一对应。
 
 ### Revit 集成
 - 通过 `mcp-servers-for-revit` 的 MCP 工具（26 个），直接在 Revit 中创建墙、板、门窗等原生图元。
-- 已验证：`revit_create_line_based_element` 成功创建墙体（6 面底图引导墙 + 4 面正方形测试房间）。
+- **已验证完整建模链路**：room0 场景 → 4 面 200mm 实心墙（Ids: 337595–337598）+ 2 扇 750×2000mm 门（Ids: 337599, 337602）+ 3 扇 0915×1220mm 窗（Ids: 337604, 337607, 337609），全部在 Revit 中原生可编辑。
 
 ## 快速开始
 
@@ -97,7 +177,7 @@ python scripts/run_pipeline.py --name room0 --elements door window column
 pytest -q
 ```
 
-当前 120 个测试（1 个需 MSVC 环境跳过）：
+当前 136 个测试（1 个需 MSVC 环境跳过）：
 
 | 测试文件 | 覆盖 | 状态 |
 |---|---|---|
@@ -109,6 +189,7 @@ pytest -q
 | `tests/test_candidate_extractor.py` | 候选提取（投影/聚类/多墙/DBSCAN自由构件/过滤）| 17/17 通过 |
 | `tests/test_vlm_verifier.py` | 极坐标/视角映射(X/Y/Z-up)/VLM响应解析/prompt/Mock端到端 | 25/25 通过 |
 | `tests/test_element_config.py` | 元素类型配置注册表（查找/属性/输出名/frozen）| 14/14 通过 |
+| `tests/test_height_detector.py` | 高度检测（法向计算/开口判定/双信号/Mock场景端到端/回退）| 16/16 通过 |
 
 MCP 工具集成测试（需 MSVC）：
 
@@ -129,6 +210,7 @@ bim_recon/
 ├── wall_line_extractor.py   # 栅格化+形态学+轮廓+DP+RANSAC 墙线提取
 ├── candidate_extractor.py   # 元素候选提取（门/窗/家具，feat.pt 语义+墙线投影）
 ├── vlm_verifier.py          # VLM 验证（极坐标→渲染→Ollama gemma4:12b 确认/排除）
+├── height_detector.py       # 高度检测（垂直深度探测 + 双信号 sill/header 精修）
 ├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
@@ -167,11 +249,13 @@ output/                      # feat.pt + 生成的扫描图/墙线
 - **COLMAP + nerfstudio 训练**：需用户手动运行（agent 不代跑）。
 - **gsplat JIT**：首次运行需 MSVC（vcvars64）环境。
 - **精度**：厘米级（依赖 SfM 度量对齐质量），非施工级。
+- **高度检测**：依赖渲染深度质量，透明玻璃/百叶窗可能误判。全高门（无过梁参考）依赖语义信号。
 - **LiDAR Provider**：P3 规划中，尚未实现。
 
 ## 下一步
 
-- 实现门窗洞口检测（在闭合墙线上分析扫描点的语义间隙）
+- ~~实现门窗洞口检测（在闭合墙线上分析扫描点的语义间隙）~~ ✅ 已完成（P2.5）
+- ~~高度精修检测~~ ✅ 已完成（P3）
 - 多房间拼接
 - LiDARProvider（ROS2 `/scan` → split-and-merge 墙线）
 - 精度评估报告
