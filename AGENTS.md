@@ -30,6 +30,15 @@
 - 注意：动态执行中 `Element.TypeId` / `Element.Host` 不可用（是扩展方法），需用 `element.GetTypeId()` 和 `(element as FamilyInstance).Host`
 - 注意：中文 Revit 项目中 `LookupParameter("Width")` 找不到参数，参数名是中文（"宽度"/"高度"/"窗台高度"）。`BuiltInParameter.FAMILY_WIDTH_PARAM` 等枚举是语言无关的，始终可用
 
+## Gradio Web UI
+
+- 启动：`scripts\launch_gradio.bat`（自动设置 vcvars64）
+- URL: `http://127.0.0.1:7860`
+- 4 个 Tab：3DGS Viewer (nerfview iframe, port 8081) / Pipeline / Results / Seg Editor
+- nerfview 依赖已安装：`nerfview`, `run_viewer` (Mini Viewer), `gsplat` 在 bim-recon 环境
+- Pipeline 通过 subprocess 调用 `run_pipeline.py`（需要 vcvars64 for gsplat JIT）
+- Seg Editor 支持手动 bbox 调整（归一化坐标 0-1 滑块）
+
 ## Revit MCP 工具使用要点
 
 - `create_point_based_element` 的 `typeId=-1` 可能找不到族类型（因为没有任何类型标记为 Active），应始终指定具体 `typeId`
