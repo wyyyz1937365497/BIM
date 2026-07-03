@@ -61,11 +61,22 @@
 - **高度检测器**（`bim_recon/height_detector.py`）：VLM 确认后，对墙挂构件（门/窗）做垂直深度探测，精修 sill/header 高度。两阶段扫描（粗扫 0.2m 间距 → 精扫 0.02m 迭代逼近），双信号判据（深度突变 + 语义匹配）。集成到 `run_pipeline.py`，对 `height_detection=True` 的构件类型自动启用。
 
 ### P3.5：Falcon-Perception 分割提取空间位置
+![alt text](assest/final_radar.png)
+![alt text](assest/final_radar_window.png)
 - **深度探测的局限**：透明玻璃导致深度渲染穿过玻璃（深度突变信号失效）；feat.pt 语义标签垂直泄漏（语义匹配信号也不可靠）。room0 三扇窗 header 全部检测为天花板高度。
 - **Falcon-Perception 分割**（`bim_recon/spatial_extractor.py`）：渲染垂直立面图 → Falcon-Perception 开放词表分割 → 紧致 mask bbox → 线性映射回墙局部坐标（sill/header/width）。垂直相机保证像素→米制映射无透视畸变。
 - **HTTP 桥接**（`Falcon-Perception/falcon_inference_server.py` + `bim_recon/falcon_client.py`）：Falcon-Perception 需要 torch 2.11（transformerv 环境），gsplat 需要 torch 2.7（bim-recon 环境），两环境不可合并 → FastAPI HTTP 桥接。
+- **Seg 遮罩叠加图**：Falcon 分割后，在立面渲染图上绘制检测结果（检测 bbox 绿框 + mask bbox 红框），保存为 `*_overlay.png` 供调试。
 - **深度探测保留为 fallback**：Falcon server 不可达或无结果时自动回退到深度探测，pipeline 始终可用。
 - **CLI 参数**：`--falcon-host`（默认 127.0.0.1）、`--falcon-port`（默认 8390）、`--no-falcon`（禁用 Falcon，仅用深度探测）。
+- **时间戳输出**：每次运行创建 `output/<name>/YYYYMMDD_HHMMSS/` 目录，保存所有中间数据（雷达图、渲染图、叠加图、JSON）。
+
+### P3.6：Revit MCP 工具扩展（自定义尺寸门窗）
+- **问题**：Revit 门/窗宽高是**族类型参数**，不是实例参数。现有 MCP 工具创建的永远是默认尺寸。
+- **解决方案**：扩展 `CreatePointElementEventHandler.cs`，事务内自动复制族类型 + 设置 `FAMILY_WIDTH_PARAM`/`FAMILY_HEIGHT_PARAM`，类型名 `Custom {W}x{H}mm`。
+- **窗台高度**：通过 `parameters: {"sillHeight": N}`（mm）设置。
+- **构建自动化**（`scripts/build_deploy_revit.ps1`）：一键构建 C# + TypeScript + 部署（5 步：Kill Revit → Build C# → Build TS → Deploy → Verify）。Debug 构建自动部署到 Addins。
+- **本地开发**：opencode MCP 配置指向本地 `server/build/index.js`（非 npm 发布版），修改 TS server 后重启 opencode 即时生效。
 
 ### SceneSplat Windows 原生推理（commit `8e25991`）
 
@@ -138,7 +149,9 @@ python -m scripts.pca_colorize_features `
 
 ### Revit 集成
 - 通过 `mcp-servers-for-revit` 的 MCP 工具（26 个），直接在 Revit 中创建墙、板、门窗等原生图元。
-- **已验证完整建模链路**：room0 场景 → 4 面 200mm 实心墙（Ids: 337595–337598）+ 2 扇 750×2000mm 门（Ids: 337599, 337602）+ 3 扇 0915×1220mm 窗（Ids: 337604, 337607, 337609），全部在 Revit 中原生可编辑。
+- **自定义尺寸门窗**：`create_point_based_element` 已扩展（§12.13），设置 `width` + `height`（mm）会自动复制族类型并设置类型参数，类型名 `Custom {W}x{H}mm`。
+- **已验证完整建模链路**：room0 场景 → 4 面 200mm 实心墙 + 2 扇自定义尺寸门（Custom 900×1920mm, Custom 947×1979mm）+ 3 扇自定义尺寸窗（Custom 389×633mm, Custom 1452×1316mm, Custom 1544×1329mm），尺寸来自 Falcon 分割，全部在 Revit 中原生可编辑。
+- **构建自动化**：`scripts/build_deploy_revit.ps1` 一键构建 C# + TypeScript + 部署到 Revit Addins（5 步流程）。
 
 ## 快速开始
 
@@ -248,6 +261,7 @@ Falcon-Perception/           # transformerv 环境（独立 conda env）
 
 scripts/
 ├── run_pipeline.py          # 主流程：scene → walls → doors → windows → JSON（唯一入口）
+├── build_deploy_revit.ps1   # Revit MCP 一键构建+部署（C# + TypeScript + Addins）
 ├── generate_walls.py        # 单独提取墙线
 ├── final_radar.py           # 可视化：4 面板管线结果图
 ├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器（工具）
@@ -255,8 +269,15 @@ scripts/
 ├── test_mcp_gs.py           # MCP 工具集成测试
 └── train_gs.py              # nerfstudio 训练包装
 
+revit_scripts/               # send_code_to_revit C# 脚本模板库
+├── query_family_types.cs    # 查询族类型（含尺寸）
+├── create_custom_door.cs    # 自定义尺寸门（复制类型+设参数）
+├── create_custom_window.cs  # 自定义尺寸窗
+├── create_walls_from_json.cs # 批量建墙（JSON 输入）
+└── delete_elements_by_category.cs # 按类别删除
+
 data/                        # SceneSplat .npy 数据 + BIM 词表
-output/                      # feat.pt + 生成的扫描图/墙线
+output/                      # feat.pt + 生成的扫描图/墙线（时间戳目录）
 ```
 
 ## 关键技术栈
@@ -269,7 +290,8 @@ output/                      # feat.pt + 生成的扫描图/墙线
 | 文本对齐 | SigLIP2 | BIM 词表文本嵌入，与 feat.pt 零样本对齐 |
 | 虚拟扫描 | gsplat depth rendering | 从任意位姿渲染深度 → 模拟 LiDAR |
 | 墙线提取 | OpenCV + scikit-learn | 栅格化 + 形态学 + 轮廓 + Douglas-Peucker + PCA |
-| Revit 桥接 | mcp-servers-for-revit | C# MCP Server，26 个工具直接操作 Revit API |
+| 空间分割 | Falcon-Perception (0.3B) | 开放词表分割 → mask bbox → 垂直立面像素→米制映射 |
+| Revit 桥接 | mcp-servers-for-revit | C# MCP Server，26 个工具直接操作 Revit API（已扩展自定义尺寸） |
 | VLM 决策 | Claude / GPT-4o | 通过 MCP 工具巡视场景、提取墙体 |
 
 ## 当前限制

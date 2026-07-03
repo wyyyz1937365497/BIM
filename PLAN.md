@@ -821,7 +821,73 @@ bim-recon 环境 (gsplat, torch 2.7+cu128)
 
 ---
 
-## 附录 A：FloorPlan 契约（草案）
+### 12.13 [2026-07-02] MCP 工具扩展：自定义尺寸门窗 + 构建自动化 + Revit 原生建模
+
+**背景**：§12.11 的 Revit 建模使用了默认尺寸的门/窗族类型（750×2000mm 门、0915×1220mm 窗）。但 pipeline 从 Falcon-Perception 分割得到了精确的 width/height/sill，需要在 Revit 中创建匹配尺寸的图元。
+
+#### 问题分析
+
+Revit 门/窗的宽高是**族类型参数（Type Parameter）**，不是实例参数。现有 MCP 工具 `create_point_based_element` 虽然接受 `width`/`height` 字段，但它们只用于计算标高偏移，**不影响实际尺寸**——创建出来的永远是族类型的默认大小。
+
+#### 方案：扩展 CreatePointElementEventHandler
+
+修改 `commandset/Services/CreatePointElementEventHandler.cs`，在事务内自动复制族类型并设置类型参数：
+
+1. **类型复制**（Step 3a）：门窗 + `Width > 0` 时，调用 `GetOrCreateCustomSizedSymbol()`：
+   - 检查现有类型的 Width/Height 是否已匹配 → 是则跳过复制
+   - 检查同名自定义类型是否已存在 → 是则复用
+   - 否则 `baseSymbol.Duplicate("Custom {W}x{H}mm")` + 设置 `FAMILY_WIDTH_PARAM` / `FAMILY_HEIGHT_PARAM`
+2. **窗台高度**：从 `parameters["sillHeight"]` 读取并设置实例参数
+3. **三个辅助方法**：`GetOrCreateCustomSizedSymbol`、`GetTypeDimension`、`SetTypeDimension`
+
+**关键 API 发现**（Revit 2026 .NET 8）：
+- `ElementId.IntegerValue` 已移除 → 用 `(long)ElementId.Value`
+- `BuiltInParameter.FAMILY_WIDTH_PARAM` / `FAMILY_HEIGHT_PARAM` 是语言无关的，始终可用
+- 中文 Revit 中 `LookupParameter("Width")` 找不到参数（实际名是"宽度"），但 `BuiltInParameter` 枚举不受影响
+- `create_point_based_element` 的 `typeId=-1` 可能找不到族类型（无 Active 标记），应指定具体 typeId
+
+#### 构建自动化
+
+**`scripts/build_deploy_revit.ps1`** — 一键构建+部署（5 步）：
+1. Kill Revit（释放 DLL 锁）
+2. Build C#（`dotnet build -c "Debug R26" --no-incremental`，默认清理 obj/ 防 WPF `.g.cs` 丢失）
+3. Build TypeScript MCP Server（`npm run build` → `server/build/index.js`）
+4. Deploy（暂存区 → `%AppData%\Autodesk\Revit\Addins\2026\`）
+5. Verify（5 个关键文件校验）
+
+**opencode MCP 配置**：从 `npx -y mcp-server-for-revit`（npm 发布版）改为 `node server/build/index.js`（本地源码 build），修改 TS server 后即时生效。
+
+#### room0 完整建模验证
+
+使用扩展后的 MCP 工具创建 room0 全部构件：
+
+| 构件 | 数量 | Revit IDs | 关键参数 |
+|---|---|---|---|
+| 墙 | 4 | 337582, 337585, 337588, 337591 | 200mm 厚, 2012mm 高, 坐标从 pipeline JSON 米→mm |
+| 门 | 2 | 337596, 337602 | Custom 900×1920mm, Custom 947×1979mm (Falcon) |
+| 窗 | 3 | 337608, 337614, 337618 | Custom 389×633mm, Custom 1452×1316mm, Custom 1544×1329mm (Falcon) |
+
+所有门窗均自动复制族类型并设置精确尺寸，类型名格式 `Custom {W}x{H}mm`，可追溯。
+
+#### Falcon-Perception 空间提取成果（§12.12 续）
+
+room0 的 5 个确认构件空间提取结果（pipeline → Revit）：
+
+| 构件 | 方法 | sill(m) | header(m) | height(m) | width(m) | Revit 类型 |
+|---|---|---|---|---|---|---|
+| Door #0 | depth+semantic | 0.050 | 1.970 | 1.920 | 0.900* | Custom 900×1920mm |
+| Door #1 | falcon_segmentation | 0.000 | 1.979 | 1.979 | 0.947 | Custom 947×1979mm |
+| Window #0 | falcon_segmentation | 1.029 | 1.662 | 0.633 | 0.389 | Custom 389×633mm |
+| Window #2 | falcon_segmentation | 0.696 | 2.012 | 1.316 | 1.452 | Custom 1452×1316mm |
+| Window #4 | falcon_segmentation | 0.683 | 2.012 | 1.329 | 1.544 | Custom 1544×1329mm |
+
+> *Door #0 无 Falcon 结果（Falcon 未检测到），回退深度探测；width 使用标准 900mm。
+> Window #0 的 Falcon confidence=0.47（较低），但 sill=1.029m 合理（高窗台）。
+
+**对比 §12.11 基线**（深度探测）：
+- Window #0: sill 0.05m→1.029m ✅（修复了玻璃透明导致的深度穿透）
+- Window header: 全部 1.97m→1.662/2.012m ✅（修复了天花板钳制问题）
+- 4/5 构件由 Falcon 分割提取，仅 1 个回退到深度探测
 
 ```python
 from dataclasses import dataclass, field
@@ -891,9 +957,11 @@ class FloorPlanProvider:
 | `fit_walls([text_query], [mode], [up_axis])` | WallFitter (RANSAC+merge+refine) | 语义高斯→墙线段（p0/p1/height/thickness）→ Revit |
 | `fit_walls_guided(floorplan_json, [text_query], [mode], [up_axis], [corridor_width])` | FloorPlanGuidedFitter + register_floorplan | 底图 JSON → 自动配准 → 走廊筛选直方图峰值 → 墙线段（比盲拟合更稳定）→ Revit |
 
-### Revit 侧（`mcp-servers-for-revit`，26 工具，复用）
+### Revit 侧（`mcp-servers-for-revit`，26 工具，复用 + 扩展）
 
-关键工具：`create_line_based_element`（墙）、`create_surface_based_element`（板）、`create_point_based_element`（门/窗）、`send_code_to_revit`（C# 代码执行）、`operate_element`（高亮/隔离/删除）等。
+关键工具：`create_line_based_element`（墙）、`create_surface_based_element`（板）、`create_point_based_element`（门/窗，**已扩展支持自定义尺寸**）、`send_code_to_revit`（C# 代码执行）、`operate_element`（高亮/隔离/删除）等。
+
+> **create_point_based_element 扩展**（§12.13）：设置 `width` + `height`（mm）会自动复制族类型并设置类型参数，类型名 `Custom {W}x{H}mm`。`parameters: {"sillHeight": N}` 设置窗台高度。中文 Revit 中 `BuiltInParameter.FAMILY_WIDTH_PARAM` 等枚举语言无关，始终可用。
 
 ### VLM 工作流（目标）
 1. `get_scene_info` → 了解场景规模
