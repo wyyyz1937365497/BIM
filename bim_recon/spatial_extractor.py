@@ -46,6 +46,7 @@ class SpatialResult:
     world_y: float
     confidence: float         # 0.0 – 1.0
     method: str               # "falcon_segmentation" | "falcon_detection"
+    elevation_params: dict | None = None  # serialized ElevationParams for manual bbox remap
 
 
 # ---------------------------------------------------------------------------
@@ -368,5 +369,16 @@ def extract_spatial(
     result.confidence = round(
         min(1.0, (best.mask_area_ratio or 0.0) * 5.0 + 0.3), 2,
     )
+
+    # Persist camera geometry so manual bbox remap can work from saved JSON
+    result.elevation_params = {
+        "wall_length": params.wall_length,
+        "wall_start": params.wall_start.tolist(),
+        "wall_dir": params.wall_dir.tolist(),
+        "target_along": params.target_along,
+        "cam_h_above_floor": params.cam_h_above_floor,
+        "extent_h": params.extent_h,
+        "extent_v": params.extent_v,
+    }
 
     return result

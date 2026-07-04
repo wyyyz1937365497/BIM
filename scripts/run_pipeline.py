@@ -63,9 +63,20 @@ from bim_recon.wall_line_extractor import (
 def find_scene_files(data_dir: Path) -> tuple[Path, Path]:
     """Auto-discover PLY + feat.pt, preferring original weights."""
     original = sorted(data_dir.glob("point_cloud_*.ply"))
+    if not original:
+        original = sorted(data_dir.glob("*.ply"))
     feat_vis = sorted(data_dir.glob("*_feat_vis_3dgs.ply"))
     ply = original[0] if original else feat_vis[0]
-    feat = sorted(data_dir.glob("*_feat.pt"))[0]
+    # feat.pt may be in data_dir or in output/<name>/
+    feat_candidates = sorted(data_dir.glob("*_feat.pt"))
+    output_dir = data_dir.parent.parent / "output" / data_dir.name
+    if not feat_candidates:
+        feat_candidates = sorted(output_dir.glob("*_feat.pt"))
+    if not feat_candidates:
+        raise FileNotFoundError(
+            f"No *_feat.pt found in {data_dir} or {output_dir}"
+        )
+    feat = feat_candidates[0]
     return ply, feat
 
 
@@ -226,9 +237,11 @@ def detect_elements(
     print(f"  [{cfg.name}] {len(confirmed)} confirmed, {len(rejected)} rejected")
 
     # Spatial extraction for confirmed wall-mounted elements.
-    # Try Falcon-Perception segmentation first (precise bbox → metric coords);
-    # fall back to depth-probing when Falcon is unavailable or finds nothing.
+    # When Falcon is online: Falcon's verdict is authoritative — if it finds
+    # nothing, the element is rejected (no depth-probe fallback).
+    # Depth-probe fallback is used ONLY when the Falcon server is offline.
     height_results: list[dict | None] = [None] * len(results)
+    falcon_rejected: set[int] = set()
     if cfg.height_detection and confirmed:
         ceiling_z = coords["ceiling_z"]
         falcon_tag = "Falcon" if falcon is not None else "depth-probe"
@@ -242,8 +255,8 @@ def detect_elements(
 
             spatial_dict: dict | None = None
 
-            # --- Primary: Falcon segmentation ---
             if falcon is not None:
+                # --- Falcon online: authoritative segmentation ---
                 elev_path = str(out_dir / f"{cfg.name}_{i}_elevation.png")
                 spatial = extract_spatial(
                     falcon, scene, r.candidate, walls[wi],
@@ -262,10 +275,15 @@ def detect_elements(
                         "t_max": spatial.t_max,
                         "confidence": spatial.confidence,
                         "method": spatial.method,
+                        "elevation_params": spatial.elevation_params,
                     }
-
-            # --- Fallback: depth-probing ---
-            if spatial_dict is None:
+                else:
+                    # Falcon online but found nothing → element doesn't exist
+                    falcon_rejected.add(i)
+                    print(f"    [{cfg.name}] #{i}: Falcon 未检测到，拒绝该构件")
+                    continue
+            else:
+                # --- Falcon offline: depth-probe fallback ---
                 hr = detect_element_heights(
                     scene, r.candidate, walls[wi],
                     floor_z, ceiling_z, center,
@@ -287,18 +305,29 @@ def detect_elements(
                   f"h={sd['element_height']:.3f}m ({sd['method']})")
 
     result_dicts = []
+    final_confirmed = 0
     for i, r in enumerate(results):
         d = r.to_dict()
-        if height_results[i] is not None:
+        if i in falcon_rejected:
+            d["confirmed"] = False
+            d["reject_reason"] = "falcon_not_detected"
+        elif height_results[i] is not None:
             d["height_detection"] = height_results[i]
+            final_confirmed += 1
+        elif r.confirmed:
+            final_confirmed += 1
         result_dicts.append(d)
+
+    if falcon_rejected:
+        print(f"  [{cfg.name}] {len(falcon_rejected)} rejected by Falcon "
+              f"(false positives removed)")
 
     return {
         "element": cfg.name,
         "total_candidates": len(candidates),
         "after_prefilter": len(filtered),
-        "confirmed": len(confirmed),
-        "rejected": len(rejected),
+        "confirmed": final_confirmed,
+        "rejected": len(rejected) + len(falcon_rejected),
         "results": result_dicts,
     }
 
@@ -357,8 +386,8 @@ def main() -> int:
 
     scene = GSScene.from_ply(
         ply_path, feat_path=feat_path,
-        text_emb_path=str(ROOT / "data" / "0" / "bim_text_emb.pt"),
-        class_names_path=str(ROOT / "data" / "0" / "bim_class_names.json"),
+        text_emb_path=str(ROOT / "data" / "bim_text_emb.pt"),
+        class_names_path=str(ROOT / "data" / "bim_class_names.json"),
     )
     print(f"  Gaussians: {scene.num_gaussians}")
 
