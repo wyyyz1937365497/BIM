@@ -443,7 +443,7 @@ class GSScene:
         )
         # render_colors: (1, H, W, 4) -> RGB(3) + expected_depth(1)
         # render_alphas: (1, H, W, 1)
-        # Single GPU→CPU transfer: concat then slice on CPU (avoids 3 sync points)
+        # Consolidated transfer: colors+depth share one GPU→CPU sync (was 3, now 2)
         rgba = render_colors[0].cpu().numpy()  # (H, W, 4)
         alpha_np = render_alphas[0, :, :, 0].cpu().numpy()
         colors = np.clip(rgba[:, :, :3], 0.0, 1.0)
