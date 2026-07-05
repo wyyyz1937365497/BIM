@@ -263,6 +263,7 @@ def verify_candidates(
     """
     from bim_recon.gs_scene import look_at_pose
     from PIL import Image
+    from concurrent.futures import ThreadPoolExecutor
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,8 +273,9 @@ def verify_candidates(
     up_vec[up_axis] = 1.0
 
     prompt = _build_prompt(element_class, vlm_hint)
-    results: List[VerificationResult] = []
 
+    # Phase 1: Render all images sequentially (GPU is single-threaded)
+    rendered: List[tuple] = []  # (index, candidate, img_path, eye, target, used_fov)
     for i, cand in enumerate(candidates):
         eye, target, used_fov = candidate_to_viewpoint(
             cand.world_x, cand.world_y,
@@ -281,7 +283,6 @@ def verify_candidates(
             scan_center, floor_z, fov=fov,
             up_axis=up_axis,
         )
-
         pose = look_at_pose(
             (eye[0], eye[1], eye[2]),
             (target[0], target[1], target[2]),
@@ -291,7 +292,6 @@ def verify_candidates(
             pose, width=image_width, height=image_height,
             fov_degrees=used_fov,
         )
-
         wall_tag = f"w{cand.wall_idx}" if cand.wall_idx is not None else "free"
         img_name = f"verify_{element_class}_{i}_{wall_tag}.png"
         img_path = str(output_dir / img_name)
@@ -299,18 +299,34 @@ def verify_candidates(
             (render_result.colors * 255).clip(0, 255).astype(np.uint8)
         )
         img.save(img_path)
+        rendered.append((i, cand, img_path, eye, target, used_fov))
 
-        vlm_text = ""
-        confirmed: Optional[bool] = None
-        if not skip_vlm:
-            try:
-                vlm_text = query_ollama(
-                    img_path, prompt, ollama_model,
-                    ollama_host, ollama_port,
-                )
-                confirmed, _ = _parse_vlm_response(vlm_text)
-            except Exception as e:
-                vlm_text = f"ERROR: {e}"
+    # Phase 2: Query VLM in parallel (HTTP I/O bound, no CUDA involvement)
+    def _query_one(item):
+        idx, cand, path = item[0], item[1], item[2]
+        if skip_vlm:
+            return idx, "", None
+        try:
+            vlm_text = query_ollama(path, prompt, ollama_model, ollama_host, ollama_port)
+            confirmed, _ = _parse_vlm_response(vlm_text)
+            return idx, vlm_text, confirmed
+        except Exception as e:
+            return idx, f"ERROR: {e}", None
+
+    vlm_results: dict = {}
+    if not skip_vlm and rendered:
+        with ThreadPoolExecutor(max_workers=min(8, len(rendered))) as pool:
+            futures = {pool.submit(_query_one, r): r[0] for r in rendered}
+            for fut in futures:
+                idx, vlm_text, confirmed = fut.result()
+                vlm_results[idx] = (vlm_text, confirmed)
+
+    # Phase 3: Assemble results in order
+    results: List[VerificationResult] = []
+    for i, cand, img_path, eye, target, used_fov in rendered:
+        wall_tag = f"w{cand.wall_idx}" if cand.wall_idx is not None else "free"
+        img_name = f"verify_{element_class}_{i}_{wall_tag}.png"
+        vlm_text, confirmed = vlm_results.get(i, ("", None))
 
         theta, r = compute_polar(cand.world_x, cand.world_y, scan_center)
         result = VerificationResult(

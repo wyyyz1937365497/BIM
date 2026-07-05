@@ -82,11 +82,16 @@ def _probe_height(
     camera_dist: float,
     img_size: int,
     fov: float,
+    enc: Optional[torch.Tensor] = None,
+    num_classes: int = 0,
 ) -> Tuple[float, Optional[int]]:
     """Render a tiny image looking at the wall at *height*.
 
     Returns ``(center_depth, center_semantic_label)``.
     ``center_depth < 0`` means no geometry was hit.
+
+    ``enc`` is the pre-built semantic color encoding tensor (N, 3) to avoid
+    rebuilding it on every probe. If None, semantics are skipped.
     """
     h_axes = [i for i in range(3) if i != up_axis]
 
@@ -118,22 +123,9 @@ def _probe_height(
     if alpha < 0.1:
         return -1.0, None
 
-    # --- semantic pass (optional) --------------------------------------
+    # --- semantic pass (optional, uses pre-built enc) -----------------
     label: Optional[int] = None
-    if class_idx is not None and scene.semantic_querier is not None and scene.feat is not None:
-        querier = scene.semantic_querier
-        dominant = querier.get_dominant_labels()
-        num_classes = querier.num_classes
-        n = scene.num_gaussians
-
-        enc = torch.zeros((n, 3), dtype=torch.float32, device=scene.device)
-        if num_classes > 1:
-            enc[:, 0] = (
-                torch.from_numpy(dominant.astype(np.float32))
-                .to(scene.device)
-                / (num_classes - 1)
-            )
-
+    if enc is not None and num_classes > 1:
         orig = scene.colors
         try:
             scene.colors = enc
@@ -182,6 +174,8 @@ def _fine_boundary(
     h_hi: float,
     step: float,
     find_bottom: bool,
+    enc: Optional[torch.Tensor] = None,
+    num_classes: int = 0,
 ) -> float:
     """Linear fine scan to pin the exact opening boundary height."""
     heights = np.arange(h_lo, h_hi + step * 0.5, step)
@@ -190,6 +184,7 @@ def _fine_boundary(
         depth, label = _probe_height(
             scene, target_xy, float(h), inward_normal, up_axis,
             class_idx, camera_dist, img_size, fov,
+            enc=enc, num_classes=num_classes,
         )
         opening = _is_opening(depth, label, class_idx, ref_depth, depth_threshold)
         if find_bottom:
@@ -244,6 +239,22 @@ def detect_element_heights(
     inward_n = _inward_normal(wall, scan_center)
     target_xy = np.array([candidate.world_x, candidate.world_y], dtype=np.float64)
 
+    # --- Build semantic encoding ONCE (was rebuilt ~30-50× per element) ---
+    enc: Optional[torch.Tensor] = None
+    num_classes = 0
+    if class_idx is not None and scene.semantic_querier is not None and scene.feat is not None:
+        querier = scene.semantic_querier
+        dominant = querier.get_dominant_labels()
+        num_classes = querier.num_classes
+        n = scene.num_gaussians
+        enc = torch.zeros((n, 3), dtype=torch.float32, device=scene.device)
+        if num_classes > 1:
+            enc[:, 0] = (
+                torch.from_numpy(dominant.astype(np.float32))
+                .to(scene.device)
+                / (num_classes - 1)
+            )
+
     # --- Phase 1: coarse scan -------------------------------------------
     h_lo = floor_z + 0.05
     h_hi = ceiling_z - 0.05
@@ -256,6 +267,7 @@ def detect_element_heights(
         depth, label = _probe_height(
             scene, target_xy, float(z), inward_n, up_axis,
             class_idx, camera_dist, img_size, fov,
+            enc=enc, num_classes=num_classes,
         )
         probes.append((float(z), depth, label))
         sem_match = label is not None and label == class_idx
@@ -294,6 +306,7 @@ def detect_element_heights(
         h_hi=min(h_hi, coarse_sill + coarse_step),
         step=fine_step,
         find_bottom=True,
+        enc=enc, num_classes=num_classes,
     )
     fine_header = _fine_boundary(
         scene, target_xy, inward_n, up_axis, class_idx,
@@ -302,6 +315,7 @@ def detect_element_heights(
         h_hi=min(h_hi, coarse_header + coarse_step),
         step=fine_step,
         find_bottom=False,
+        enc=enc, num_classes=num_classes,
     )
 
     if fine_header <= fine_sill:

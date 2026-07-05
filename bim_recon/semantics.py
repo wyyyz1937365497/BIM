@@ -39,7 +39,7 @@ class SemanticQuerier:
             raise TypeError(
                 f"feat.pt must contain a torch.Tensor, got {type(raw).__name__}"
             )
-        self.feat: torch.Tensor = raw.float().to(device)  # (N, 768)
+        self.feat: Optional[torch.Tensor] = raw.float().to(device)  # (N, 768)
 
         text_emb = torch.load(text_emb_path, map_location="cpu", weights_only=False)
         if not isinstance(text_emb, torch.Tensor):
@@ -63,12 +63,21 @@ class SemanticQuerier:
         )
 
         # Pre-compute probability matrix (N, C) — done once, cheap relative to rendering.
-        self.logits: torch.Tensor = self.feat @ self.text_emb.T  # (N, C)
-        self.probs: torch.Tensor = torch.sigmoid(self.logits)  # (N, C)
+        logits: torch.Tensor = self.feat @ self.text_emb.T  # (N, C)
+        self.probs: torch.Tensor = torch.sigmoid(logits)  # (N, C)
         # Dominant (argmax) label per Gaussian — the most reliable classification
         # because logits cluster tightly (cosine sims ~0.1 with small std), making
         # absolute thresholds unreliable but argmax discriminative.
         self._dominant: torch.Tensor = self.probs.argmax(dim=1)  # (N,)
+
+        # Free large intermediates — feat (N,768) and logits (N,C) are never read
+        # again after this point. Keeping them wastes ~4 GB on 1.3M Gaussians.
+        del self.feat, logits
+        self.feat = None  # keep attribute for GSScene._has_semantics gate check
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         self._device = torch.device(device)
 

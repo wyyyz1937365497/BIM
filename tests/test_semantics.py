@@ -98,7 +98,10 @@ class TestSemanticQuerierInit:
             synthetic_scene["class_names_path"],
             device="cpu",
         )
-        assert q.feat.dtype == torch.float32
+        # feat is freed after init to save GPU memory; verify conversion worked
+        # by checking that probs were computed correctly from float16→float32 feat
+        assert q.feat is None  # freed after init
+        assert q.probs.dtype == torch.float32
         assert q.num_gaussians == 300
 
     def test_dimension_mismatch(self, synthetic_scene, tmp_path):
