@@ -63,6 +63,7 @@ class _MockScene:
         # Semantic stubs — height_detector checks these are non-None.
         self.semantic_querier = True
         self.feat = True
+        self._has_feat = True
         self.colors = np.zeros((100, 3), dtype=np.float32)
 
     # ---- GSScene API used by height_detector --------------------------

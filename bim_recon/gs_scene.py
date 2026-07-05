@@ -172,7 +172,8 @@ class GSScene:
     colors: torch.Tensor      # (N, 3) float32 linear RGB in [0, 1]
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
     # Optional semantic features from SceneSplat
-    feat: Optional[torch.Tensor] = None           # (N, 768) float32
+    feat: Optional[torch.Tensor] = None           # freed after init; kept for type compat
+    _has_feat: bool = field(default=False, repr=False)
     semantic_querier: Optional["SemanticQuerier"] = None
     _bounds_cache: Optional[tuple] = field(default=None, repr=False)
 
@@ -340,7 +341,12 @@ class GSScene:
         text_emb_path: Optional[str | Path] = None,
         class_names_path: Optional[str | Path] = None,
     ) -> None:
-        """Load SceneSplat feat.pt and optionally construct a SemanticQuerier."""
+        """Load SceneSplat feat.pt and optionally construct a SemanticQuerier.
+
+        The raw feat tensor is validated then freed — SemanticQuerier loads its
+        own copy from disk, so keeping it here wastes ~4GB on 1.3M Gaussians.
+        ``self._has_feat`` flag replaces the tensor for downstream gate checks.
+        """
         from bim_recon.semantics import SemanticQuerier
 
         raw = torch.load(feat_path, map_location="cpu", weights_only=False)
@@ -351,7 +357,9 @@ class GSScene:
                 f"feat.pt has {raw.shape[0]} rows but the scene has "
                 f"{self.num_gaussians} Gaussians"
             )
-        self.feat = raw.float().to(self.device)
+        # Validate shape then free — SemanticQuerier will reload from disk
+        del raw
+        self._has_feat = True
 
         if text_emb_path and class_names_path:
             self.semantic_querier = SemanticQuerier(

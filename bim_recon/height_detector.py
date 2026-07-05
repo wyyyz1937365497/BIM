@@ -242,7 +242,7 @@ def detect_element_heights(
     # --- Build semantic encoding ONCE (was rebuilt ~30-50× per element) ---
     enc: Optional[torch.Tensor] = None
     num_classes = 0
-    if class_idx is not None and scene.semantic_querier is not None and scene.feat is not None:
+    if class_idx is not None and scene.semantic_querier is not None and scene._has_feat:
         querier = scene.semantic_querier
         dominant = querier.get_dominant_labels()
         num_classes = querier.num_classes

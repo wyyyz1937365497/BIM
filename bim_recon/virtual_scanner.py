@@ -77,7 +77,7 @@ class VirtualScanner:
         self.up_axis = up_axis
         self.h_axes = [i for i in range(3) if i != up_axis]
         self._has_semantics = (
-            scene.semantic_querier is not None and scene.feat is not None
+            scene.semantic_querier is not None and scene._has_feat
         )
         # Cache semantic color encoding (rebuilt per-scan was wasteful)
         self._semantic_colors: Optional[torch.Tensor] = None

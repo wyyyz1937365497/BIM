@@ -679,9 +679,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             cameras = _load_transforms_json(cam_path)
             print(f"Loaded {len(cameras)} training cameras", file=sys.stderr)
 
-    if has_semantics and scene.semantic_querier is not None and scene.feat is not None:
+    if has_semantics and scene.semantic_querier is not None and scene._has_feat:
         print(f"Semantic features enabled: {scene.semantic_querier.num_classes} classes, "
-              f"{scene.feat.shape[1]}-dim features", file=sys.stderr)
+              f"768-dim features", file=sys.stderr)
 
     state = ServerState(
         scene=scene,
