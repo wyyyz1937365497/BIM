@@ -241,7 +241,7 @@ def extract_wall_lines(
         return [], wall_pts
 
     # --- Step 2: DBSCAN noise removal ---
-    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(wall_pts)
+    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, algorithm="kd_tree").fit(wall_pts)
     labels = clustering.labels_
     unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
     if len(unique_labels) == 0:

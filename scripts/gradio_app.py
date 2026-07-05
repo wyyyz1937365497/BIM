@@ -407,11 +407,6 @@ def _get_scene(scene_name: str):
     if scene_name in _SCENE_CACHE:
         return _SCENE_CACHE[scene_name]
     # Free previous scene's GPU memory before loading a new one
-    for old_name, old_scene in list(_SCENE_CACHE.items()):
-        try:
-            del old_scene
-        except Exception:
-            pass
     _SCENE_CACHE.clear()
     try:
         import torch

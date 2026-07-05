@@ -443,12 +443,18 @@ class GSScene:
         )
         # render_colors: (1, H, W, 4) -> RGB(3) + expected_depth(1)
         # render_alphas: (1, H, W, 1)
-        colors = render_colors[0, :, :, :3].clamp(0.0, 1.0).cpu().numpy()
-        depth = render_colors[0, :, :, 3].cpu().numpy()
-        alpha = render_alphas[0, :, :, 0].cpu().numpy()
+        # Single GPU→CPU transfer: concat then slice on CPU (avoids 3 sync points)
+        rgba = render_colors[0].cpu().numpy()  # (H, W, 4)
+        alpha_np = render_alphas[0, :, :, 0].cpu().numpy()
+        colors = np.clip(rgba[:, :, :3], 0.0, 1.0)
+        depth = rgba[:, :, 3].copy()
         # Zero-out depth where alpha is effectively zero (background, in-place).
-        depth[alpha <= 1e-3] = 0.0
-        return RenderResult(colors=colors.astype(np.float32), depth=depth.astype(np.float32), alpha=alpha.astype(np.float32))
+        depth[alpha_np <= 1e-3] = 0.0
+        return RenderResult(
+            colors=colors.astype(np.float32),
+            depth=depth.astype(np.float32),
+            alpha=alpha_np.astype(np.float32),
+        )
 
     def render_batch(
         self,

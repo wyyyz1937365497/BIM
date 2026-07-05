@@ -210,7 +210,7 @@ class VirtualScanner:
             angle = np.degrees(np.arctan2(dy, dx)) % 360.0
 
             # Select valid points
-            idx = valid & (dist > 0)
+            idx = valid
             all_angles.extend(angle[idx].tolist())
             all_distances.extend(dist[idx].tolist())
             all_points.extend(zip(px[idx].tolist(), py[idx].tolist()))
