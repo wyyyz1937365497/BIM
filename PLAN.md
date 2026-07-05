@@ -976,4 +976,158 @@ class FloorPlanProvider:
 
 ---
 
+## 13. 项目完成度总览（2026-07-05 更新）
+
+### 阶段完成状态
+
+| 阶段 | 计划内容 | 状态 | 完成度 |
+|---|---|---|---|
+| **P0** | 基础设施（FloorPlan 契约、Revit MCP 26 工具、IFC→Revit 验证） | ✅ 已完成 | 100% |
+| **P1** | 3DGS 重建 + 语义高斯 + 墙体提取（SceneSplat + 虚拟扫描 + 墙线提取） | ✅ 已完成 | 100% |
+| **P2** | 元素检测（门/窗 VLM 验证 + Falcon 分割 + Revit 建模） | ✅ 已完成 | 100% |
+| **P2.5** | Gradio Web UI（单页界面 + Mask 编辑 + 相机捕获 + 视角重分割） | ✅ 已完成 | 100% |
+| **P2.6** | AI Agent（smolagents + Revit MCP + 管线上下文注入） | ✅ 已完成 | 100% |
+| **P3** | LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真） | ❌ 未开始 | 0% |
+| **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 20% |
+
+**总体完成度：约 85%**（P0-P2.6 全部完成，P3 未开始，P4 部分完成）
+
+### 各阶段交付物清单
+
+#### P0 ✅ 基础设施
+- FloorPlan 契约 + ManualProvider（14/14 测试）
+- Revit MCP 服务器 26 工具（C# + TypeScript + WebSocket）
+- `floorplan.py` / `revit_code.py` / `diff_report.py`
+
+#### P1 ✅ 3DGS + 语义 + 墙体
+- SceneSplat Windows 原生推理（5 处兼容性修复，commit `8e25991`）
+- `GSScene`（PLY/npy 加载 + gsplat 渲染 + 语义查询）
+- `SemanticQuerier`（feat.pt + SigLIP2，dominant/threshold/top_percent 三模式）
+- MCP Server 9 工具（render/depth/cluster/semantics/fit_walls/fit_walls_guided）
+- 虚拟激光扫描器 + 栅格化墙线提取（12 高度 × 8 视角 = 48001 扫描点）
+- WallFitter（迭代 RANSAC + 遮挡补全 + 重力对齐）+ FloorPlanGuidedFitter（走廊+直方图峰值）
+
+#### P2 ✅ 元素检测 + Revit 建模
+- 候选提取器（feat.pt 高召回 → 墙线投影 + 间隙聚类 + 极坐标）
+- VLM 验证器（Ollama gemma4:12b，极坐标→渲染→确认/排除）
+- Falcon-Perception 分割（HTTP 桥接，垂直立面 → 开放词表分割 → 像素→米制线性映射）
+- 高度检测器（两阶段深度探测 + 双信号，作为 Falcon fallback）
+- **Falcon 权威判定**：Falcon 在线但未检测到 → 直接拒绝构件（消除 depth-probe 假阳性）
+- 元素类型注册表（door/window/column/furniture）
+- room0 完整 Revit 建模验证（4 墙 + 2 门 + 3 窗，自定义尺寸，原生可编辑）
+- 统一管线 `run_pipeline.py`（唯一入口，时间戳输出目录）
+- 150 个单元测试（149 通过，1 个需 MSVC JIT）
+
+#### P2.5 ✅ Gradio Web UI
+- **单页布局**（5 个区块 + 底部 3D 查看器，无 Tab 切换）
+  - ① 场景与数据准备：PLY 上传 → 验证 → SceneSplat 预处理 → 场景下拉
+  - ② 运行管线：选项（门/窗/Falcon/跳过VLM）→ 实时流式控制台 → 结果下拉
+  - ③ 检测结果：墙线俯视图 + VLM 验证图库 + Seg 叠加图库 + JSON 报告
+  - ④ 微调：Mask 绘制（gr.ImageMask）+ 视角重分割
+  - ⑤ AI Agent：Revit MCP 聊天
+  - ⑥ 3D 查看器：nerfview iframe
+- **Mask 绘制**：`gr.ImageMask`（红色画笔）→ alpha 通道提取 → 紧致 bbox → `mask_to_bbox()` → 墙局部坐标
+- **相机捕获**：nerfview HTTP 端点（端口 8082）→ `viewer_camera_patch.py` monkey-patch viser.ViserServer → `GET /camera-state` 返回 position/look_at/fov/c2w
+- **视角重分割**：捕获视角 → GSScene 渲染 → Falcon 分割 → 射线-平面交点（mask_bbox 8 点采样）→ 墙坐标 → 更新结果 + 图库 + Mask 编辑器
+- **全中文 UI**
+
+#### P2.6 ✅ AI Agent
+- **smolagents**（HuggingFace）`ToolCallingAgent` + `ToolCollection.from_mcp`
+- **config.json 统一配置**：VLM + LLM API 地址/密钥/模型名（OpenAI 兼容接口）
+- **Gradio API 配置面板**：API Base / Key / Model 输入 → 测试连接 → 保存到 config.json
+- **管线上下文注入**：墙/门/窗检测结果（坐标、尺寸）自动写入 Agent system prompt
+- **26 个 Revit MCP 工具**自动加载（create_line_based_element / create_point_based_element 等）
+- **轻量级 Revit 连接检测**：TCP 端口 8080 探测（3s 超时，不调用 Revit API）
+- **MCP 连接超时优化**：5s → 30s
+
+---
+
+## 14. 失败探索记录（续）
+
+### 12.14 [2026-07-05] Gradio Web UI + Falcon 权威判定 + Mask 绘制 + 相机捕获 + AI Agent
+
+#### Falcon 权威判定（消除假阳性）
+
+**问题**：当 Falcon 在线但未检测到某构件时，pipeline 回退到 depth-probe，产生假阳性（door#0、window#0 实际不存在，但 depth-probe 从深度不连续处"发现"了构件）。
+
+**修复**：
+- Falcon 在线 + 返回空 → **直接拒绝**（`falcon_rejected`），`confirmed=false`，`reject_reason="falcon_not_detected"`
+- Falcon 离线（服务器不可达）→ 仍用 depth-probe fallback
+- 日志输出：`[door] #0: Falcon 未检测到，拒绝该构件`
+
+**代码**：`run_pipeline.py` `detect_elements()` — 新增 `falcon_rejected` 集合。
+
+#### Mask 绘制替代滑块（gr.ImageMask）
+
+**背景**：原 Tab 3 微调用 4 个滑块（cx/cy/w/h）调整 bbox，不够直观。
+
+**方案**：`gr.ImageMask`（Gradio 6.x 原生组件），用户直接在立面渲染图上用红色画笔涂出门窗区域。
+
+**数据流**：`layers[0][:,:,3] > 10`（alpha 通道）→ 二值化 → `np.where` 紧致 bbox → 归一化 → `mask_to_bbox()` → 墙局部坐标。
+
+**新增**：`bim_recon/pipeline_api.py` `mask_to_bbox()` 函数。
+
+#### nerfview 相机捕获（端口 8082 HTTP 端点）
+
+**背景**：用户在 nerfview 3D 查看器中漫游到覆盖构件的视角后，需要捕获相机参数用于渲染。
+
+**方案**：`scripts/viewer_camera_patch.py` 在 `viser.ViserServer.__init__` 上打 monkey-patch，自动在端口 8082 启动 HTTP 微服务。
+
+**API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}`
+
+**修复**：`import run_viewer` 名称冲突 — `scripts/run_viewer.py`（我们的 wrapper）与 site-packages 的 `run_viewer`（Mini Viewer）重名。修复：在 import 前从 `sys.path` 移除 `scripts/` 目录。
+
+#### 视角重分割（射线-平面交点）
+
+**背景**：固定垂直视角可能不完全覆盖构件。用户希望在 nerfview 中找到最佳视角后，以此视角为基准重新执行 Falcon 分割。
+
+**方案**：
+1. 捕获相机参数（eye, target, fov）
+2. GSScene 从该视角渲染 800×600 RGB
+3. Falcon 分割 → mask_bbox（归一化坐标）
+4. **射线-平面交点**：从 mask_bbox 的 8 个采样点发射射线 → 与墙面平面相交 → 墙局部坐标 (along, height)
+5. 保存渲染图 + overlay 到磁盘，更新 ElementResult + Seg 图库 + Mask 编辑器
+
+**数学**：
+```python
+# OpenCV 约定：+Z forward, +X right, +Y down
+forward = normalize(target - eye)
+right = normalize(cross(forward, up))
+down = cross(forward, right)
+ray = forward + dx * right + dy * down  # dx, dy 由像素坐标 + focal 计算
+# 与墙面平面相交
+t = dot(wall_start - eye, wall_normal) / dot(ray, wall_normal)
+point = eye + t * ray
+along = dot(point - wall_start, wall_dir)
+height = point[up_axis]
+```
+
+**wall_start 2D→3D 扩展**：`elevation_params` 中的 `wall_start` 是 2D `[x, y]`（地面平面），需插入 `floor_z` 到 up_axis 位置扩展为 3D。
+
+#### AI Agent（smolagents + Revit MCP）
+
+**背景**：用户希望通过自然语言对话让 Agent 自动在 Revit 中创建检测到的构件。
+
+**方案**：`smolagents` `ToolCallingAgent`（非 `CodeAgent`）+ `ToolCollection.from_mcp`（stdio）。
+
+**关键技术决策**：
+- **ToolCallingAgent 而非 CodeAgent**：CodeAgent 在沙箱解释器中执行代码，MCP 工具的 asyncio 事件循环在子线程中会关闭（"Event loop is closed"）。ToolCallingAgent 直接在主线程调用工具。
+- **MCP context manager 存活**：`ToolCollection.from_mcp` 返回的 context manager 必须存储在**模块级全局变量**中，否则 Python GC 回收后关闭 MCP 子进程的 event loop。
+- **OpenAIServerModel**（标准 OpenAI API）：兼容 Ollama（`/v1`）、智谱 ZAI（`/api/paas/v4`）、OpenAI、DeepSeek 等。
+- **管线上下文注入**：检测结果（墙坐标、门窗尺寸）写入 `instructions`（smolagents 参数名，非 `system_prompt`）。
+- **Revit 连接检测**：TCP 端口 8080 探测（3s），不调用 Revit API。
+
+**config.json 统一配置**：
+```json
+{
+  "vlm": { "provider": "ollama", "api_base": "...", "model": "gemma4:12b" },
+  "llm": { "provider": "openai", "api_base": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-5.1" },
+  "revit_mcp": { "command": "node", "args": ["path/to/index.js"] }
+}
+```
+
+**已验证**：`scripts/test_agent.py` — say_hello + get_current_view_info 两个工具调用成功（26 工具加载，glm-5.1 模型）。
+
+---
+
 *本计划由需求讨论逐步收敛而成。实施过程中如遇架构变更，请同步更新本文件。*

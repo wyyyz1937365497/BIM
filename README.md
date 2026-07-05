@@ -78,6 +78,44 @@
 - **构建自动化**（`scripts/build_deploy_revit.ps1`）：一键构建 C# + TypeScript + 部署（5 步：Kill Revit → Build C# → Build TS → Deploy → Verify）。Debug 构建自动部署到 Addins。
 - **本地开发**：opencode MCP 配置指向本地 `server/build/index.js`（非 npm 发布版），修改 TS server 后重启 opencode 即时生效。
 
+### P3.7：Falcon 权威判定 + Gradio Web UI + AI Agent
+
+#### Falcon 权威判定（消除假阳性）
+- **问题**：Falcon 在线但未检测到构件时，回退到 depth-probe 产生假阳性（实际不存在的构件被"发现"）。
+- **修复**：Falcon 在线 + 返回空 → **直接拒绝**（`falcon_rejected`），不再回退 depth-probe。Falcon 离线时仍保留 depth-probe fallback。
+
+#### Gradio 单页 Web UI（`scripts/gradio_app.py`）
+- **单页布局**：5 个区块 + 底部 3D 查看器，无 Tab 切换：
+  - ① 场景与数据准备：PLY 上传 → 验证 → SceneSplat 预处理
+  - ② 运行管线：实时流式控制台输出 → 结果下拉列表
+  - ③ 检测结果：墙线俯视图 + VLM 验证图库 + Seg 叠加图库 + JSON 报告
+  - ④ 微调：Mask 绘制（`gr.ImageMask`）+ 视角重分割
+  - ⑤ AI Agent：Revit MCP 聊天界面
+  - ⑥ 3D 查看器：nerfview iframe（端口 8081）
+- **Mask 绘制**（`gr.ImageMask`）：用户直接在立面渲染图上用红色画笔涂出门窗区域 → alpha 通道提取紧致 bbox → `mask_to_bbox()` → 墙局部坐标。
+- **相机捕获**（`scripts/viewer_camera_patch.py`）：monkey-patch `viser.ViserServer` → 端口 8082 暴露 `GET /camera-state`（position/look_at/fov/c2w）。用户在 nerfview 中漫游到合适视角后一键捕获。
+- **视角重分割**：捕获视角 → GSScene 渲染 → Falcon 分割 → 射线-平面交点（mask_bbox 8 点采样）→ 墙坐标。渲染图 + overlay 自动保存并更新 Seg 图库 + Mask 编辑器。
+- **结果下拉列表**：扫描 `output/<scene>/` 中所有时间戳结果目录，用户可选择加载历史结果。
+
+#### 配置系统（`bim_recon/config.py` + `config.json`）
+- **统一配置**：VLM + LLM + Revit MCP 设置集中在一个 JSON 文件中。
+- **OpenAI 兼容接口**：支持 Ollama（`/v1`）、智谱 ZAI（`/api/paas/v4`）、OpenAI、DeepSeek 等。
+- **Gradio API 面板**：内嵌在 ⑤ AI Agent 区域，可测试连接 + 保存配置。
+- `config.json` 加入 `.gitignore`（防止密钥泄露），`config.example.json` 作为模板。
+
+#### AI Agent（smolagents + Revit MCP）
+- **框架**：[smolagents](https://github.com/huggingface/smolagents)（HuggingFace）`ToolCallingAgent`。
+- **26 个 Revit MCP 工具**自动加载（`ToolCollection.from_mcp`，stdio 传输）。
+- **管线上下文注入**：墙/门/窗检测结果（坐标、尺寸）自动写入 Agent `instructions`。
+- **轻量级 Revit 检测**：TCP 端口 8080 探测（3s 超时，不调用 Revit API）。
+- **测试脚本**（`scripts/test_agent.py`）：独立验证 MCP 连通性 + 工具调用。
+- **关键修复**：`ToolCollection.from_mcp` 的 context manager 必须存模块级全局变量（否则 GC 回收关闭 event loop）。
+
+#### nerfview 相机捕获（`scripts/viewer_camera_patch.py`）
+- **monkey-patch** `viser.ViserServer.__init__` → 启动时自动在端口 8082 开 HTTP 微服务。
+- **API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}` + CORS。
+- **修复**：`import run_viewer` 名称冲突 — 在 import 前从 `sys.path` 移除 `scripts/` 目录。
+
 ### SceneSplat Windows 原生推理（commit `8e25991`）
 
 SceneSplat（ICCV'25 Oral）官方仓库仅验证 Linux，我们在 Windows 11 + Python 3.10 + PyTorch 2.5.1+cu124 上完成**无 WSL 原生推理**，三条核心命令全部通过：
@@ -204,6 +242,43 @@ cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0 --sk
 ```powershell
 python scripts/run_pipeline.py --name room0 --elements door window column
 ```
+
+### 2. Gradio Web UI（推荐交互方式）
+
+```powershell
+scripts\launch_gradio.bat
+```
+
+打开浏览器访问 `http://127.0.0.1:7860`。单页界面包含：
+
+1. **场景与数据准备** — 上传 PLY → SceneSplat 预处理 → 启动 3DGS 查看器
+2. **运行管线** — 实时流式控制台 → 结果下拉列表加载历史结果
+3. **检测结果** — 墙线俯视图 + VLM 验证图库 + Seg 叠加图库
+4. **微调** — 两种方式：
+   - **手动 Mask**：`gr.ImageMask` 画笔涂门窗区域 → 重算尺寸
+   - **视角重分割**：在 3D 查看器中漫游 → 捕获视角 → Falcon 重新分割 → 射线-平面交点回墙坐标
+5. **AI Agent** — 自然语言对话控制 Revit（需要 Revit + MCP 插件运行）
+6. **3D 查看器** — nerfview（端口 8081）+ 相机捕获（端口 8082）
+
+**配置文件**（`config.json`）：
+```json
+{
+  "vlm": { "provider": "ollama", "api_base": "http://127.0.0.1:11434", "model": "gemma4:12b" },
+  "llm": { "provider": "openai", "api_base": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-5.1", "api_key": "your-key" },
+  "revit_mcp": { "command": "node", "args": ["mcp-servers-for-revit/server/build/index.js"] }
+}
+```
+
+LLM 配置也可在 Gradio 界面的「⚙️ LLM API 配置」面板中修改并测试连接。
+
+### 3. AI Agent 测试
+
+```powershell
+# 确保 Revit 已启动 + MCP 插件已加载
+python scripts/test_agent.py
+```
+
+测试 say_hello + get_current_view_info 两个工具调用，验证 MCP 连通性。
 
 ## 运行测试
 
