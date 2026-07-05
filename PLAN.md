@@ -987,10 +987,12 @@ class FloorPlanProvider:
 | **P2** | 元素检测（门/窗 VLM 验证 + Falcon 分割 + Revit 建模） | ✅ 已完成 | 100% |
 | **P2.5** | Gradio Web UI（单页界面 + Mask 编辑 + 相机捕获 + 视角重分割） | ✅ 已完成 | 100% |
 | **P2.6** | AI Agent（smolagents + Revit MCP + 管线上下文注入） | ✅ 已完成 | 100% |
-| **P3** | LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真） | ❌ 未开始 | 0% |
+| **~~P3~~** | ~~LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真）~~ | ✅ **已被取代** | 100% |
 | **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 20% |
 
-**总体完成度：约 85%**（P0-P2.6 全部完成，P3 未开始，P4 部分完成）
+**总体完成度：约 90%**（P0-P2.6 + P3 全部完成，P4 部分完成）
+
+> **P3 已被 P1 取代**：原计划的物理 LiDAR（ROS2 `/scan` → split-and-merge 墙线）已被 §12.8 的**虚拟激光扫描器**（`bim_recon/virtual_scanner.py`）完全取代——从 3DGS 深度渲染模拟 2D 激光扫描，多高度 × 多视角拼接 360° 极坐标扫描，每个扫描点携带 feat.pt 语义标签。无需任何物理硬件，且语义信息更丰富（真实 LiDAR 只有距离，无语义）。原 P3 的 gsplat 旋转 LiDAR 光栅化也已通过 gsplat 深度渲染实现。
 
 ### 各阶段交付物清单
 
