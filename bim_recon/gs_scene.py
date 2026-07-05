@@ -174,6 +174,7 @@ class GSScene:
     # Optional semantic features from SceneSplat
     feat: Optional[torch.Tensor] = None           # (N, 768) float32
     semantic_querier: Optional["SemanticQuerier"] = None
+    _bounds_cache: Optional[tuple] = field(default=None, repr=False)
 
     # ---- construction -------------------------------------------------------
 
@@ -292,26 +293,27 @@ class GSScene:
 
     @classmethod
     def _from_parsed(cls, data: Dict[str, np.ndarray], device: torch.device) -> "GSScene":
-        """Convert parsed PLY fields to gsplat-ready tensors."""
-        means = data["positions"].astype(np.float32)
-        # opacity: logit -> probability
-        opacity_logit = data["opacity"].reshape(-1).astype(np.float32)
-        opacities = 1.0 / (1.0 + np.exp(-opacity_logit))
-        # scales: log space -> linear
-        scales = np.exp(data["scales"].astype(np.float32))
-        # quaternions: (w, x, y, z) — normalize defensively
-        quats = data["rotations"].astype(np.float32)
-        norms = np.linalg.norm(quats, axis=1, keepdims=True)
-        quats = quats / np.clip(norms, 1e-12, None)
-        # SH DC -> linear RGB color
-        sh_dc = data["sh_dc"].astype(np.float32).reshape(-1, 3)
-        colors = np.clip(SH_C0 * sh_dc + 0.5, 0.0, 1.0)
+        """Convert parsed PLY fields to gsplat-ready tensors.
+
+        All activation transforms (sigmoid, exp, quat normalization, SH→RGB)
+        run on GPU to avoid CPU memory peaks on large scenes.
+        """
+        # Upload raw data to GPU first, then apply activations on-device
+        means = torch.from_numpy(np.ascontiguousarray(data["positions"], dtype=np.float32)).to(device)
+        opacity_logit = torch.from_numpy(data["opacity"].reshape(-1).astype(np.float32)).to(device)
+        opacities = torch.sigmoid(opacity_logit)
+        scales = torch.exp(torch.from_numpy(data["scales"].astype(np.float32)).to(device))
+        quats_raw = torch.from_numpy(data["rotations"].astype(np.float32)).to(device)
+        norms = torch.norm(quats_raw, dim=1, keepdim=True)
+        quats = quats_raw / norms.clamp(min=1e-12)
+        sh_dc = torch.from_numpy(data["sh_dc"].astype(np.float32).reshape(-1, 3)).to(device)
+        colors = (SH_C0 * sh_dc + 0.5).clamp(0.0, 1.0)
         return cls(
-            means=torch.from_numpy(means).to(device),
-            quats=torch.from_numpy(quats).to(device),
-            scales=torch.from_numpy(scales).to(device),
-            opacities=torch.from_numpy(opacities).to(device),
-            colors=torch.from_numpy(colors).to(device),
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
             device=device,
         )
 
@@ -322,10 +324,13 @@ class GSScene:
         return int(self.means.shape[0])
 
     def scene_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (min_xyz, max_xyz) of Gaussian means in world space."""
+        """Return (min_xyz, max_xyz) of Gaussian means in world space. Cached."""
+        if self._bounds_cache is not None:
+            return self._bounds_cache
         mn = self.means.min(dim=0).values.cpu().numpy()
         mx = self.means.max(dim=0).values.cpu().numpy()
-        return mn, mx
+        self._bounds_cache = (mn, mx)
+        return self._bounds_cache
 
     # ---- semantic features -------------------------------------------------
 
@@ -441,9 +446,9 @@ class GSScene:
         colors = render_colors[0, :, :, :3].clamp(0.0, 1.0).cpu().numpy()
         depth = render_colors[0, :, :, 3].cpu().numpy()
         alpha = render_alphas[0, :, :, 0].cpu().numpy()
-        # Zero-out depth where alpha is effectively zero (background).
-        depth = np.where(alpha > 1e-3, depth, 0.0).astype(np.float32)
-        return RenderResult(colors=colors.astype(np.float32), depth=depth, alpha=alpha.astype(np.float32))
+        # Zero-out depth where alpha is effectively zero (background, in-place).
+        depth[alpha <= 1e-3] = 0.0
+        return RenderResult(colors=colors.astype(np.float32), depth=depth.astype(np.float32), alpha=alpha.astype(np.float32))
 
     def render_batch(
         self,

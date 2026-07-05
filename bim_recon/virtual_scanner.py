@@ -79,6 +79,19 @@ class VirtualScanner:
         self._has_semantics = (
             scene.semantic_querier is not None and scene.feat is not None
         )
+        # Cache semantic color encoding (rebuilt per-scan was wasteful)
+        self._semantic_colors: Optional[torch.Tensor] = None
+        self._num_classes = 0
+        if self._has_semantics:
+            querier = scene.semantic_querier
+            if querier is not None:
+                dominant = querier.get_dominant_labels()
+                self._num_classes = querier.num_classes
+                N = scene.num_gaussians
+                enc = torch.zeros((N, 3), dtype=torch.float32, device=scene.device)
+                if self._num_classes > 1:
+                    enc[:, 0] = torch.from_numpy(dominant.astype(np.float32)).to(scene.device) / (self._num_classes - 1)
+                self._semantic_colors = enc
 
     def scan(
         self,
@@ -111,20 +124,8 @@ class VirtualScanner:
         cx, cy = float(center_2d[0]), float(center_2d[1])
         h0, h1 = self.h_axes
 
-        # Prepare semantic color encoding if feat.pt is loaded.
-        semantic_colors: Optional[torch.Tensor] = None
-        num_classes = 0
-        if self._has_semantics:
-            querier = self.scene.semantic_querier
-            if querier is not None:
-                dominant = querier.get_dominant_labels()  # (N,) numpy int32
-                num_classes = querier.num_classes
-                N = self.scene.num_gaussians
-                # Encode class index in R channel: R = class_idx / (C-1).
-                enc = torch.zeros((N, 3), dtype=torch.float32, device=self.scene.device)
-                if num_classes > 1:
-                    enc[:, 0] = torch.from_numpy(dominant.astype(np.float32)).to(self.scene.device) / (num_classes - 1)
-                semantic_colors = enc
+        semantic_colors = self._semantic_colors
+        num_classes = self._num_classes
 
         all_angles: List[float] = []
         all_distances: List[float] = []
@@ -136,6 +137,9 @@ class VirtualScanner:
         cx_pix = width / 2.0
         render_h = width  # square image so middle row = camera height
         middle_v = render_h // 2
+
+        # Pre-compute pixel coordinates for vectorized unprojection
+        us = np.arange(width, dtype=np.float64)
 
         for i in range(num_views):
             azimuth_deg = i * (360.0 / num_views)
@@ -163,10 +167,8 @@ class VirtualScanner:
 
             # Pass 1: geometry render (depth + alpha).
             result = self.scene.render(pose, width=width, height=render_h, fov_degrees=fov)
-            depth = result.depth
-            alpha = result.alpha
-            depth_row = depth[middle_v].copy()
-            alpha_row = alpha[middle_v]
+            depth_row = result.depth[middle_v]
+            alpha_row = result.alpha[middle_v]
 
             # Pass 2: semantic render (class-index encoded colors).
             sem_row: Optional[np.ndarray] = None
@@ -177,43 +179,43 @@ class VirtualScanner:
                     sem_result = self.scene.render(pose, width=width, height=render_h, fov_degrees=fov)
                 finally:
                     self.scene.colors = orig_colors
-                # Decode class index from R channel: class = round(R * (C-1)).
-                sem_r = sem_result.colors[middle_v, :, 0]  # (W,)
+                sem_r = sem_result.colors[middle_v, :, 0]
                 sem_alpha = sem_result.alpha[middle_v]
                 sem_row = np.round(sem_r * (num_classes - 1)).astype(np.int32)
-                sem_row[sem_alpha < 0.1] = -1  # no hit
+                sem_row[sem_alpha < 0.1] = -1
 
-            # Unproject middle-row pixels to world XY.
+            # Vectorized unprojection of the entire middle row at once
             viewmat = pose.to_viewmat()
             R_w2c = viewmat[:3, :3].astype(np.float64)
             R_c2w = R_w2c.T
             eye_np = np.array(eye, dtype=np.float64)
 
-            for u in range(width):
-                if alpha_row[u] < 0.1:
-                    continue
-                d = float(depth_row[u])
-                if d < 0.05 or d > 50.0:
-                    continue
+            # Build all pixel rays in camera space (W, 3)
+            d = depth_row.astype(np.float64)
+            valid = (alpha_row >= 0.1) & (d >= 0.05) & (d <= 50.0)
 
-                x_cam = (u - cx_pix) / fx * d
-                y_cam = (middle_v - render_h / 2.0) / fx * d  # 0 for middle row
-                z_cam = d
-                p_cam = np.array([x_cam, y_cam, z_cam], dtype=np.float64)
-                p_world = R_c2w @ p_cam + eye_np
+            x_cam = (us - cx_pix) / fx * d
+            y_cam = (middle_v - render_h / 2.0) / fx * d  # 0 for middle row
+            z_cam = d
+            P_cam = np.stack([x_cam, y_cam, z_cam], axis=1)  # (W, 3)
 
-                px = float(p_world[h0])
-                py = float(p_world[h1])
-                dx = px - cx
-                dy = py - cy
-                dist = math.sqrt(dx * dx + dy * dy)
-                angle = math.degrees(math.atan2(dy, dx)) % 360.0
+            # World coordinates: (W, 3) @ (3, 3) + (3,) → (W, 3)
+            P_world = P_cam @ R_c2w.T + eye_np
 
-                all_angles.append(angle)
-                all_distances.append(dist)
-                all_points.append((px, py))
-                if all_labels is not None and sem_row is not None:
-                    all_labels.append(int(sem_row[u]))
+            px = P_world[:, h0]
+            py = P_world[:, h1]
+            dx = px - cx
+            dy = py - cy
+            dist = np.sqrt(dx * dx + dy * dy)
+            angle = np.degrees(np.arctan2(dy, dx)) % 360.0
+
+            # Select valid points
+            idx = valid & (dist > 0)
+            all_angles.extend(angle[idx].tolist())
+            all_distances.extend(dist[idx].tolist())
+            all_points.extend(zip(px[idx].tolist(), py[idx].tolist()))
+            if all_labels is not None and sem_row is not None:
+                all_labels.extend(sem_row[idx].tolist())
 
         return ScanResult(
             angles_deg=np.array(all_angles, dtype=np.float64),
@@ -259,10 +261,10 @@ def save_scan_plot(
     # Determine colors: semantic palette or uniform blue.
     if scan.semantic_labels is not None:
         labels = scan.semantic_labels[mask]
-        colors = np.array([
-            SEMANTIC_PALETTE[l] if 0 <= l < len(SEMANTIC_PALETTE) else (0.5, 0.5, 0.5)
-            for l in labels
-        ])
+        palette = np.array(SEMANTIC_PALETTE, dtype=np.float64)
+        safe_idx = np.clip(labels, 0, len(palette) - 1)
+        in_range = (labels >= 0) & (labels < len(palette))
+        colors = np.where(in_range[:, None], palette[safe_idx], 0.5)
     else:
         colors = np.tile([0.3, 0.5, 0.9], (len(dists), 1))
 
@@ -280,8 +282,7 @@ def save_scan_plot(
     margin = max_distance
     ax_xy.set_xlim(scan.center_2d[0] - margin, scan.center_2d[0] + margin)
     ax_xy.set_ylim(scan.center_2d[1] - margin, scan.center_2d[1] + margin)
-    h0 = [i for i in range(3) if i != scan.up_axis][0]
-    h1 = [i for i in range(3) if i != scan.up_axis][1]
+    h0, h1 = [i for i in range(3) if i != scan.up_axis][:2]
     ax_xy.set_xlabel(f"World {'XYZ'[h0]} (m)")
     ax_xy.set_ylabel(f"World {'XYZ'[h1]} (m)")
     ax_xy.set_title(f"Top-Down (h={scan.height:.2f}m)")

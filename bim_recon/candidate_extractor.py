@@ -155,6 +155,8 @@ def extract_candidates(
     if project_to_walls:
         # Structural elements: project onto walls, cluster per-wall.
         wall_data: List[Dict[str, Any]] = []
+        wall_starts_list: List[np.ndarray] = []
+        wall_ends_list: List[np.ndarray] = []
         for w in walls:
             ws = np.array([w["x1"], w["y1"]])
             we = np.array([w["x2"], w["y2"]])
@@ -163,30 +165,48 @@ def extract_candidates(
                 "length": w["length"],
                 "ts": [], "hs": [], "world_xs": [], "world_ys": [],
             })
+            wall_starts_list.append(ws)
+            wall_ends_list.append(we)
 
-        for scan in scans:
-            if scan.semantic_labels is None:
-                continue
-            mask = scan.semantic_labels == class_idx
-            if mask.sum() == 0:
-                continue
-            rel_h = scan.height - floor_z
-            for pt in scan.points_2d[mask]:
-                best_wi = -1
-                best_dist = 1e9
-                best_t = 0.0
-                for wi, wd in enumerate(wall_data):
-                    t, dist = project_point_to_wall(pt, wd["start"], wd["end"])
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_wi = wi
-                        best_t = t
-                if best_wi >= 0 and best_dist < max_wall_dist:
-                    wd = wall_data[best_wi]
-                    wd["ts"].append(best_t)
-                    wd["hs"].append(rel_h)
-                    wd["world_xs"].append(float(pt[0]))
-                    wd["world_ys"].append(float(pt[1]))
+        # Pre-stack wall geometry for vectorized projection
+        W = len(wall_data)
+        if W > 0:
+            wall_starts = np.stack(wall_starts_list)  # (W, 2)
+            wall_ends = np.stack(wall_ends_list)      # (W, 2)
+            segs = wall_ends - wall_starts             # (W, 2)
+            seg_len_sq = np.sum(segs ** 2, axis=1)     # (W,)
+            seg_len_sq = np.clip(seg_len_sq, 1e-12, None)
+
+            for scan in scans:
+                if scan.semantic_labels is None:
+                    continue
+                mask = scan.semantic_labels == class_idx
+                if mask.sum() == 0:
+                    continue
+                rel_h = scan.height - floor_z
+                pts = scan.points_2d[mask]  # (P, 2)
+
+                # Vectorized projection of P points onto W walls
+                diffs = pts[:, None, :] - wall_starts[None, :, :]  # (P, W, 2)
+                t = np.einsum("pwd,wd->pw", diffs, segs) / seg_len_sq[None, :]  # (P, W)
+                t_clamped = np.clip(t, 0.0, 1.0)
+                closest = wall_starts[None, :, :] + t_clamped[:, :, None] * segs[None, :, :]
+                dist = np.linalg.norm(pts[:, None, :] - closest, axis=2)  # (P, W)
+
+                # Best wall per point
+                best_wi = np.argmin(dist, axis=1)
+                P = len(pts)
+                best_dist = dist[np.arange(P), best_wi]
+                best_t = t_clamped[np.arange(P), best_wi]
+
+                for pi in range(P):
+                    wi = int(best_wi[pi])
+                    if best_dist[pi] < max_wall_dist:
+                        wd = wall_data[wi]
+                        wd["ts"].append(float(best_t[pi]))
+                        wd["hs"].append(rel_h)
+                        wd["world_xs"].append(float(pts[pi, 0]))
+                        wd["world_ys"].append(float(pts[pi, 1]))
 
         candidates: List[Candidate] = []
         for wi, wd in enumerate(wall_data):
@@ -239,7 +259,7 @@ def extract_candidates(
             return []
         pts_arr = np.array(all_pts)
         hs_arr = np.array(all_hs)
-        clustering = DBSCAN(eps=0.5, min_samples=cluster_min_pts).fit(pts_arr)
+        clustering = DBSCAN(eps=0.5, min_samples=cluster_min_pts, algorithm="kd_tree").fit(pts_arr)
         candidates = []
         for label in set(clustering.labels_):
             if label == -1:

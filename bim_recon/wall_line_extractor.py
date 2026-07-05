@@ -108,25 +108,23 @@ def extract_wall_points(
         (points_2d, heights) — (N, 2) XY coords and (N,) scan heights.
     """
     all_pts: List[np.ndarray] = []
-    all_h: List[float] = []
-    exclude_set = set(exclude_classes) if exclude_classes is not None else None
+    all_h: List[np.ndarray] = []
+    exclude_list = list(exclude_classes) if exclude_classes is not None else None
     for scan in scans:
         if scan.semantic_labels is None:
             continue
         labels = scan.semantic_labels
-        if exclude_set is not None:
-            mask = np.ones(len(labels), dtype=bool)
-            for cls in exclude_set:
-                mask &= (labels != cls)
+        if exclude_list is not None:
+            mask = np.isin(labels, exclude_list, invert=True)
         else:
             mask = labels == wall_class_idx
         if mask.sum() == 0:
             continue
         all_pts.append(scan.points_2d[mask])
-        all_h.extend([scan.height] * int(mask.sum()))
+        all_h.append(np.full(int(mask.sum()), scan.height))
     if not all_pts:
         return np.empty((0, 2)), np.empty(0)
-    return np.concatenate(all_pts), np.array(all_h)
+    return np.concatenate(all_pts), np.concatenate(all_h)
 
 
 def _ransac_refine_wall(

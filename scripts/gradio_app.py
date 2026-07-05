@@ -403,9 +403,21 @@ def fetch_camera_state() -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 def _get_scene(scene_name: str):
-    """Lazy-load and cache a GSScene for rendering."""
+    """Lazy-load and cache a GSScene for rendering. Evicts old scene to free GPU memory."""
     if scene_name in _SCENE_CACHE:
         return _SCENE_CACHE[scene_name]
+    # Free previous scene's GPU memory before loading a new one
+    for old_name, old_scene in list(_SCENE_CACHE.items()):
+        try:
+            del old_scene
+        except Exception:
+            pass
+    _SCENE_CACHE.clear()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
     from bim_recon.gs_scene import GSScene
     data_dir = ROOT / "data" / scene_name
     ply_candidates = list(data_dir.glob("point_cloud_*.ply"))
