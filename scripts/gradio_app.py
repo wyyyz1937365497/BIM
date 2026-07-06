@@ -187,10 +187,20 @@ def _result_dir_from_label(scene_name: str, label: str) -> str:
 def _prepare_results(res: PipelineResults):
     """从 PipelineResults 准备 UI 输出元组。
 
-    返回顺序: (results, summary, vlm_imgs, seg_imgs, topdown, report,
+    返回顺序: (results, summary, vlm_imgs, seg_imgs, radar_imgs, report,
                vlm_cb_update, elem_dd_update)
     """
-    topdown = res.wall_topdown_image or None
+    # Radar gallery: wall top-down + per-element radar plots
+    radar_imgs = []
+    if res.wall_topdown_image and Path(res.wall_topdown_image).exists():
+        radar_imgs.append((res.wall_topdown_image, "墙线俯视图"))
+    # Scan output dir for radar_*.png
+    if res.wall_topdown_image:
+        out_dir = Path(res.wall_topdown_image).parent
+        for r in sorted(out_dir.glob("radar_*.png")):
+            elem_name = r.stem.replace("radar_", "")
+            radar_imgs.append((str(r), f"{elem_name} 雷达图"))
+
     vlm_imgs = [(e.image_path, f"{e.element_class} #{e.result_index} ({'✓' if e.confirmed else '✗'})")
                 for e in (res.doors + res.windows) if Path(e.image_path).exists()]
     # Seg gallery: show overlay if available, else elevation image
@@ -206,7 +216,7 @@ def _prepare_results(res: PipelineResults):
     all_elems = res.doors + res.windows
     choices = [f"{e.element_class} #{e.result_index}" for e in all_elems]
     defaults = [f"{e.element_class} #{e.result_index}" for e in all_elems if e.confirmed]
-    return (res, summary, vlm_imgs, seg_imgs, topdown, res.report,
+    return (res, summary, vlm_imgs, seg_imgs, radar_imgs, res.report,
             gr.update(choices=choices, value=defaults),
             gr.update(choices=choices))
 
@@ -215,7 +225,7 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
                            falcon: bool, skip_vlm: bool):
     """生成器：实时流式输出管线子进程日志，完成后自动加载结果。
 
-    yield 10 个值: (console, out_dir, results, summary, wall_img,
+    yield 10 个值: (console, out_dir, results, summary, radar_gallery,
                     vlm_gallery, seg_gallery, report, vlm_cb, elem_dd)
     """
     if not scene:
@@ -896,19 +906,19 @@ def build_app() -> gr.Blocks:
         # ====== ③ 检测结果 ======
         gr.Markdown("---\n## ③ 检测结果")
         summary_md = gr.Markdown("运行管线后，结果将在此显示。")
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("#### 墙线俯视图")
-                wall_img = gr.Image(height=400, label="", show_label=False)
-            with gr.Column(scale=1):
-                gr.Markdown("#### VLM 验证图库")
-                vlm_gallery = gr.Gallery(
-                    columns=2, height=400, label="", show_label=False,
-                    object_fit="contain", preview=True,
-                )
+        gr.Markdown("#### 雷达探测图（墙体 + 门窗等构件扫描）")
+        radar_gallery = gr.Gallery(
+            columns=3, height=400, label="", show_label=False,
+            object_fit="contain", preview=True,
+        )
+        gr.Markdown("#### VLM 验证图库")
+        vlm_gallery = gr.Gallery(
+            columns=4, height=400, label="", show_label=False,
+            object_fit="contain", preview=True,
+        )
         gr.Markdown("#### Seg 叠加图库（Falcon 分割 / 立面渲染）")
         seg_gallery = gr.Gallery(
-            columns=4, height=450, label="", show_label=False,
+            columns=4, height=400, label="", show_label=False,
             object_fit="contain", preview=True,
         )
         with gr.Row():
@@ -1076,7 +1086,7 @@ def build_app() -> gr.Blocks:
             fn=run_pipeline_streaming,
             inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
-                     wall_img, vlm_gallery, seg_gallery, report_json,
+                      radar_gallery, vlm_gallery, seg_gallery, report_json,
                      vlm_review_cbs, elem_sel],
         )
         # 管线运行完成后，刷新结果下拉列表并选中最新结果
@@ -1096,7 +1106,7 @@ def build_app() -> gr.Blocks:
             fn=_on_load,
             inputs=[scene_state, results_dropdown],
             outputs=[results_state, summary_md, vlm_gallery, seg_gallery,
-                     wall_img, report_json, vlm_review_cbs, elem_sel],
+                      radar_gallery, report_json, vlm_review_cbs, elem_sel],
         )
         review_btn.click(fn=apply_vlm_review,
                          inputs=[results_state, vlm_review_cbs],

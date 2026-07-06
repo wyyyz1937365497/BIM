@@ -333,6 +333,104 @@ def detect_elements(
 
 
 # ---------------------------------------------------------------------------
+# Per-element radar visualization
+# ---------------------------------------------------------------------------
+
+def _generate_element_radars(
+    scans: list,
+    walls: list[dict],
+    all_results: dict[str, dict],
+    center: tuple[float, float],
+    floor_z: float,
+    up_axis: int,
+    out_dir: Path,
+) -> None:
+    """Generate a top-down radar PNG for each detected element type.
+
+    Shows scan points colored by semantic class, wall polygon, and
+    confirmed/rejected element positions. Saves as ``radar_<element>.png``.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from bim_recon.virtual_scanner import SEMANTIC_PALETTE
+
+    h_axes = [i for i in range(3) if i != up_axis]
+    h0, h1 = h_axes[0], h_axes[1]
+
+    # Collect all scan points + labels
+    all_pts = []
+    all_labels = []
+    for scan in scans:
+        if scan.semantic_labels is None:
+            continue
+        all_pts.append(scan.points_2d)
+        all_labels.append(scan.semantic_labels)
+    if not all_pts:
+        return
+    pts = np.concatenate(all_pts)
+    labels = np.concatenate(all_labels)
+    palette = np.array(SEMANTIC_PALETTE, dtype=np.float64)
+
+    for elem_type, result in all_results.items():
+        elem_class_idx = None
+        try:
+            cfg_elem = get_element_config(elem_type)
+            elem_class_idx = cfg_elem.class_idx
+        except KeyError:
+            continue
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+
+        # Plot scan points: wall=gray, target=red, others=faint
+        safe_idx = np.clip(labels, 0, len(palette) - 1)
+        in_range = (labels >= 0) & (labels < len(palette))
+        colors = np.where(in_range[:, None], palette[safe_idx], 0.5)
+
+        wall_mask = labels == 0
+        target_mask = labels == elem_class_idx
+        other_mask = ~wall_mask & ~target_mask
+
+        if other_mask.sum() > 0:
+            ax.scatter(pts[other_mask, 0], pts[other_mask, 1],
+                       s=0.3, c=colors[other_mask], alpha=0.15)
+        if wall_mask.sum() > 0:
+            ax.scatter(pts[wall_mask, 0], pts[wall_mask, 1],
+                       s=0.5, c="gray", alpha=0.3)
+        if target_mask.sum() > 0:
+            ax.scatter(pts[target_mask, 0], pts[target_mask, 1],
+                       s=2.0, c="red", alpha=0.6, label=f"{elem_type} pts")
+
+        # Plot wall lines
+        for w in walls:
+            ax.plot([w["x1"], w["x2"]], [w["y1"], w["y2"]],
+                    "b-", linewidth=2, alpha=0.7)
+
+        # Plot detected elements
+        for r in result.get("results", []):
+            c = r.get("candidate", {})
+            wx, wy = c.get("world_x", 0), c.get("world_y", 0)
+            if r.get("confirmed"):
+                ax.scatter([wx], [wy], s=80, c="lime", marker="o",
+                           edgecolors="black", linewidths=0.5, zorder=5,
+                           label="confirmed" if "confirmed" not in ax.get_legend_handles_labels()[1] else "")
+            else:
+                ax.scatter([wx], [wy], s=60, c="red", marker="x",
+                           linewidths=1.5, zorder=5,
+                           label="rejected" if "rejected" not in ax.get_legend_handles_labels()[1] else "")
+
+        ax.set_aspect("equal")
+        ax.set_title(f"Radar: {elem_type} ({result.get('confirmed', 0)} confirmed)")
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        radar_path = out_dir / f"radar_{elem_type}.png"
+        fig.savefig(str(radar_path), dpi=100)
+        plt.close(fig)
+        print(f"  Radar saved: {radar_path.name}")
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -448,6 +546,9 @@ def main() -> int:
         }
         elem_path = out_dir / cfg.output_json_name
         elem_path.write_text(json.dumps(elem_json, indent=2), encoding="utf-8")
+
+    # === Stage 5b: Generate per-element radar plots ===
+    _generate_element_radars(scans, walls_snapped, all_results, center, floor_z, up_axis, out_dir)
 
     # === Stage 6: Pipeline report ===
     print(f"\n{'='*60}")
