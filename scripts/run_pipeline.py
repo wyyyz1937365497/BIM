@@ -345,10 +345,13 @@ def _generate_element_radars(
     up_axis: int,
     out_dir: Path,
 ) -> None:
-    """Generate a top-down radar PNG for each detected element type.
+    """Generate multi-panel radar PNG for each detected element type.
 
-    Shows scan points colored by semantic class, wall polygon, and
-    confirmed/rejected element positions. Saves as ``radar_<element>.png``.
+    Creates a 2-panel figure per element:
+      1. Top-down scatter with semantic colors + wall lines + element positions
+      2. Polar radar scan with semantic colors + element arcs
+
+    Saves as ``radar_<element>.png``.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -361,15 +364,21 @@ def _generate_element_radars(
     # Collect all scan points + labels
     all_pts = []
     all_labels = []
+    all_dists = []
+    all_angles = []
     for scan in scans:
         if scan.semantic_labels is None:
             continue
         all_pts.append(scan.points_2d)
         all_labels.append(scan.semantic_labels)
+        all_dists.append(scan.distances)
+        all_angles.append(scan.angles_deg)
     if not all_pts:
         return
     pts = np.concatenate(all_pts)
     labels = np.concatenate(all_labels)
+    dists = np.concatenate(all_dists)
+    angles = np.concatenate(all_angles)
     palette = np.array(SEMANTIC_PALETTE, dtype=np.float64)
 
     for elem_type, result in all_results.items():
@@ -380,7 +389,10 @@ def _generate_element_radars(
         except KeyError:
             continue
 
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        fig = plt.figure(figsize=(14, 6))
+
+        # ==== Panel 1: Top-down scatter ====
+        ax_td = fig.add_subplot(1, 2, 1)
 
         # Plot scan points: wall=gray, target=red, others=faint
         safe_idx = np.clip(labels, 0, len(palette) - 1)
@@ -392,37 +404,91 @@ def _generate_element_radars(
         other_mask = ~wall_mask & ~target_mask
 
         if other_mask.sum() > 0:
-            ax.scatter(pts[other_mask, 0], pts[other_mask, 1],
-                       s=0.3, c=colors[other_mask], alpha=0.15)
+            ax_td.scatter(pts[other_mask, 0], pts[other_mask, 1],
+                          s=0.3, c=colors[other_mask], alpha=0.15)
         if wall_mask.sum() > 0:
-            ax.scatter(pts[wall_mask, 0], pts[wall_mask, 1],
-                       s=0.5, c="gray", alpha=0.3)
+            ax_td.scatter(pts[wall_mask, 0], pts[wall_mask, 1],
+                          s=0.5, c="gray", alpha=0.3, label="wall pts")
         if target_mask.sum() > 0:
-            ax.scatter(pts[target_mask, 0], pts[target_mask, 1],
-                       s=2.0, c="red", alpha=0.6, label=f"{elem_type} pts")
+            ax_td.scatter(pts[target_mask, 0], pts[target_mask, 1],
+                          s=2.0, c="red", alpha=0.6, label=f"{elem_type} pts")
 
         # Plot wall lines
         for w in walls:
-            ax.plot([w["x1"], w["x2"]], [w["y1"], w["y2"]],
-                    "b-", linewidth=2, alpha=0.7)
+            ax_td.plot([w["x1"], w["x2"]], [w["y1"], w["y2"]],
+                       "b-", linewidth=2, alpha=0.7)
 
         # Plot detected elements
         for r in result.get("results", []):
             c = r.get("candidate", {})
             wx, wy = c.get("world_x", 0), c.get("world_y", 0)
             if r.get("confirmed"):
-                ax.scatter([wx], [wy], s=80, c="lime", marker="o",
-                           edgecolors="black", linewidths=0.5, zorder=5,
-                           label="confirmed" if "confirmed" not in ax.get_legend_handles_labels()[1] else "")
+                ax_td.scatter([wx], [wy], s=80, c="lime", marker="o",
+                              edgecolors="black", linewidths=0.5, zorder=5,
+                              label="confirmed" if "confirmed" not in ax_td.get_legend_handles_labels()[1] else "")
             else:
-                ax.scatter([wx], [wy], s=60, c="red", marker="x",
-                           linewidths=1.5, zorder=5,
-                           label="rejected" if "rejected" not in ax.get_legend_handles_labels()[1] else "")
+                ax_td.scatter([wx], [wy], s=60, c="red", marker="x",
+                              linewidths=1.5, zorder=5,
+                              label="rejected" if "rejected" not in ax_td.get_legend_handles_labels()[1] else "")
 
-        ax.set_aspect("equal")
-        ax.set_title(f"Radar: {elem_type} ({result.get('confirmed', 0)} confirmed)")
-        ax.legend(fontsize=8, loc="upper right")
-        ax.grid(True, alpha=0.3)
+        ax_td.set_aspect("equal")
+        ax_td.set_title(f"Top-Down: {elem_type} ({result.get('confirmed', 0)} confirmed)")
+        ax_td.legend(fontsize=8, loc="upper right")
+        ax_td.grid(True, alpha=0.3)
+
+        # ==== Panel 2: Polar radar ====
+        ax_polar = fig.add_subplot(1, 2, 2, projection="polar")
+
+        # Filter to reasonable distance
+        dist_mask = dists <= 15.0
+        angles_rad = np.radians(angles[dist_mask])
+        dists_filtered = dists[dist_mask]
+        labels_filtered = labels[dist_mask]
+
+        # Color by semantic class
+        safe_idx_f = np.clip(labels_filtered, 0, len(palette) - 1)
+        in_range_f = (labels_filtered >= 0) & (labels_filtered < len(palette))
+        colors_f = np.where(in_range_f[:, None], palette[safe_idx_f], 0.5)
+
+        # Plot non-target, non-wall points faintly
+        other_mask_f = ~((labels_filtered == 0) | (labels_filtered == elem_class_idx))
+        wall_mask_f = labels_filtered == 0
+        target_mask_f = labels_filtered == elem_class_idx
+
+        if other_mask_f.sum() > 0:
+            ax_polar.scatter(angles_rad[other_mask_f], dists_filtered[other_mask_f],
+                             s=0.3, c=colors_f[other_mask_f], alpha=0.2)
+        if wall_mask_f.sum() > 0:
+            ax_polar.scatter(angles_rad[wall_mask_f], dists_filtered[wall_mask_f],
+                             s=0.5, c=colors_f[wall_mask_f], alpha=0.4)
+        if target_mask_f.sum() > 0:
+            ax_polar.scatter(angles_rad[target_mask_f], dists_filtered[target_mask_f],
+                             s=3.0, c="red", alpha=0.8, zorder=5)
+
+        # Mark confirmed elements with green arcs
+        for r in result.get("results", []):
+            theta_c = np.radians(r.get("theta", 0))
+            r_dist = r.get("r", 0)
+            theta_span_rad = np.radians(r.get("candidate", {}).get("theta_span", 5))
+            if r.get("confirmed"):
+                theta_range = np.linspace(
+                    theta_c - theta_span_rad / 2,
+                    theta_c + theta_span_rad / 2, 20,
+                )
+                ax_polar.plot(theta_range, [r_dist] * len(theta_range),
+                              "g-", linewidth=4, alpha=0.8, zorder=10)
+            else:
+                ax_polar.scatter([theta_c], [r_dist], s=80, c="red",
+                                 marker="x", zorder=10, linewidths=2)
+
+        if len(dists_filtered) > 0:
+            ax_polar.set_ylim(0, max(dists_filtered.max() + 1, 6))
+        ax_polar.set_title(
+            f"Polar Radar: {elem_type}\n(red={elem_type} pts, green=confirmed)",
+            pad=20, fontsize=11,
+        )
+        ax_polar.grid(True, alpha=0.3)
+
         fig.tight_layout()
         radar_path = out_dir / f"radar_{elem_type}.png"
         fig.savefig(str(radar_path), dpi=100)
