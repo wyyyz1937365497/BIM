@@ -17,15 +17,15 @@ class TestGetElementConfig:
         assert cfg.name == "door"
         assert cfg.class_idx == 3
         assert cfg.structural is True
-        assert cfg.min_width == 0.7
-        assert cfg.min_points == 100
+        assert cfg.min_width == 0.0
+        assert cfg.min_points == 1
 
     def test_window_config(self):
         cfg = get_element_config("window")
         assert cfg.name == "window"
         assert cfg.class_idx == 4
         assert cfg.structural is True
-        assert cfg.min_width == 0.5
+        assert cfg.min_width == 0.0
 
     def test_furniture_config(self):
         cfg = get_element_config("furniture")

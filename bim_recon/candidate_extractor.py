@@ -291,10 +291,14 @@ def extract_candidates(
 
 def prefilter_candidates(
     candidates: List[Candidate],
-    min_width: float = 0.7,
-    min_points: int = 100,
+    min_width: float = 0.0,
+    min_points: int = 1,
 ) -> List[Candidate]:
-    """Filter candidates by physical constraints to reduce VLM calls."""
+    """Filter candidates by physical constraints to reduce VLM calls.
+
+    Defaults are permissive (min_width=0, min_points=1) — the VLM is the
+    primary filter. Override via ElementConfig if stricter filtering is needed.
+    """
     return [
         c for c in candidates
         if c.width_m >= min_width and c.num_points >= min_points
