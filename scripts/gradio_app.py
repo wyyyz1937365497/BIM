@@ -11,13 +11,29 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import sys
 import time
 import urllib.request
+import warnings
 from pathlib import Path
 from typing import Any
+
+# 抑制 Starlette 的弃用警告（StarletteDeprecationWarning 是自定义类，非标准 DeprecationWarning）
+warnings.filterwarnings('ignore', message='.*HTTP_422_UNPROCESSABLE_ENTITY.*')
+warnings.filterwarnings('ignore', message='.*deprecated.*', module='starlette.*')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='gradio.*')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='starlette.*')
+
+# 配置日志（force=True 覆盖 Gradio/uvicorn 的默认配置，确保我们的日志可见）
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    force=True,
+)
+logger = logging.getLogger('gradio_app')
 
 import gradio as gr
 import numpy as np
@@ -30,6 +46,7 @@ from bim_recon.pipeline_api import (
     PipelineResults, load_results, remap_from_json, mask_to_bbox,
 )
 from bim_recon.config import load_config, get_llm_model, save_config, test_llm_connection
+from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 
 VIEWER_PORT = 8081
 CAMERA_PORT = 8082
@@ -190,32 +207,78 @@ def _prepare_results(res: PipelineResults):
     返回顺序: (results, summary, vlm_imgs, seg_imgs, radar_imgs, report,
                vlm_cb_update, elem_dd_update)
     """
+    logger.info("=" * 60)
+    logger.info("开始准备结果展示")
+    
     # Radar gallery: wall top-down + per-element radar plots
     radar_imgs = []
     if res.wall_topdown_image and Path(res.wall_topdown_image).exists():
         radar_imgs.append((res.wall_topdown_image, "墙线俯视图"))
+        logger.info(f"添加墙线俯视图: {res.wall_topdown_image}")
+    else:
+        logger.warning(f"墙线俯视图不存在: {res.wall_topdown_image}")
+    
     # Scan output dir for radar_*.png
     if res.wall_topdown_image:
         out_dir = Path(res.wall_topdown_image).parent
-        for r in sorted(out_dir.glob("radar_*.png")):
+        radar_files = sorted(out_dir.glob("radar_*.png"))
+        logger.info(f"扫描雷达图库目录: {out_dir}, 找到 {len(radar_files)} 个文件")
+        for r in radar_files:
             elem_name = r.stem.replace("radar_", "")
             radar_imgs.append((str(r), f"{elem_name} 雷达图"))
+            logger.info(f"添加雷达图: {r.name}")
 
-    vlm_imgs = [(e.image_path, f"{e.element_class} #{e.result_index} ({'✓' if e.confirmed else '✗'})")
-                for e in (res.doors + res.windows) if Path(e.image_path).exists()]
+    # VLM gallery
+    logger.info(f"处理 VLM 图库: 共 {len(res.doors)} 扇门, {len(res.windows)} 扇窗")
+    vlm_imgs = []
+    for e in (res.doors + res.windows):
+        logger.info(f"检查构件: {e.element_class} #{e.result_index}, image_path={e.image_path}")
+        if e.image_path and Path(e.image_path).exists():
+            # 三态: ✓ confirmed / ✗ rejected / ⚠️ VLM error
+            status = '✓' if e.confirmed is True else ('✗' if e.confirmed is False else '⚠️')
+            vlm_imgs.append((e.image_path, f"{e.element_class} #{e.result_index} ({status})"))
+            logger.info(f"  ✓ 添加 VLM 图: {e.image_path}")
+        else:
+            logger.warning(f"  ✗ VLM 图不存在: {e.image_path}")
+
     # Seg gallery: show overlay if available, else elevation image
     seg_imgs = []
     for e in (res.doors + res.windows):
+        status = '✓' if e.confirmed is True else ('✗' if e.confirmed is False else '⚠️')
         if e.overlay_image and Path(e.overlay_image).exists():
-            seg_imgs.append((e.overlay_image, f"{e.element_class} #{e.result_index} (Falcon)"))
+            seg_imgs.append((e.overlay_image, f"{e.element_class} #{e.result_index} ({status} Falcon)"))
+            logger.info(f"  ✓ 添加 Falcon overlay: {e.overlay_image}")
         elif e.elevation_image and Path(e.elevation_image).exists():
-            seg_imgs.append((e.elevation_image, f"{e.element_class} #{e.result_index} (elevation)"))
+            seg_imgs.append((e.elevation_image, f"{e.element_class} #{e.result_index} ({status} elevation)"))
+            logger.info(f"  ✓ 添加 elevation 图: {e.elevation_image}")
+    
     summary = (f"### 结果\n- 墙体: {len(res.walls)}\n"
                f"- 门: {sum(1 for d in res.doors if d.confirmed)}/{len(res.doors)} 已确认\n"
                f"- 窗: {sum(1 for w in res.windows if w.confirmed)}/{len(res.windows)} 已确认")
     all_elems = res.doors + res.windows
     choices = [f"{e.element_class} #{e.result_index}" for e in all_elems]
     defaults = [f"{e.element_class} #{e.result_index}" for e in all_elems if e.confirmed]
+    
+    logger.info(f"最终统计: radar_imgs={len(radar_imgs)}, vlm_imgs={len(vlm_imgs)}, seg_imgs={len(seg_imgs)}")
+    logger.info("=" * 60)
+
+    # print() 始终输出到 stdout，作为 logger 不可靠时的后备调试手段
+    print("\n" + "=" * 60, flush=True)
+    print(f"[DEBUG _prepare_results] 门={len(res.doors)} 窗={len(res.windows)} 墙={len(res.walls)}", flush=True)
+    for e in (res.doors + res.windows):
+        img_ok = bool(e.image_path and Path(e.image_path).exists())
+        ovl_ok = bool(e.overlay_image and Path(e.overlay_image).exists())
+        elv_ok = bool(e.elevation_image and Path(e.elevation_image).exists())
+        print(f"  {e.element_class}#{e.result_index} confirmed={e.confirmed} "
+              f"vlm_img={'✓' if img_ok else '✗'} seg_overlay={'✓' if ovl_ok else '✗'} "
+              f"seg_elev={'✓' if elv_ok else '✗'}", flush=True)
+        if not img_ok:
+            print(f"    image_path={e.image_path!r}", flush=True)
+        if not ovl_ok and not elv_ok:
+            print(f"    overlay_image={e.overlay_image!r} elevation_image={e.elevation_image!r}", flush=True)
+    print(f"[DEBUG] gallery counts: radar={len(radar_imgs)} vlm={len(vlm_imgs)} seg={len(seg_imgs)}", flush=True)
+    print("=" * 60 + "\n", flush=True)
+
     return (res, summary, vlm_imgs, seg_imgs, radar_imgs, res.report,
             gr.update(choices=choices, value=defaults),
             gr.update(choices=choices))
@@ -272,28 +335,45 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
 
     out = find_latest_output(scene)
     console = "\n".join(lines[-MAX_CONSOLE_LINES:]) + f"\n✅ 完成: {out}"
+    logger.info(f"管线完成，输出目录: {out}")
+    print(f"\n[DEBUG run_pipeline_streaming] 输出目录: {out}", flush=True)
 
     try:
+        logger.info(f"开始加载结果: {out}")
         res = load_results(Path(out))
+        logger.info(f"结果加载成功: {len(res.doors)} 扇门, {len(res.windows)} 扇窗, {len(res.walls)} 面墙")
+        print(f"[DEBUG] load_results: 门={len(res.doors)} 窗={len(res.windows)} 墙={len(res.walls)}", flush=True)
     except Exception as e:
+        logger.error(f"加载结果失败: {e}", exc_info=True)
+        print(f"[DEBUG] load_results 失败: {e}", flush=True)
         yield (f"{console}\n❌ 加载结果失败: {e}", out, None, "❌ 加载失败",
                None, [], [], None, gr.update(), gr.update())
         return
 
+    logger.info("开始准备结果展示")
     r = _prepare_results(res)
-    # r = (res, summary, vlm_imgs, seg_imgs, topdown, report, vlm_cb, elem_dd)
+    logger.info(f"结果准备完成，准备 yield 到 UI")
+    # r = (res, summary, vlm_imgs, seg_imgs, radar_imgs, report, vlm_cb, elem_dd)
     yield (console, out, r[0], r[1], r[4], r[2], r[3], r[5], r[6], r[7])
 
 
 def load_results_cb(out_dir: str):
     """从输出目录加载已有结果。返回 8 个值。"""
+    logger.info(f"加载结果回调: out_dir={out_dir}")
     if not out_dir or not Path(out_dir).exists():
+        logger.warning(f"输出目录不存在: {out_dir}")
         return None, "无结果", [], [], None, None, gr.update(choices=[]), gr.update(choices=[])
     try:
+        logger.info(f"开始加载结果: {out_dir}")
         res = load_results(Path(out_dir))
+        logger.info(f"结果加载成功: {len(res.doors)} 扇门, {len(res.windows)} 扇窗, {len(res.walls)} 面墙")
     except Exception as e:
+        logger.error(f"加载结果失败: {e}", exc_info=True)
         return None, f"❌ 加载失败: {e}", [], [], None, None, gr.update(choices=[]), gr.update(choices=[])
-    return _prepare_results(res)
+    logger.info("开始准备结果展示")
+    result = _prepare_results(res)
+    logger.info(f"结果准备完成，返回给 UI")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -779,50 +859,110 @@ def _get_agent(results: PipelineResults | None, scene_name: str):
 
 
 def _build_agent_context(results: PipelineResults | None, scene_name: str) -> str:
-    """Build a system prompt with pipeline detection results."""
-    parts = [
+    """Build a system prompt with pipeline detection results and Revit workflow."""
+    parts: list[str] = [
+        "# 角色",
         "你是一个 BIM 自动化助手。你可以通过 Revit MCP 工具在 Revit 中创建建筑构件。",
-        "所有坐标单位为毫米(mm)。以下是管线检测结果：",
-        f"\n场景: {scene_name}",
+        "你收到的检测数据来自 3DGS 场景分析（单位为米），向 Revit 工具传递坐标时**必须乘以 1000 转换为毫米(mm)**。",
+        "",
+        "# 可用的 Revit MCP 工具（按使用顺序）",
+        "",
+        "## 第 0 步：连接与环境检查",
+        "- `say_hello` — 测试 Revit MCP 连接是否正常（**创建任何构件前先调用一次**）",
+        "- `get_current_view_info` — 获取当前活动视图信息",
+        "- `get_available_family_types` — 查询项目可用的族类型（**建门窗前必须先查 typeId**）",
+        "",
+        "## 第 1 步：标高与轴网（可选）",
+        "- `create_level` — 创建标高（如场景缺少楼层）",
+        "- `create_grid` — 创建轴网系统",
+        "",
+        "## 第 2 步：墙体（line-based）",
+        "- `create_line_based_element` — 创建墙/梁/管道等线型构件",
+        "  - 参数: `category=\"OST_Walls\"`, `typeId`, `locationLine={p0, p1}`, `thickness`(mm), `height`(mm), `baseLevel`(mm), `baseOffset`(mm)",
+        "  - **创建后记录返回的 ElementId，后续门窗需要用作 hostWallId**",
+        "",
+        "## 第 3 步：楼板/天花板（surface-based）",
+        "- `create_surface_based_element` — 创建楼板/天花板/屋顶",
+        "  - 参数: `category=\"OST_Floors\"`, `boundary={outerLoop: [{p0, p1}, ...]}`, `thickness`(mm)",
+        "",
+        "## 第 4 步：门（point-based，依赖墙）",
+        "- `create_point_based_element` — 创建门",
+        "  - 参数: `category=\"OST_Doors\"`, `typeId`, `locationPoint={x,y,z}`, `width`(mm), `height`(mm), `baseLevel`(mm), `baseOffset`(mm)",
+        "  - **关键**: `hostWallId` 必须设为第 2 步创建的墙的 ElementId，否则自动检测最近墙可能不准",
+        "  - `parameters: {\"sillHeight\": N}` 可设窗台高度(mm)（门通常为 0）",
+        "  - 设置 `width` + `height` 会自动复制族类型并设自定义尺寸（类型名 `Custom {W}x{H}mm`）",
+        "",
+        "## 第 5 步：窗（point-based，依赖墙）",
+        "- `create_point_based_element` — 创建窗（同门，`category=\"OST_Windows\"`）",
+        "  - **窗台高度**(`sillHeight`)来自检测结果，通常为地面以上 0.9-1.2m，务必传入",
+        "",
+        "## 第 6 步：房间",
+        "- `create_room` — 创建房间（`location` 必须在闭合墙体内）",
+        "",
+        "## 第 7 步：标注与注释",
+        "- `create_dimensions` — 创建尺寸标注",
+        "- `tag_all_walls` / `tag_all_rooms` — 批量标注",
+        "",
+        "## 其他工具",
+        "- `operate_element` — 选择/高亮/隐藏/着色已有构件",
+        "- `color_elements` — 按参数着色",
+        "- `delete_element` — 按 ID 删除构件",
+        "- `ai_element_filter` — 按类别/空间查询已有构件",
+        "- `send_code_to_revit` — 直接执行 C# 代码（高级操作）",
+        "",
+        "# 重要工作规则",
+        "",
+        "1. **单位**: 检测数据单位为**米(m)**，Revit 工具单位为**毫米(mm)**。转换公式: `mm_value = m_value * 1000`",
+        "2. **创建顺序**: 标高 → 轴网 → 墙 → 楼板 → 门 → 窗 → 房间 → 标注。**门窗必须在墙创建后才能放置**（需要 hostWallId）。",
+        "3. **typeId 查询**: 门窗的 `typeId` 必须用 `get_available_family_types` 查询，不同项目可用的族类型不同。",
+        "4. **批量创建**: `create_line_based_element` 和 `create_point_based_element` 的 `data` 参数是**数组**，支持一次创建多个构件。优先批量创建以提高效率。",
+        "5. **坐标系统**: 检测数据的坐标系原点为房间中心，X/Y 为水平面坐标，Z 轴朝上。传给 Revit 时直接使用这些坐标值（已转换为 mm）。",
+        "6. **逐步确认**: 每完成一个步骤（如创建完所有墙），简要报告结果再继续下一步。",
+        "7. **错误处理**: 如果工具返回错误，检查参数（特别是 typeId、hostWallId、单位）后重试，不要跳过。",
+        "",
+        "# 场景检测数据",
+        f"场景名称: `{scene_name}`",
     ]
+
     if results and results.walls:
-        parts.append(f"\n## 墙体 ({len(results.walls)} 面)")
+        parts.append(f"\n## 墙体（{len(results.walls)} 面）")
         for i, w in enumerate(results.walls):
             parts.append(
-                f"  墙{i}: ({w['x1']:.0f}, {w['y1']:.0f}) → "
-                f"({w['x2']:.0f}, {w['y2']:.0f}), 长{w['length']:.0f}mm"
+                f"  墙{i}: ({w['x1']:.3f}, {w['y1']:.3f}) → "
+                f"({w['x2']:.3f}, {w['y2']:.3f}), "
+                f"长 {w['length']:.3f}m"
             )
+
     if results and results.doors:
         confirmed = [d for d in results.doors if d.confirmed]
-        parts.append(f"\n## 门 ({len(confirmed)} 个已确认)")
+        parts.append(f"\n## 门（{len(confirmed)} 个已确认）")
         for d in confirmed:
             hd = d.height_detection or {}
             parts.append(
-                f"  {d.element_class}#{d.result_index}: "
-                f"位置({d.world_x:.0f}, {d.world_y:.0f}), "
-                f"墙#{d.wall_idx}, "
-                f"宽{hd.get('width_m', 0)*1000:.0f}mm, "
-                f"高{hd.get('element_height', 0)*1000:.0f}mm, "
-                f"窗台{hd.get('sill_height', 0)*1000:.0f}mm"
+                f"  门#{d.result_index} (墙#{d.wall_idx}): "
+                f"位置({d.world_x:.3f}, {d.world_y:.3f})m, "
+                f"宽 {hd.get('width_m', 0):.3f}m, "
+                f"高 {hd.get('element_height', 0):.3f}m, "
+                f"窗台 {hd.get('sill_height', 0):.3f}m"
             )
+
     if results and results.windows:
         confirmed = [w for w in results.windows if w.confirmed]
-        parts.append(f"\n## 窗 ({len(confirmed)} 个已确认)")
+        parts.append(f"\n## 窗（{len(confirmed)} 个已确认）")
         for w in confirmed:
             hd = w.height_detection or {}
             parts.append(
-                f"  {w.element_class}#{w.result_index}: "
-                f"位置({w.world_x:.0f}, {w.world_y:.0f}), "
-                f"墙#{w.wall_idx}, "
-                f"宽{hd.get('width_m', 0)*1000:.0f}mm, "
-                f"高{hd.get('element_height', 0)*1000:.0f}mm, "
-                f"窗台{hd.get('sill_height', 0)*1000:.0f}mm"
+                f"  窗#{w.result_index} (墙#{w.wall_idx}): "
+                f"位置({w.world_x:.3f}, {w.world_y:.3f})m, "
+                f"宽 {hd.get('width_m', 0):.3f}m, "
+                f"高 {hd.get('element_height', 0):.3f}m, "
+                f"窗台 {hd.get('sill_height', 0):.3f}m"
             )
-    parts.append(
-        "\n你可以使用 Revit MCP 工具来创建这些构件。"
-        "例如：先创建墙体，再在墙上放置门窗。"
-        "请逐步执行，每步确认结果。"
-    )
+
+    if not results or (not results.walls and not results.doors and not results.windows):
+        parts.append("\n（尚未加载检测结果，请先运行管线或在上方加载结果）")
+
+    parts.append("")
     return "\n".join(parts)
 
 
@@ -1002,6 +1142,21 @@ def build_app() -> gr.Blocks:
             )
             agent_send = gr.Button("发送", variant="primary", scale=1)
 
+        # ====== ⑤b B类构件 Mesh 生成（TRELLIS） ======
+        gr.Markdown("---\n## ⑤b B类构件 Mesh 生成（TRELLIS）")
+        gr.Markdown(
+            "上传或选择构件图像，通过 TRELLIS HTTP 服务生成 GLB mesh。"
+            "需先启动 TRELLIS 服务（`scripts/launch_trellis_server.bat`）。"
+        )
+        trellis_input_image = gr.Image(
+            label="输入图像", type="filepath", height=300,
+        )
+        with gr.Row():
+            trellis_name = gr.Textbox(label="输出名称", value="b_class_mesh", scale=2)
+            trellis_seed = gr.Number(label="种子", value=1, precision=0, scale=1)
+            trellis_gen_btn = gr.Button("🔲 生成 Mesh", variant="primary", scale=1)
+        trellis_output = gr.JSON(label="生成结果")
+
         # ====== ⑥ 3D 查看器（底部） ======
         gr.Markdown("---\n## ⑥ 3D 查看器")
         viewer_btn = gr.Button("▶ 启动查看器", variant="secondary")
@@ -1164,15 +1319,129 @@ def build_app() -> gr.Blocks:
             if not message.strip():
                 yield history, ""
                 return
+
+            from smolagents import (
+                ActionStep, PlanningStep, FinalAnswerStep, ChatMessageStreamDelta,
+            )
+
+            # 1. 显示用户消息
             history = history + [{"role": "user", "content": message}]
-            yield history, ""  # show user message immediately
+            yield history, ""
+
+            # 2. 初始化一个不断更新的 assistant 消息
+            assistant_msg = {"role": "assistant", "content": "🤔 **Agent 思考中...**\n\n"}
+            history = history + [assistant_msg]
+            yield history, ""
+
+            # 累积每一步的文本
+            steps_lines: list[str] = []
+            current_step_lines: list[str] = []
+            final_answer = ""
+            step_count = 0
+            in_tool_call = False
+
             try:
                 agent = _get_agent(results, scene_name)
-                response = agent.run(message)
-                history.append({"role": "assistant", "content": str(response)})
-                yield history, ""
+
+                for step in agent.run(message, stream=True):
+                    updated = False
+
+                    # --- PlanningStep: 规划 ---
+                    if isinstance(step, PlanningStep):
+                        plan = step.plan if hasattr(step, "plan") else ""
+                        if plan:
+                            steps_lines.append(f"📋 **规划**: {plan}")
+                            updated = True
+
+                    # --- ChatMessageStreamDelta: LLM token 流 ---
+                    elif isinstance(step, ChatMessageStreamDelta):
+                        delta = step.content if hasattr(step, "content") else ""
+                        if delta and not in_tool_call:
+                            # token 流附加到当前步骤
+                            if current_step_lines:
+                                current_step_lines[-1] += delta
+                            else:
+                                current_step_lines.append(delta)
+                            updated = True
+
+                    # --- ActionStep: 工具调用 / 观察 ---
+                    elif isinstance(step, ActionStep):
+                        step_count += 1
+
+                        # 工具调用
+                        if step.tool_calls:
+                            for tc in step.tool_calls:
+                                args = tc.arguments
+                                if isinstance(args, dict):
+                                    arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                                else:
+                                    arg_str = str(args)
+                                current_step_lines.append(
+                                    f"**步骤 {step_count}**: 🔧 调用 `{tc.name}({arg_str})`"
+                                )
+                                in_tool_call = True
+                            updated = True
+
+                        # 观察结果
+                        if step.observations:
+                            obs = str(step.observations).strip()
+                            if obs:
+                                current_step_lines.append(f"→ **结果**: {obs}")
+                                in_tool_call = False
+                                # 完成一个完整步骤，保存到历史
+                                steps_lines.extend(current_step_lines)
+                                current_step_lines = []
+                                updated = True
+
+                        # 错误
+                        if step.error:
+                            err = str(step.error)
+                            current_step_lines.append(f"→ **错误**: {err}")
+                            steps_lines.extend(current_step_lines)
+                            current_step_lines = []
+                            updated = True
+
+                        # 最终答案标记
+                        if step.is_final_answer:
+                            if current_step_lines:
+                                steps_lines.extend(current_step_lines)
+                                current_step_lines = []
+
+                    # --- FinalAnswerStep: 最终答案 ---
+                    elif isinstance(step, FinalAnswerStep):
+                        final_answer = str(step.output) if hasattr(step, "output") else str(step)
+                        if current_step_lines:
+                            steps_lines.extend(current_step_lines)
+                            current_step_lines = []
+                        updated = True
+
+                    # 更新 chatbot 显示
+                    if updated:
+                        content_parts = ["🤔 **Agent 思考中...**\n"]
+                        content_parts.extend(steps_lines)
+                        if current_step_lines:
+                            content_parts.extend(current_step_lines)
+
+                        # 如果有最终答案，替换为最终答案
+                        if final_answer:
+                            content_parts = [final_answer]
+
+                        history[-1] = {
+                            "role": "assistant",
+                            "content": "\n".join(content_parts),
+                        }
+                        yield history, ""
+
+                # 流结束后的最终更新
+                if not final_answer and steps_lines:
+                    history[-1] = {
+                        "role": "assistant",
+                        "content": "\n".join(steps_lines),
+                    }
+                    yield history, ""
+
             except Exception as e:
-                history.append({"role": "assistant", "content": f"❌ Agent 错误: {e}"})
+                history[-1] = {"role": "assistant", "content": f"❌ Agent 错误: {e}"}
                 yield history, ""
 
         agent_send.click(
@@ -1184,6 +1453,38 @@ def build_app() -> gr.Blocks:
             fn=_agent_respond,
             inputs=[agent_input, agent_chatbot, results_state, scene_state],
             outputs=[agent_chatbot, agent_input],
+        )
+
+        # --- TRELLIS mesh generation ---
+        def _on_trellis_generate(image_path: str, name: str, seed: int) -> dict:
+            if not image_path:
+                return {"错误": "请先上传或选择输入图像"}
+            cfg = load_config().trellis
+            client = TrellisClient(host=cfg.host, port=cfg.port, timeout=cfg.timeout)
+            if not client.health():
+                return {"错误": f"TRELLIS 服务不可达 ({cfg.host}:{cfg.port})，请先启动服务"}
+            out_dir = ROOT / "output" / "_trellis_meshes"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                result = client.generate_mesh(TrellisMeshRequest(
+                    image_path=Path(image_path),
+                    output_dir=out_dir,
+                    name=name or "b_class_mesh",
+                    seed=int(seed),
+                ))
+                return {
+                    "状态": "✅ 生成成功",
+                    "GLB": str(result.glb_path),
+                    "PLY": str(result.gaussian_path) if result.gaussian_path else None,
+                    "种子": result.seed,
+                }
+            except Exception as e:
+                return {"错误": f"生成失败: {e}"}
+
+        trellis_gen_btn.click(
+            fn=_on_trellis_generate,
+            inputs=[trellis_input_image, trellis_name, trellis_seed],
+            outputs=trellis_output,
         )
 
     return app

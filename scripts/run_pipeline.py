@@ -41,11 +41,13 @@ from bim_recon.candidate_extractor import (
     extract_candidates,
     prefilter_candidates,
 )
+from bim_recon.config import load_config
 from bim_recon.element_config import ElementConfig, get_element_config, list_element_types
 from bim_recon.falcon_client import FalconClient
 from bim_recon.gs_scene import GSScene
 from bim_recon.height_detector import detect_element_heights
 from bim_recon.spatial_extractor import extract_spatial
+from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
 from bim_recon.wall_line_extractor import (
@@ -182,7 +184,9 @@ def detect_elements(
     coords: dict,
     scene: GSScene,
     out_dir: Path,
-    ollama_model: str,
+    vlm_api_base: str,
+    vlm_model: str,
+    vlm_api_key: str,
     skip_vlm: bool = False,
     falcon: FalconClient | None = None,
 ) -> dict:
@@ -226,7 +230,9 @@ def detect_elements(
     results = verify_candidates(
         filtered, scene, center, floor_z, verify_dir,
         element_class=cfg.name,
-        ollama_model=ollama_model,
+        vlm_api_base=vlm_api_base,
+        vlm_model=vlm_model,
+        vlm_api_key=vlm_api_key,
         up_axis=up_axis,
         vlm_hint=cfg.vlm_hint,
         skip_vlm=skip_vlm,
@@ -511,18 +517,38 @@ def main() -> int:
                         help=f"Element types to detect: {list_element_types()}")
     parser.add_argument("--num-heights", type=int, default=12,
                         help="Number of scan heights")
-    parser.add_argument("--ollama-model", default="gemma4:12b")
     parser.add_argument("--skip-vlm", action="store_true",
                         help="Skip VLM verification (render only)")
     parser.add_argument("--snap-threshold", type=float, default=0.5,
                         help="Wall endpoint snap threshold (m)")
+    parser.add_argument("--vlm-model", default=None,
+                        help="Override VLM model from config.json")
+    parser.add_argument("--vlm-api-base", default=None,
+                        help="Override VLM API base URL from config.json")
+    parser.add_argument("--vlm-api-key", default=None,
+                        help="Override VLM API key from config.json")
     parser.add_argument("--falcon-host", default="127.0.0.1",
                         help="Falcon inference server host")
     parser.add_argument("--falcon-port", type=int, default=8390,
                         help="Falcon inference server port")
     parser.add_argument("--no-falcon", action="store_true",
                         help="Disable Falcon spatial extraction (use depth-probing only)")
+    parser.add_argument("--trellis-host", default=None,
+                        help="Override TRELLIS server host from config.json")
+    parser.add_argument("--trellis-port", type=int, default=None,
+                        help="Override TRELLIS server port from config.json")
+    parser.add_argument("--no-trellis", action="store_true",
+                        help="Disable TRELLIS B-class mesh generation")
     args = parser.parse_args()
+
+    # === Load VLM config from config.json (CLI args override) ===
+    app_config = load_config()
+    vlm = app_config.vlm
+    vlm_api_base = args.vlm_api_base or vlm.api_base
+    vlm_model = args.vlm_model or vlm.model
+    vlm_api_key = args.vlm_api_key if args.vlm_api_key is not None else vlm.api_key
+    if not args.skip_vlm:
+        print(f"  VLM: {vlm_model} @ {vlm_api_base}")
 
     # === Falcon client (optional) ===
     falcon: FalconClient | None = None
@@ -533,6 +559,19 @@ def main() -> int:
         else:
             print(f"  Falcon server: unreachable, using depth-probing fallback")
             falcon = None
+
+    # === TRELLIS client (optional, for B-class mesh generation) ===
+    trellis: TrellisClient | None = None
+    if not args.no_trellis:
+        t_cfg = app_config.trellis
+        t_host = args.trellis_host or t_cfg.host
+        t_port = args.trellis_port or t_cfg.port
+        trellis = TrellisClient(host=t_host, port=t_port, timeout=t_cfg.timeout)
+        if trellis.health():
+            print(f"  TRELLIS server: connected ({t_host}:{t_port})")
+        else:
+            print(f"  TRELLIS server: unreachable, B-class mesh generation disabled")
+            trellis = None
 
     data_dir = ROOT / "data" / args.name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -597,7 +636,7 @@ def main() -> int:
 
         result = detect_elements(
             cfg, scans, walls_snapped, coords, scene,
-            out_dir, args.ollama_model, args.skip_vlm,
+            out_dir, vlm_api_base, vlm_model, vlm_api_key, args.skip_vlm,
             falcon=falcon,
         )
         all_results[elem_type] = result
@@ -607,7 +646,7 @@ def main() -> int:
             "scene": args.name,
             "element": elem_type,
             "ply_used": ply_path.name,
-            "ollama_model": args.ollama_model if not args.skip_vlm else None,
+            "vlm_model": vlm_model if not args.skip_vlm else None,
             **result,
         }
         elem_path = out_dir / cfg.output_json_name
@@ -615,6 +654,51 @@ def main() -> int:
 
     # === Stage 5b: Generate per-element radar plots ===
     _generate_element_radars(scans, walls_snapped, all_results, center, floor_z, up_axis, out_dir)
+
+    # === Stage 5c: B-class mesh generation via TRELLIS (optional) ===
+    trellis_results: list[dict] = []
+    if trellis is not None:
+        print(f"\n--- Stage 4: B-class Mesh Generation (TRELLIS) ---")
+        trellis_dir = out_dir / "trellis_meshes"
+        trellis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect VLM-verified images from all element types
+        vlm_images: list[tuple[str, str]] = []
+        for elem_type, result in all_results.items():
+            verify_subdir = trellis_dir.parent / f"verify_{elem_type}"
+            if not verify_subdir.exists():
+                continue
+            for img_file in sorted(verify_subdir.glob("*.png")):
+                vlm_images.append((elem_type, str(img_file)))
+
+        if vlm_images:
+            print(f"  Found {len(vlm_images)} VLM images to process")
+            for elem_type, img_path in vlm_images:
+                img_name = Path(img_path).stem
+                try:
+                    mesh_result = trellis.generate_mesh(TrellisMeshRequest(
+                        image_path=Path(img_path),
+                        output_dir=trellis_dir,
+                        name=f"{elem_type}_{img_name}",
+                    ))
+                    trellis_results.append({
+                        "element": elem_type,
+                        "source_image": img_path,
+                        "glb_path": str(mesh_result.glb_path),
+                        "gaussian_path": str(mesh_result.gaussian_path) if mesh_result.gaussian_path else None,
+                    })
+                    print(f"  ✓ {img_name}: {mesh_result.glb_path.name}")
+                except Exception as e:
+                    print(f"  ✗ {img_name}: {e}")
+                    trellis_results.append({
+                        "element": elem_type,
+                        "source_image": img_path,
+                        "error": str(e),
+                    })
+        else:
+            print(f"  No VLM images found, skipping mesh generation")
+    elif not args.no_trellis:
+        print(f"\n  (TRELLIS server unreachable, B-class mesh generation skipped)")
 
     # === Stage 6: Pipeline report ===
     print(f"\n{'='*60}")
@@ -646,7 +730,12 @@ def main() -> int:
             "snapped": True,
         },
         "elements": all_results,
-        "vlm_model": args.ollama_model if not args.skip_vlm else None,
+        "vlm_model": vlm_model if not args.skip_vlm else None,
+        "trellis": {
+            "enabled": trellis is not None,
+            "meshes_generated": len([r for r in trellis_results if "glb_path" in r]),
+            "results": trellis_results,
+        },
     }
     report_path = out_dir / "pipeline_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
