@@ -108,15 +108,19 @@ def load_results(out_dir: Path) -> PipelineResults:
 
 
 def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
-    """Parse a ``*_verified.json`` file into ``ElementResult`` list (confirmed only)."""
+    """Parse a ``*_verified.json`` file into ``ElementResult`` list.
+
+    Loads ALL candidates (confirmed, rejected, and VLM-error) so the UI
+    always shows feedback. The ``confirmed`` field on each ElementResult
+    distinguishes: ``True`` = VLM confirmed, ``False`` = VLM rejected,
+    ``None`` = VLM error (e.g. server unreachable).
+    """
     path = out_dir / filename
     if not path.exists():
         return []
     data = json.loads(path.read_text("utf-8"))
     results: list[ElementResult] = []
     for result_index, r in enumerate(data.get("results", [])):
-        if not r.get("confirmed"):
-            continue
         c = r.get("candidate", {})
         hd = r.get("height_detection")
         elem_class = c.get("element_class", "")
