@@ -1,0 +1,23 @@
+TRELLIS Windows xformers patches
+===============================
+
+These two patches switch TRELLIS from flash-attn (unavailable on Windows)
+to xformers as the attention backend. They must be applied after a fresh
+`git submodule update --init TRELLIS` on Windows.
+
+The launch script `scripts/launch_trellis_server.bat` applies them
+automatically via `git apply` before starting the server.
+
+Manual application::
+
+    cd G:\TJ\BIM\TRELLIS
+    git apply ../../trellis_server/xformers_windows.patch
+
+Files patched:
+  - trellis/modules/attention/__init__.py: BACKEND 'flash_attn' → 'xformers'
+  - trellis/modules/sparse/__init__.py:    ATTN    'flash_attn' → 'xformers'
+
+Note: `trellis_server/server.py` also sets `os.environ["ATTN_BACKEND"]="xformers"`
+at runtime as a belt-and-suspenders measure, but the source patches are still
+needed because some modules read the module-level constant before the env var
+is checked.

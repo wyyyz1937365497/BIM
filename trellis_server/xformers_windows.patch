@@ -1,0 +1,25 @@
+diff --git a/trellis/modules/attention/__init__.py b/trellis/modules/attention/__init__.py
+index f452320..853ed09 100755
+--- a/trellis/modules/attention/__init__.py
++++ b/trellis/modules/attention/__init__.py
+@@ -1,6 +1,6 @@
+ from typing import *
+ 
+-BACKEND = 'flash_attn' 
++BACKEND = 'xformers'
+ DEBUG = False
+ 
+ def __from_env():
+diff --git a/trellis/modules/sparse/__init__.py b/trellis/modules/sparse/__init__.py
+index 726756c..77108a6 100755
+--- a/trellis/modules/sparse/__init__.py
++++ b/trellis/modules/sparse/__init__.py
+@@ -2,7 +2,7 @@ from typing import *
+ 
+ BACKEND = 'spconv' 
+ DEBUG = False
+-ATTN = 'flash_attn'
++ATTN = 'xformers'
+ 
+ def __from_env():
+     import os

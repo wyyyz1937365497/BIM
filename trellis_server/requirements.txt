@@ -1,0 +1,9 @@
+# TRELLIS server extra dependencies (not installed by TRELLIS setup.sh)
+# Install in the trellis conda env:
+#   conda activate trellis
+#   pip install -r trellis_server/requirements.txt
+
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.0.0
+Pillow>=10.0.0
