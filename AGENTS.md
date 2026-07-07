@@ -10,6 +10,7 @@
 | **.NET SDK** | 10.0.203 |
 | **Conda: bim-recon** | `G:\Miniconda3\envs\bim-recon\python.exe` (gsplat, torch 2.7) |
 | **Conda: transformerv** | `G:\Miniconda3\envs\transformerv\python.exe` (Falcon-Perception, torch 2.11) |
+| **Conda: trellis** | `G:\Miniconda3\envs\trellis\python.exe` (TRELLIS mesh生成, torch 2.4) |
 
 ## Revit MCP Build
 
@@ -51,4 +52,20 @@
 
 - 永远不要在意字符/字体警告
 - VLM 固定使用 Ollama gemma4:12b
-- 两环境不可合并：bim-recon (gsplat) vs transformerv (falcon_perception)
+- 三环境不可合并：bim-recon (gsplat) vs transformerv (falcon_perception) vs trellis (TRELLIS mesh生成)
+
+## TRELLIS Mesh 生成服务
+
+- **用途**：B类复杂构件（管道、楼梯、异形件）的 mesh 生成（image → GLB + PLY）
+- **conda 环境**：`trellis`（torch 2.4 + xformers，flash-attn 不可用于 Windows）
+- **服务端**：`trellis_server/server.py`（FastAPI，端口 8391）
+  - 启动：`scripts\launch_trellis_server.bat`（自动 apply xformers patch）
+  - 手动启动：`conda activate trellis && python trellis_server/server.py --port 8391`
+  - 首次启动前需安装额外依赖：`pip install -r trellis_server/requirements.txt`
+- **客户端**：`bim_recon/trellis_client.py`（HTTP client，在 bim-recon 环境中调用）
+- **CLI**：`scripts/generate_trellis_mesh.py --image <path> --output-dir <dir>`
+- **配置**：`config.json` 的 `trellis` 节点（host/port/model/timeout）
+- **xformers patch**：`trellis_server/xformers_windows.patch`，launch 脚本自动 `git apply`
+- **架构**：与 Falcon-Perception 相同的跨环境 HTTP 桥接模式
+  - `trellis_server/server.py` 在 trellis 环境常驻，加载模型一次
+  - `bim_recon/trellis_client.py` 在 bim-recon 环境通过 HTTP 请求生成 mesh
