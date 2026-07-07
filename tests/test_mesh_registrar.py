@@ -259,7 +259,7 @@ class TestParseGlb:
 # ---------------------------------------------------------------------------
 
 class TestRegisterMeshInRevit:
-    def test_payload_contains_vertices_in_feet(self, tmp_path):
+    def test_no_runner_returns_formatted_payload(self, tmp_path):
         glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
         placement = MeshPlacement(
             glb_path=glb_path,
@@ -273,18 +273,24 @@ class TestRegisterMeshInRevit:
         transform = compute_placement_transform(placement)
         result = register_mesh_in_revit(placement, transform)
 
+        assert result["status"] == "formatted"
+        assert result["script_name"] == "create_directshape_from_mesh"
+        assert result["vertex_count"] == 8
+        assert result["face_count"] == 12
+
         payload = json.loads(result["payload_json"])
         assert payload["name"] == "Test Mesh"
         assert payload["category"] == "OST_GenericModel"
-        assert len(payload["vertices"]) == 8 * 3  # 8 verts * 3 coords
-        assert len(payload["faces"]) == 12 * 3   # 12 faces * 3 indices
+        assert len(payload["vertices"]) == 8 * 3
+        assert len(payload["faces"]) == 12 * 3
 
         # Verify coordinates are in feet (1m ≈ 3.28ft)
-        # World position (1, 2, 0.5) meters → feet ≈ (3.28, 6.56, 1.64)
         max_x_ft = max(payload["vertices"][i] for i in range(0, len(payload["vertices"]), 3))
-        assert max_x_ft > 3.0  # at least 1m in feet
+        assert max_x_ft > 3.0
 
-    def test_status_is_formatted(self, tmp_path):
+    def test_with_mock_runner_calls_revit(self, tmp_path):
+        """When a runner with MCP sender is provided, register_mesh_in_revit
+        calls runner.run() and returns the Revit result."""
         glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
         placement = MeshPlacement(
             glb_path=glb_path,
@@ -293,5 +299,42 @@ class TestRegisterMeshInRevit:
             element_width_m=1.0, element_height_m=1.0,
         )
         transform = compute_placement_transform(placement)
-        result = register_mesh_in_revit(placement, transform)
+
+        class MockRunner:
+            def __init__(self):
+                self.last_script = None
+                self.last_params = None
+
+            def run(self, script_name, parameters=None):
+                self.last_script = script_name
+                self.last_params = parameters
+                return {"elementId": 12345, "name": "test"}
+
+        runner = MockRunner()
+        result = register_mesh_in_revit(placement, transform, runner=runner)
+
+        assert result["status"] == "ok"
+        assert result["elementId"] == 12345
+        assert runner.last_script == "create_directshape_from_mesh"
+        assert runner.last_params is not None
+
+    def test_with_runner_no_sender_returns_formatted(self, tmp_path):
+        """When runner has no MCP sender (_note in result), returns formatted."""
+        glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0, world_y=0,
+            floor_z=0, ceiling_z=3,
+            element_width_m=1.0, element_height_m=1.0,
+        )
+        transform = compute_placement_transform(placement)
+
+        class MockRunnerNoSender:
+            def run(self, script_name, parameters=None):
+                return {"_note": "No MCP sender configured"}
+
+        result = register_mesh_in_revit(placement, transform, runner=MockRunnerNoSender())
+
+        assert result["status"] == "formatted"
+        assert "payload_json" in result
         assert result["status"] == "formatted"

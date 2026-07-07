@@ -48,6 +48,11 @@ from bim_recon.gs_scene import GSScene
 from bim_recon.height_detector import detect_element_heights
 from bim_recon.spatial_extractor import extract_spatial
 from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
+from bim_recon.mesh_registrar import (
+    MeshPlacement,
+    compute_placement_transform,
+    register_mesh_in_revit,
+)
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
 from bim_recon.wall_line_extractor import (
@@ -655,14 +660,32 @@ def main() -> int:
     # === Stage 5b: Generate per-element radar plots ===
     _generate_element_radars(scans, walls_snapped, all_results, center, floor_z, up_axis, out_dir)
 
-    # === Stage 5c: B-class mesh generation via TRELLIS (optional) ===
+    # === Stage 5c: B-class mesh generation + placement via TRELLIS (optional) ===
     trellis_results: list[dict] = []
     if trellis is not None:
-        print(f"\n--- Stage 4: B-class Mesh Generation (TRELLIS) ---")
+        print(f"\n--- Stage 4: B-class Mesh Generation + Placement (TRELLIS) ---")
         trellis_dir = out_dir / "trellis_meshes"
         trellis_dir.mkdir(parents=True, exist_ok=True)
 
-        # Collect VLM-verified images from all element types
+        # Build a lookup: image filename → candidate world coordinates + dims
+        candidate_lookup: dict[str, dict] = {}
+        for elem_type, result in all_results.items():
+            for r in result.get("results", []):
+                img_name = r.get("image_path", "")
+                if not img_name:
+                    continue
+                c = r.get("candidate", {})
+                hd = r.get("height_detection", {}) or {}
+                candidate_lookup[Path(img_name).stem] = {
+                    "element": elem_type,
+                    "world_x": c.get("world_x", 0.0),
+                    "world_y": c.get("world_y", 0.0),
+                    "width_m": hd.get("width_m", c.get("width_m", 0.5)),
+                    "height_m": hd.get("element_height", c.get("h_max", 1.0) - c.get("h_min", 0.0)),
+                    "confirmed": r.get("confirmed"),
+                }
+
+        # Collect VLM-verified images
         vlm_images: list[tuple[str, str]] = []
         for elem_type, result in all_results.items():
             verify_subdir = trellis_dir.parent / f"verify_{elem_type}"
@@ -674,22 +697,52 @@ def main() -> int:
         if vlm_images:
             print(f"  Found {len(vlm_images)} VLM images to process")
             for elem_type, img_path in vlm_images:
-                img_name = Path(img_path).stem
+                img_stem = Path(img_path).stem
                 try:
                     mesh_result = trellis.generate_mesh(TrellisMeshRequest(
                         image_path=Path(img_path),
                         output_dir=trellis_dir,
-                        name=f"{elem_type}_{img_name}",
+                        name=f"{elem_type}_{img_stem}",
                     ))
-                    trellis_results.append({
+
+                    entry: dict = {
                         "element": elem_type,
                         "source_image": img_path,
                         "glb_path": str(mesh_result.glb_path),
                         "gaussian_path": str(mesh_result.gaussian_path) if mesh_result.gaussian_path else None,
-                    })
-                    print(f"  ✓ {img_name}: {mesh_result.glb_path.name}")
+                    }
+
+                    # Compute placement transform if we have candidate coordinates
+                    cand = candidate_lookup.get(img_stem)
+                    if cand and cand.get("confirmed") is not False:
+                        placement = MeshPlacement(
+                            glb_path=mesh_result.glb_path,
+                            world_x=cand["world_x"],
+                            world_y=cand["world_y"],
+                            floor_z=floor_z,
+                            ceiling_z=ceiling_z,
+                            element_width_m=cand["width_m"],
+                            element_height_m=cand["height_m"],
+                            up_axis=up_axis,
+                            name=f"{elem_type}_{img_stem}",
+                        )
+                        transform = compute_placement_transform(placement)
+                        reg_result = register_mesh_in_revit(placement, transform)
+                        entry["placement"] = {
+                            "scale": transform.scale,
+                            "vertex_count": reg_result["vertex_count"],
+                            "face_count": reg_result["face_count"],
+                            "status": reg_result["status"],
+                        }
+                        print(f"  ✓ {img_stem}: GLB={mesh_result.glb_path.name}, "
+                              f"placement={reg_result['status']}")
+                    else:
+                        print(f"  ✓ {img_stem}: GLB={mesh_result.glb_path.name} (no placement data)")
+
+                    trellis_results.append(entry)
+
                 except Exception as e:
-                    print(f"  ✗ {img_name}: {e}")
+                    print(f"  ✗ {img_stem}: {e}")
                     trellis_results.append({
                         "element": elem_type,
                         "source_image": img_path,

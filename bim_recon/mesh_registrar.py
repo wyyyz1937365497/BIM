@@ -338,27 +338,33 @@ def _build_axis_remap_rotation(up_axis: int) -> np.ndarray:
 def register_mesh_in_revit(
     placement: MeshPlacement,
     transform: MeshTransform,
+    runner: Any | None = None,
 ) -> dict[str, Any]:
     """Send the transformed mesh to Revit as a DirectShape via C# script.
 
-    The C# script creates a DirectShape with the given category, builds a
-    TessellatedShape from the vertex/face data, and places it in the model.
+    If *runner* is a :class:`~bim_recon.revit_runner.RevitScriptRunner` with an
+    MCP sender configured, the mesh is immediately created in Revit.
 
-    This function formats the mesh data as JSON (vertices in feet, faces as
-    triangle indices) and sends it via ``send_code_to_revit`` MCP tool.
+    If *runner* is ``None`` (e.g. when Revit is not running or the pipeline is
+    executed headless), the formatted payload and C# code are returned for
+    later manual dispatch via ``send_code_to_revit``.
+
+    Args:
+        placement: The placement specification (name, category, etc.).
+        transform: The computed mesh transform (vertices in meters, faces).
+        runner: Optional ``RevitScriptRunner`` instance. If provided and has
+            an MCP sender, the DirectShape is created immediately.
 
     Returns:
-        Dict with keys: ``status``, ``element_id``, ``name``, ``category``.
+        Dict with keys: ``status``, ``vertex_count``, ``face_count``, and
+        either ``element_id`` (if Revit was called) or ``payload_json`` +
+        ``script_name`` (for manual dispatch).
     """
     meters_to_feet = 3.280839895013123
 
     # Convert vertices from meters to feet for Revit internal units
     vertices_feet = (transform.vertices_world * meters_to_feet).round(6)
-
-    # Flatten to [x0,y0,z0, x1,y1,z1, ...] for compact JSON
     verts_flat = vertices_feet.flatten().tolist()
-
-    # Faces: flatten to [i0,i1,i2, i3,i4,i5, ...]
     faces_flat = transform.faces.flatten().tolist()
 
     payload = {
@@ -368,10 +374,24 @@ def register_mesh_in_revit(
         "faces": faces_flat,
     }
 
-    return {
-        "status": "formatted",
-        "payload_size": len(verts_flat) * 4 + len(faces_flat) * 4,  # bytes
+    base_info = {
         "vertex_count": len(vertices_feet),
         "face_count": len(transform.faces),
+    }
+
+    if runner is not None:
+        result = runner.run(
+            "create_directshape_from_mesh",
+            parameters=[json.dumps(payload)],
+        )
+        if "_note" in result:
+            # No MCP sender configured — return for manual dispatch
+            return {**base_info, "status": "formatted", "payload_json": json.dumps(payload)}
+        return {**base_info, "status": "ok", **result}
+
+    return {
+        **base_info,
+        "status": "formatted",
         "payload_json": json.dumps(payload),
+        "script_name": "create_directshape_from_mesh",
     }

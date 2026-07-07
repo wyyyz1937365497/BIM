@@ -18,11 +18,6 @@
 // Usage:
 //   revit_send_code_to_revit(code=<this file>, parameters=['{"name":"Chair","category":"OST_GenericModel","vertices":[...],"faces":[...]}'])
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using Autodesk.Revit.DB;
-
 string jsonStr = Convert.ToString(parameters[0]);
 var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(jsonStr);
 
