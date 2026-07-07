@@ -267,7 +267,7 @@ def main() -> int:
         f"    -> {verified['rejected']} rejected (false positives)\n"
         f"    -> VLM: {verified.get('errors', 0)} errors\n\n"
         f"  Scene: {verified['ply_used']}\n"
-        f"  Model: {verified['ollama_model']}\n"
+        f"  Model: {verified.get('vlm_model', verified.get('ollama_model', 'N/A'))}\n"
         f"  Result: {verified['total_candidates']} -> "
         f"{verified['after_prefilter']} -> {verified['confirmed']} confirmed {elem_name}s"
     )

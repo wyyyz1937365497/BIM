@@ -241,7 +241,7 @@ class TestVerifyCandidatesMock:
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
-        with patch("bim_recon.vlm_verifier.query_ollama",
+        with patch("bim_recon.vlm_verifier.query_vlm",
                    return_value="CONFIRMED\nA door is visible."):
             results = verify_candidates(
                 [cand], mock_scene, (0.0, 0.0), 0.0, tmp_path,
@@ -271,7 +271,7 @@ class TestVerifyCandidatesMock:
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
-        with patch("bim_recon.vlm_verifier.query_ollama",
+        with patch("bim_recon.vlm_verifier.query_vlm",
                    return_value="REJECTED\nNo door here."):
             results = verify_candidates(
                 [cand], mock_scene, (0.0, 0.0), 0.0, tmp_path,
@@ -298,8 +298,8 @@ class TestVerifyCandidatesMock:
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
-        with patch("bim_recon.vlm_verifier.query_ollama",
-                   side_effect=ConnectionError("Ollama offline")):
+        with patch("bim_recon.vlm_verifier.query_vlm",
+                   side_effect=ConnectionError("VLM offline")):
             results = verify_candidates(
                 [cand], mock_scene, (0.0, 0.0), 0.0, tmp_path,
                 element_class="door",

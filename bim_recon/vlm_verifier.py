@@ -1,4 +1,4 @@
-"""VLM-verified element extraction via Ollama.
+"""VLM-verified element extraction via OpenAI-compatible API.
 
 Two-stage element detection pipeline:
 
@@ -6,12 +6,17 @@ Two-stage element detection pipeline:
   locations via radar scan. High recall, low precision.
 
   Stage 2 (VLM verification): for each candidate, render a targeted RGB
-  image from 3DGS at the polar-derived viewpoint, then ask an Ollama VLM
-  to confirm or reject. High precision.
+  image from 3DGS at the polar-derived viewpoint, then ask a VLM
+  (GPT-4o, GLM-4V, Qwen-VL, Ollama vision, etc.) to confirm or reject.
+  High precision.
 
 The polar-to-viewpoint mapping is the key mathematical bridge: the radar
 scan's azimuth angle θ directly determines the camera direction, and the
 distance r determines where to aim.
+
+VLM config is loaded from ``config.json`` (see :mod:`bim_recon.config`).
+The ``vlm.api_base`` should point to the ``/v1`` (or equivalent) endpoint
+that supports the OpenAI Chat Completions format with ``image_url``.
 
 Usage::
 
@@ -21,16 +26,17 @@ Usage::
     results = verify_candidates(
         candidates, scene, scan_center, floor_z, output_dir,
         element_class="door",
+        vlm_api_base="https://open.bigmodel.cn/api/paas/v4",
+        vlm_model="glm-4v",
+        vlm_api_key="your-key",
     )
     confirmed = [r for r in results if r.confirmed]
 """
 from __future__ import annotations
 
 import base64
-import json
 import math
-import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -138,8 +144,72 @@ def candidate_to_viewpoint(
 
 
 # ---------------------------------------------------------------------------
-# Ollama VLM query
+# OpenAI-compatible VLM query
 # ---------------------------------------------------------------------------
+
+def query_vlm(
+    image_path: str,
+    prompt: str,
+    api_base: str,
+    model: str,
+    api_key: str = "",
+    timeout: int = 120,
+    max_tokens: int = 200,
+) -> str:
+    """Send an image + prompt to an OpenAI-compatible VLM and return the response.
+
+    Uses the standard Chat Completions API (``POST /chat/completions``) with
+    ``image_url`` containing a base64 data URL. Works with any provider that
+    supports the OpenAI vision format:
+
+    - OpenAI: ``gpt-4o``, ``gpt-4-turbo``
+    - 智谱 ZAI: ``glm-4v``, ``glm-4o``
+    - Qwen: ``qwen-vl-max``, ``qwen-vl-plus``
+    - Ollama: ``gemma4:12b`` (via ``/v1`` endpoint)
+    - DeepSeek, Moonshot, etc.
+
+    Args:
+        image_path: Path to the PNG image file.
+        prompt: Text prompt for the VLM.
+        api_base: API base URL including version path
+                  (e.g. ``https://api.openai.com/v1``, ``http://localhost:11434/v1``).
+        model: Model name.
+        api_key: API key (empty string for local servers like Ollama).
+        timeout: Request timeout in seconds.
+        max_tokens: Max tokens in the response.
+
+    Returns:
+        The VLM's text response.
+
+    Raises:
+        Exception: If the API call fails (network error, auth error, etc.).
+    """
+    from openai import OpenAI
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+
+    client = OpenAI(base_url=api_base, api_key=api_key or "empty", timeout=timeout)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}",
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content or ""
+
 
 def query_ollama(
     image_path: str,
@@ -149,43 +219,18 @@ def query_ollama(
     port: int = 11434,
     timeout: int = 120,
 ) -> str:
-    """Send an image + prompt to a local Ollama VLM and return the response.
+    """Backward-compatible wrapper — delegates to :func:`query_vlm`.
 
-    Uses the Ollama REST API (``POST /api/generate``). The image is
-    base64-encoded inline.
-
-    Args:
-        image_path: Path to the PNG image file.
-        prompt: Text prompt for the VLM.
-        model: Ollama model name (must support vision).
-        host, port: Ollama server address.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        The VLM's text response.
-
-    Raises:
-        urllib.error.URLError: If Ollama is unreachable.
-        KeyError: If the response lacks a ``response`` field.
+    Converts Ollama host/port to the OpenAI-compatible ``/v1`` endpoint.
     """
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    payload = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "images": [img_b64],
-        "stream": False,
-    }).encode()
-
-    url = f"http://{host}:{port}/api/generate"
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
+    return query_vlm(
+        image_path,
+        prompt,
+        api_base=f"http://{host}:{port}/v1",
+        model=model,
+        api_key="",
+        timeout=timeout,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read().decode())
-    return result.get("response", "")
 
 
 def _build_prompt(element_class: str, vlm_hint: str = "") -> str:
@@ -228,9 +273,10 @@ def verify_candidates(
     floor_z: float,
     output_dir: Path,
     element_class: str = "door",
-    ollama_model: str = "gemma4:12b",
-    ollama_host: str = "localhost",
-    ollama_port: int = 11434,
+    vlm_api_base: str = "http://127.0.0.1:11434/v1",
+    vlm_model: str = "gemma4:12b",
+    vlm_api_key: str = "",
+    vlm_timeout: int = 120,
     image_width: int = 800,
     image_height: int = 600,
     fov: float = 60.0,
@@ -239,13 +285,13 @@ def verify_candidates(
     skip_vlm: bool = False,
     progress_callback: Optional[Any] = None,
 ) -> List[VerificationResult]:
-    """Render targeted images for candidates and verify via Ollama VLM.
+    """Render targeted images for candidates and verify via OpenAI-compatible VLM.
 
     For each candidate:
       1. Compute camera pose from polar coordinates.
       2. Render a clean RGB image from 3DGS.
       3. Save image to ``output_dir``.
-      4. Query Ollama VLM for confirmation.
+      4. Query VLM for confirmation.
 
     Args:
         candidates: List of :class:`Candidate` objects.
@@ -254,7 +300,10 @@ def verify_candidates(
         floor_z: Floor level world coordinate (on the up-axis).
         output_dir: Directory to save rendered images.
         element_class: Element type for VLM prompt (e.g. "door").
-        ollama_model: Ollama model name.
+        vlm_api_base: OpenAI-compatible API base URL (e.g. ``https://api.openai.com/v1``).
+        vlm_model: VLM model name (e.g. ``gpt-4o``, ``glm-4v``, ``gemma4:12b``).
+        vlm_api_key: API key (empty for local Ollama).
+        vlm_timeout: Per-request timeout in seconds.
         up_axis: Which world axis is vertical (0=x, 1=y, 2=z).
         skip_vlm: If True, only render images without VLM queries.
 
@@ -307,7 +356,9 @@ def verify_candidates(
         if skip_vlm:
             return idx, "", None
         try:
-            vlm_text = query_ollama(path, prompt, ollama_model, ollama_host, ollama_port)
+            vlm_text = query_vlm(
+                path, prompt, vlm_api_base, vlm_model, vlm_api_key, vlm_timeout
+            )
             confirmed, _ = _parse_vlm_response(vlm_text)
             return idx, vlm_text, confirmed
         except Exception as e:
