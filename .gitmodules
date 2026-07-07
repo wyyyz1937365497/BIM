@@ -7,3 +7,6 @@
 [submodule "SceneSplat"]
 	path = SceneSplat
 	url = https://github.com/wyyyz1937365497/SceneSplat.git
+[submodule "TRELLIS"]
+	path = TRELLIS
+	url = https://github.com/microsoft/TRELLIS.git
