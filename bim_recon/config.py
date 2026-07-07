@@ -31,11 +31,22 @@ class RevitMCPConfig:
 
 
 @dataclass(frozen=True)
+class TrellisConfig:
+    """TRELLIS mesh generation HTTP server config."""
+
+    host: str = "127.0.0.1"
+    port: int = 8391
+    model: str = "microsoft/TRELLIS-image-large"
+    timeout: int = 1800
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application config."""
     vlm: ModelConfig
     llm: ModelConfig
     revit_mcp: RevitMCPConfig
+    trellis: TrellisConfig
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -52,11 +63,12 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     vlm_raw = raw.get("vlm", {})
     llm_raw = raw.get("llm", {})
     mcp_raw = raw.get("revit_mcp", {})
+    trellis_raw = raw.get("trellis", {})
 
     return AppConfig(
         vlm=ModelConfig(
             provider=vlm_raw.get("provider", "ollama"),
-            api_base=vlm_raw.get("api_base", "http://127.0.0.1:11434"),
+            api_base=vlm_raw.get("api_base", "http://127.0.0.1:11434/v1"),
             model=vlm_raw.get("model", "gemma4:12b"),
             api_key=vlm_raw.get("api_key", ""),
         ),
@@ -69,6 +81,12 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         revit_mcp=RevitMCPConfig(
             command=mcp_raw.get("command", "node"),
             args=mcp_raw.get("args", []),
+        ),
+        trellis=TrellisConfig(
+            host=trellis_raw.get("host", "127.0.0.1"),
+            port=trellis_raw.get("port", 8391),
+            model=trellis_raw.get("model", "microsoft/TRELLIS-image-large"),
+            timeout=trellis_raw.get("timeout", 1800),
         ),
     )
 
@@ -107,6 +125,12 @@ def save_config(config: AppConfig) -> None:
             "command": config.revit_mcp.command,
             "args": config.revit_mcp.args,
         },
+        "trellis": {
+            "host": config.trellis.host,
+            "port": config.trellis.port,
+            "model": config.trellis.model,
+            "timeout": config.trellis.timeout,
+        },
     }
     _CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 
@@ -125,3 +149,42 @@ def test_llm_connection(api_base: str, api_key: str, model: str) -> str:
         return f"✅ 连接成功，模型回复: {reply.strip()[:30]}"
     except Exception as e:
         return f"❌ 连接失败: {e}"
+
+
+def test_vlm_connection(api_base: str, api_key: str, model: str) -> str:
+    """Test VLM connectivity with a tiny image. Returns status string.
+
+    Sends a 1x1 white pixel to verify the endpoint accepts vision input.
+    """
+    try:
+        import base64
+        from io import BytesIO
+        from openai import OpenAI
+
+        # 1x1 white PNG
+        from PIL import Image
+        buf = BytesIO()
+        Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        client = OpenAI(base_url=api_base, api_key=api_key or "empty", timeout=30)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What color is this image? Reply in one word."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=10,
+        )
+        reply = resp.choices[0].message.content or ""
+        return f"✅ VLM 连接成功，模型回复: {reply.strip()[:30]}"
+    except Exception as e:
+        return f"❌ VLM 连接失败: {e}"

@@ -1,8 +1,8 @@
 {
   "vlm": {
-    "comment": "VLM 用于管线中的构件验证",
+    "comment": "VLM 用于管线中的构件验证 (OpenAI 兼容接口, 支持 GPT-4o/GLM-4V/Qwen-VL/Ollama 等)",
     "provider": "ollama",
-    "api_base": "http://127.0.0.1:11434",
+    "api_base": "http://127.0.0.1:11434/v1",
     "model": "gemma4:12b",
     "api_key": ""
   },
@@ -17,5 +17,12 @@
     "comment": "Revit MCP Server (stdio transport)",
     "command": "node",
     "args": ["G:/TJ/BIM/mcp-servers-for-revit/server/build/index.js"]
+  },
+  "trellis": {
+    "comment": "TRELLIS B类复杂构件 mesh 生成服务 (conda env: trellis)",
+    "host": "127.0.0.1",
+    "port": 8391,
+    "model": "microsoft/TRELLIS-image-large",
+    "timeout": 1800
   }
 }
