@@ -685,14 +685,21 @@ def main() -> int:
                     "confirmed": r.get("confirmed"),
                 }
 
-        # Collect VLM-verified images
+        # Collect VLM-verified images — only for B-class elements per config
+        routing = app_config.element_routing
+        b_class_types = set(routing.b_class_types())
         vlm_images: list[tuple[str, str]] = []
         for elem_type, result in all_results.items():
+            if elem_type not in b_class_types:
+                continue
             verify_subdir = trellis_dir.parent / f"verify_{elem_type}"
             if not verify_subdir.exists():
                 continue
             for img_file in sorted(verify_subdir.glob("*.png")):
                 vlm_images.append((elem_type, str(img_file)))
+
+        print(f"  B-class types ({', '.join(sorted(b_class_types)) or 'none'}): "
+              f"{len(vlm_images)} images to process")
 
         if vlm_images:
             print(f"  Found {len(vlm_images)} VLM images to process")

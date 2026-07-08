@@ -41,12 +41,45 @@ class TrellisConfig:
 
 
 @dataclass(frozen=True)
+class ElementRoutingConfig:
+    """A/B class routing per element type.
+
+    "A" → parametric Revit elements (Wall/Door/Window via MCP tools)
+    "B" → TRELLIS mesh generation + DirectShape insertion
+    """
+
+    routing: dict[str, str] = field(default_factory=lambda: {
+        "door": "A",
+        "window": "A",
+        "column": "A",
+        "furniture": "B",
+    })
+
+    def get_route(self, element_type: str) -> str:
+        """Return 'A' or 'B' for the given element type. Defaults to 'A'."""
+        return self.routing.get(element_type, "A")
+
+    def is_b_class(self, element_type: str) -> bool:
+        """Return True if this element type should use TRELLIS mesh route."""
+        return self.get_route(element_type) == "B"
+
+    def b_class_types(self) -> list[str]:
+        """Return all element types routed to B-class."""
+        return sorted(k for k, v in self.routing.items() if v == "B")
+
+    def a_class_types(self) -> list[str]:
+        """Return all element types routed to A-class."""
+        return sorted(k for k, v in self.routing.items() if v == "A")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application config."""
     vlm: ModelConfig
     llm: ModelConfig
     revit_mcp: RevitMCPConfig
     trellis: TrellisConfig
+    element_routing: ElementRoutingConfig = field(default_factory=ElementRoutingConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -64,6 +97,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     llm_raw = raw.get("llm", {})
     mcp_raw = raw.get("revit_mcp", {})
     trellis_raw = raw.get("trellis", {})
+    routing_raw = raw.get("element_routing", {})
 
     return AppConfig(
         vlm=ModelConfig(
@@ -87,6 +121,9 @@ def load_config(path: Path | str | None = None) -> AppConfig:
             port=trellis_raw.get("port", 8391),
             model=trellis_raw.get("model", "microsoft/TRELLIS-image-large"),
             timeout=trellis_raw.get("timeout", 1800),
+        ),
+        element_routing=ElementRoutingConfig(
+            routing=routing_raw if routing_raw else ElementRoutingConfig().routing,
         ),
     )
 
@@ -131,6 +168,7 @@ def save_config(config: AppConfig) -> None:
             "model": config.trellis.model,
             "timeout": config.trellis.timeout,
         },
+        "element_routing": dict(config.element_routing.routing),
     }
     _CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 

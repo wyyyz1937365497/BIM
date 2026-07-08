@@ -24,5 +24,12 @@
     "port": 8391,
     "model": "microsoft/TRELLIS-image-large",
     "timeout": 1800
+  },
+  "element_routing": {
+    "comment": "A=参数化Revit图元(Wall/Door/Window), B=TRELLIS mesh+DirectShape",
+    "door": "A",
+    "window": "A",
+    "column": "A",
+    "furniture": "B"
   }
 }
