@@ -384,7 +384,11 @@ ender_from_pose：gsplat 渲染 RGB+深度
 
 > ⚠️ **已弃用 IFC 路线**：下方原 IfcBuildingElementProxy / IfcShellBasedSurfaceModel 描述为历史记录。pyRevit 架构下，B 类 mesh 用 `doc.Create.NewDirectShape(...)`（Revit DirectShape 承载任意 mesh，原生可见但不可参数化编辑）；A 类用 `Wall.Create`/`Floor.Create` 等原生 API。
 
-**流程**：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → Revit **DirectShape**（via pyRevit）。
+**当前状态（2026-07-08）**：TRELLIS mesh 生成 + 坐标变换 + DirectShape 插入已实现（见 §12.15）。剩余工作：多视角配准精修、精度评估。
+
+**已完成流程**：VLM 验证候选 → TRELLIS 生成 GLB → `mesh_registrar` 坐标变换（轴重映射 + 缩放 + 平移）→ `send_code_to_revit` DirectShape（TessellatedShapeBuilder）→ Revit 原生可见图元。
+
+**原计划流程**（部分已实现）：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → Revit **DirectShape**。
 
 **IFC 版本与 mesh 表达策略（关键）**：项目标准为 **IFC4**（见 §2.3），B 类 mesh 直接用原生 `IfcTriangulatedFaceSet` + `IfcCartesianPointList3D`，代码简洁、文件紧凑。
 
@@ -988,9 +992,9 @@ class FloorPlanProvider:
 | **P2.5** | Gradio Web UI（单页界面 + Mask 编辑 + 相机捕获 + 视角重分割） | ✅ 已完成 | 100% |
 | **P2.6** | AI Agent（smolagents + Revit MCP + 管线上下文注入） | ✅ 已完成 | 100% |
 | **~~P3~~** | ~~LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真）~~ | ✅ **已被取代** | 100% |
-| **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 20% |
+| **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 40% |
 
-**总体完成度：约 90%**（P0-P2.6 + P3 全部完成，P4 部分完成）
+**总体完成度：约 93%**（P0-P2.6 + P3 全部完成，P4 B类mesh已完成，剩余精度报告/多房间/Demo）
 
 > **P3 已被 P1 取代**：原计划的物理 LiDAR（ROS2 `/scan` → split-and-merge 墙线）已被 §12.8 的**虚拟激光扫描器**（`bim_recon/virtual_scanner.py`）完全取代——从 3DGS 深度渲染模拟 2D 激光扫描，多高度 × 多视角拼接 360° 极坐标扫描，每个扫描点携带 feat.pt 语义标签。无需任何物理硬件，且语义信息更丰富（真实 LiDAR 只有距离，无语义）。原 P3 的 gsplat 旋转 LiDAR 光栅化也已通过 gsplat 深度渲染实现。
 
@@ -1129,6 +1133,79 @@ height = point[up_axis]
 ```
 
 **已验证**：`scripts/test_agent.py` — say_hello + get_current_view_info 两个工具调用成功（26 工具加载，glm-5.1 模型）。
+
+---
+
+### 12.15 [2026-07-08] TRELLIS B类构件 Mesh 生成 + 坐标变换 + Revit DirectShape
+
+#### 架构：跨环境 HTTP 桥接（与 Falcon 相同模式）
+
+```
+trellis 环境 (torch 2.4 + xformers)          bim-recon 环境 (gsplat, torch 2.7)
+  TRELLIS/trellis submodule                    bim_recon/trellis_client.py
+  trellis_server/server.py  ← FastAPI 8391 →        ↕ HTTP
+    TrellisImageTo3DPipeline                       bim_recon/mesh_registrar.py
+    POST /generate → GLB + PLY                      compute_placement_transform()
+                                                    register_mesh_in_revit()
+                                                         ↓ send_code_to_revit
+                                                    revit_scripts/create_directshape_from_mesh.cs
+```
+
+**三环境不可合并**：bim-recon (gsplat, torch 2.7) vs transformerv (falcon_perception, torch 2.11) vs trellis (TRELLIS mesh生成, torch 2.4)。
+
+#### TRELLIS 服务端（`trellis_server/server.py`）
+
+- **不在子模块内**：放在主仓库 `trellis_server/` 目录（避免 `git submodule update` 丢失）
+- **Windows 兼容**：`ATTN_BACKEND=xformers`（flash-attn 不可用于 Windows）+ `SPCONV_ALGO=native`
+- **xformers patch**：`trellis_server/xformers_windows.patch` + `scripts/launch_trellis_server.bat` 自动 `git apply`
+- **错误处理**：`pipeline.run()` 和 GLB export 都有 try/except + traceback + HTTPException(500)
+- **首次依赖安装**：`pip install -r trellis_server/requirements.txt`（fastapi/uvicorn/pydantic/Pillow）
+
+#### 坐标变换（`bim_recon/mesh_registrar.py`）
+
+**问题**：TRELLIS 输出的 GLB 在归一化包围盒（[-1,1]，Y 轴朝上）中，需要变换到 3DGS 场景坐标系（米制，Z 轴朝上或自定义 up_axis）。
+
+**三步变换**：
+1. **轴重映射旋转**：TRELLIS Y-up → 3DGS up_axis。旋转矩阵 det=1（正旋转，无镜像）。Z-up 映射：mesh Y→world Z，mesh Z→world -Y。
+2. **均匀缩放**：将 mesh 最大水平维度匹配到检测到的物理宽度 `element_width_m`。如果缩放后高度超过房间高度 `ceiling_z - floor_z`，进一步缩小。
+3. **平移**：将 mesh 质心放置在候选位置 `(world_x, world_y)`，底面在 `floor_z`。
+
+**GLB 解析**：优先使用 `trimesh.load(force='mesh')`，回退到最小二进制 glTF 解析器（直接解析 JSON chunk + BIN chunk 中的 POSITION/INDICES accessor）。
+
+**测试**：15 个单元测试覆盖旋转正交性、det=1、缩放拟合、平移位置、天花板钳制、GLB 解析、payload 格式。
+
+#### Revit DirectShape 插入
+
+**C# 脚本**（`revit_scripts/create_directshape_from_mesh.cs`）：
+- 接收 JSON payload（顶点 feet + 三角面索引 + 名称 + 类别）
+- `TessellatedShapeBuilder` 从原始三角形构建 mesh
+- `DirectShapeType` + `DirectShape` 创建（OST_GenericModel 或自定义类别）
+- **无 `using` 指令**：模板在命名空间级注入，方法体内 `using` 会导致编译错误
+
+**Python 调用**（`register_mesh_in_revit`）：
+- 接受可选 `runner` 参数（`RevitScriptRunner`）
+- `runner` 有 MCP sender → 立即调用 `runner.run("create_directshape_from_mesh")`
+- `runner=None` → 返回格式化 JSON payload 供手动派发
+
+#### 管线集成（`run_pipeline.py` Stage 5c）
+
+- 构建 `candidate_lookup`：从检测结果中提取每个候选的 `world_x`/`world_y`/`width_m`/`height_m`
+- 匹配 VLM 图像文件名到候选坐标
+- 对每个生成的 GLB：`MeshPlacement` → `compute_placement_transform` → `register_mesh_in_revit`
+- 结果写入 `pipeline_report.json` 的 `trellis.results` 字段
+
+#### CLI 参数
+
+```bash
+# 完整管线（含 TRELLIS mesh）
+python scripts/run_pipeline.py --name room0 --elements door window furniture
+
+# 跳过 TRELLIS
+python scripts/run_pipeline.py --name room0 --no-trellis
+
+# 单独生成 mesh
+python scripts/generate_trellis_mesh.py --image chair.png --output-dir output/meshes/
+```
 
 ---
 
