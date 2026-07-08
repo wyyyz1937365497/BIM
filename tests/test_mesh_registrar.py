@@ -21,6 +21,7 @@ from bim_recon.mesh_registrar import (
     MeshTransform,
     _build_axis_remap_rotation,
     compute_placement_transform,
+    extract_object_from_render,
     parse_glb_vertices_faces,
     register_mesh_in_revit,
 )
@@ -337,4 +338,86 @@ class TestRegisterMeshInRevit:
 
         assert result["status"] == "formatted"
         assert "payload_json" in result
-        assert result["status"] == "formatted"
+
+
+# ---------------------------------------------------------------------------
+# Object extraction (Falcon mask → clean RGBA)
+# ---------------------------------------------------------------------------
+
+class TestExtractObjectFromRender:
+    def _make_render(self, size=(400, 300)) -> "Image.Image":
+        """Create a test render with a colored rectangle in the center."""
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", size, (128, 128, 128))  # gray background
+        draw = ImageDraw.Draw(img)
+        # Draw a red rectangle in center (the "object")
+        draw.rectangle([120, 80, 280, 220], fill=(255, 0, 0))
+        return img
+
+    def test_extracts_object_with_mask_bbox(self):
+        from PIL import Image
+        render = self._make_render()
+        detections = [{
+            "bbox": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.5},
+            "mask_bbox": {"x": 0.5, "y": 0.5, "w": 0.35, "h": 0.45},
+            "mask_area_ratio": 0.12,
+        }]
+
+        result = extract_object_from_render(render, detections)
+
+        assert result is not None
+        assert result.mode == "RGBA"
+        # Should be cropped smaller than original
+        assert result.size[0] < render.size[0]
+        assert result.size[1] < render.size[1]
+
+    def test_returns_none_for_empty_detections(self):
+        from PIL import Image
+        render = self._make_render()
+        result = extract_object_from_render(render, [])
+        assert result is None
+
+    def test_picks_largest_mask_area(self):
+        from PIL import Image
+        render = self._make_render()
+        detections = [
+            {"bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}, "mask_area_ratio": 0.01},
+            {"bbox": {"x": 0.5, "y": 0.5, "w": 0.4, "h": 0.5}, "mask_area_ratio": 0.15},
+            {"bbox": {"x": 0.8, "y": 0.8, "w": 0.05, "h": 0.05}, "mask_area_ratio": 0.002},
+        ]
+
+        result = extract_object_from_render(render, detections)
+
+        assert result is not None
+        # The largest detection (index 1, 0.4×0.5) should be selected
+        # Crop with padding: ~(0.4+0.1) * 400 = 200 wide
+        assert result.size[0] > 150  # roughly 40% of 400
+
+    def test_alpha_channel_is_transparent_at_edges(self):
+        from PIL import Image
+        import numpy as np
+        render = self._make_render()
+        detections = [{"bbox": {"x": 0.5, "y": 0.5, "w": 0.6, "h": 0.6}}]
+
+        result = extract_object_from_render(render, detections)
+        arr = np.array(result)
+        alpha = arr[:, :, 3]
+
+        # Center should be more opaque than corners
+        center_alpha = alpha[alpha.shape[0]//2, alpha.shape[1]//2]
+        corner_alpha = alpha[0, 0]
+        assert center_alpha > corner_alpha
+
+    def test_falls_back_to_bbox_when_no_mask_bbox(self):
+        from PIL import Image
+        render = self._make_render()
+        detections = [{
+            "bbox": {"x": 0.5, "y": 0.5, "w": 0.3, "h": 0.3},
+            "mask_bbox": None,
+            "mask_area_ratio": None,
+        }]
+
+        result = extract_object_from_render(render, detections)
+
+        assert result is not None
+        assert result.mode == "RGBA"

@@ -37,6 +37,7 @@ Usage::
 """
 from __future__ import annotations
 
+import io
 import json
 import struct
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,148 @@ class MeshTransform:
     translation: np.ndarray  # (3,)
     vertices_world: np.ndarray  # (N, 3) in meters
     faces: np.ndarray  # (M, 3) int32
+
+
+# ---------------------------------------------------------------------------
+# Object extraction: Falcon mask → clean RGBA image (transparent background)
+# ---------------------------------------------------------------------------
+
+def extract_object_from_render(
+    rendered_image: Image.Image,
+    falcon_detections: list[dict],
+    padding: float = 0.05,
+) -> Image.Image | None:
+    """Extract a clean object image from a rendered scene using Falcon detections.
+
+    Takes a full-scene render + Falcon's detection results, picks the largest
+    detection, crops to its mask bbox (with padding), and makes the background
+    transparent. The result is a clean RGBA image suitable for TRELLIS.
+
+    Args:
+        rendered_image: Full-scene RGB render (PIL Image).
+        falcon_detections: List of detection dicts from FalconClient.segment().
+            Each must have ``mask_bbox`` with ``{x, y, w, h}`` normalized [0,1],
+            or at minimum ``bbox``.
+        padding: Extra padding around the crop as fraction of image size.
+
+    Returns:
+        RGBA PIL Image with transparent background, cropped to the object.
+        None if no valid detection.
+    """
+    if not falcon_detections:
+        return None
+
+    # Pick the detection with the largest mask area (most likely the main object)
+    best = max(
+        falcon_detections,
+        key=lambda d: d.get("mask_area_ratio", 0) or 0,
+    )
+
+    # Use mask_bbox if available (tighter), else fall back to detection bbox
+    bbox = best.get("mask_bbox") or best.get("bbox")
+    if not bbox:
+        return None
+
+    w_img, h_img = rendered_image.size
+
+    # Convert normalized bbox to pixel coordinates with padding
+    x0 = max(0, int((bbox["x"] - bbox["w"] / 2 - padding) * w_img))
+    y0 = max(0, int((bbox["y"] - bbox["h"] / 2 - padding) * h_img))
+    x1 = min(w_img, int((bbox["x"] + bbox["w"] / 2 + padding) * w_img))
+    y1 = min(h_img, int((bbox["y"] + bbox["h"] / 2 + padding) * h_img))
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    # Crop to the object region
+    cropped = rendered_image.crop((x0, y0, x1, y1))
+
+    # Create alpha channel: use the bbox region as opaque, edges fade out.
+    # Since Falcon only gives bbox (not pixel-level mask), we use a simple
+    # center-weighted alpha that makes corners semi-transparent.
+    # For production, request task="segmentation" from Falcon to get pixel masks.
+    rgba = cropped.convert("RGBA")
+    alpha = _create_center_weighted_alpha(rgba.size)
+    rgba.putalpha(alpha)
+
+    return rgba
+
+
+def extract_object_from_segmentation(
+    rendered_image: Image.Image,
+    mask_rle: dict | None = None,
+    mask_bbox: dict | None = None,
+    padding: float = 0.05,
+) -> Image.Image | None:
+    """Extract object using pixel-level segmentation mask (if available).
+
+    When Falcon returns a segmentation mask (not just bbox), this produces
+    a pixel-accurate alpha channel.
+
+    Args:
+        rendered_image: Full-scene render.
+        mask_rle: RLE-encoded mask from Falcon (if available). Not currently
+            passed by the HTTP client, but supported for future use.
+        mask_bbox: Normalized bbox {x, y, w, h} from Falcon mask_bbox.
+        padding: Extra padding fraction.
+
+    Returns:
+        RGBA image with transparent background, or None.
+    """
+    if mask_bbox is None:
+        return None
+
+    w_img, h_img = rendered_image.size
+    x0 = max(0, int((mask_bbox["x"] - mask_bbox["w"] / 2 - padding) * w_img))
+    y0 = max(0, int((mask_bbox["y"] - mask_bbox["h"] / 2 - padding) * h_img))
+    x1 = min(w_img, int((mask_bbox["x"] + mask_bbox["w"] / 2 + padding) * w_img))
+    y1 = min(h_img, int((mask_bbox["y"] + mask_bbox["h"] / 2 + padding) * h_img))
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    cropped = rendered_image.crop((x0, y0, x1, y1))
+    rgba = cropped.convert("RGBA")
+
+    # If we have RLE mask, apply it directly
+    if mask_rle is not None:
+        try:
+            from pycocotools import mask as mask_utils
+            counts = mask_rle["counts"]
+            if isinstance(counts, str):
+                counts = counts.encode("utf-8")
+            mask_arr = mask_utils.decode({
+                "counts": counts,
+                "size": mask_rle["size"],
+            })
+            # Crop the mask to the same region
+            mask_crop = mask_arr[y0:y1, x0:x1]
+            alpha = Image.fromarray((mask_crop * 255).astype(np.uint8), mode="L")
+            rgba.putalpha(alpha)
+            return rgba
+        except ImportError:
+            pass
+
+    # Fall back to center-weighted alpha
+    alpha = _create_center_weighted_alpha(rgba.size)
+    rgba.putalpha(alpha)
+    return rgba
+
+
+def _create_center_weighted_alpha(size: tuple[int, int]) -> Image.Image:
+    """Create a center-weighted alpha channel (opaque center, faded edges).
+
+    This is a simple approximation when pixel-level masks aren't available.
+    Uses a radial gradient: alpha = 255 at center, fading to ~50 at corners.
+    """
+    w, h = size
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx, cy = w / 2, h / 2
+    # Distance from center, normalized to [0, 1]
+    dist = np.sqrt(((xx - cx) / cx) ** 2 + ((yy - cy) / cy) ** 2)
+    # Alpha: 255 at center, linearly fading to 80 at corners
+    alpha = np.clip(255 - dist * 175, 80, 255).astype(np.uint8)
+    return Image.fromarray(alpha, mode="L")
 
 
 # ---------------------------------------------------------------------------

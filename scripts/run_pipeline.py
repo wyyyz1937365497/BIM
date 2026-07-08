@@ -51,6 +51,7 @@ from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 from bim_recon.mesh_registrar import (
     MeshPlacement,
     compute_placement_transform,
+    extract_object_from_render,
     register_mesh_in_revit,
 )
 from bim_recon.virtual_scanner import VirtualScanner
@@ -702,12 +703,31 @@ def main() -> int:
               f"{len(vlm_images)} images to process")
 
         if vlm_images:
-            print(f"  Found {len(vlm_images)} VLM images to process")
             for elem_type, img_path in vlm_images:
                 img_stem = Path(img_path).stem
                 try:
+                    # Step 1: Load the VLM render and use Falcon to extract clean object
+                    clean_image_path = Path(img_path)
+                    if falcon is not None:
+                        from PIL import Image as PILImage
+                        render = PILImage.open(img_path).convert("RGB")
+                        query_text = elem_type  # "furniture", "door", etc.
+                        detections = falcon.segment(render, query_text, task="segmentation")
+                        det_dicts = [
+                            {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
+                            for d in detections
+                        ]
+                        clean = extract_object_from_render(render, det_dicts)
+                        if clean is not None:
+                            clean_image_path = trellis_dir / f"{img_stem}_clean.png"
+                            clean.save(str(clean_image_path))
+                            print(f"  📌 {img_stem}: Falcon masked → {clean.size}")
+                        else:
+                            print(f"  ⚠ {img_stem}: Falcon returned no mask, using raw image")
+
+                    # Step 2: Send clean image to TRELLIS
                     mesh_result = trellis.generate_mesh(TrellisMeshRequest(
-                        image_path=Path(img_path),
+                        image_path=clean_image_path,
                         output_dir=trellis_dir,
                         name=f"{elem_type}_{img_stem}",
                     ))

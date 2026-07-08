@@ -1142,20 +1142,37 @@ def build_app() -> gr.Blocks:
             )
             agent_send = gr.Button("发送", variant="primary", scale=1)
 
-        # ====== ⑤b B类构件 Mesh 生成（TRELLIS） ======
+        # ====== ⑤b B类构件 Mesh 生成（TRELLIS + Falcon 抠图） ======
         gr.Markdown("---\n## ⑤b B类构件 Mesh 生成（TRELLIS）")
         gr.Markdown(
-            "上传或选择构件图像，通过 TRELLIS HTTP 服务生成 GLB mesh。"
-            "需先启动 TRELLIS 服务（`scripts/launch_trellis_server.bat`）。"
+            "**方式一（自动）**：上传已抠好的物体图片 → 生成 Mesh\n"
+            "**方式二（手动）**：在 ⑥ 查看器中选好视角 → 捕获 → 输入物体描述 → Falcon 抠图 → 生成 Mesh\n"
+            "需先启动 TRELLIS 服务。Falcon 抠图需 Falcon 服务在线。"
         )
-        trellis_input_image = gr.Image(
-            label="输入图像", type="filepath", height=300,
-        )
-        with gr.Row():
-            trellis_name = gr.Textbox(label="输出名称", value="b_class_mesh", scale=2)
-            trellis_seed = gr.Number(label="种子", value=1, precision=0, scale=1)
-            trellis_gen_btn = gr.Button("🔲 生成 Mesh", variant="primary", scale=1)
-        trellis_output = gr.JSON(label="生成结果")
+        with gr.Tab("自动上传"):
+            trellis_input_image = gr.Image(
+                label="物体图片（建议透明/白背景）", type="filepath", height=300,
+            )
+            with gr.Row():
+                trellis_name = gr.Textbox(label="输出名称", value="b_class_mesh", scale=2)
+                trellis_seed = gr.Number(label="种子", value=1, precision=0, scale=1)
+                trellis_gen_btn = gr.Button("🔲 生成 Mesh", variant="primary", scale=1)
+            trellis_output = gr.JSON(label="生成结果")
+
+        with gr.Tab("视角+Falcon 抠图"):
+            gr.Markdown("**步骤**: ① 启动下方查看器 → ② 漫游到目标物体 → ③ 捕获视角 → ④ 输入物体名称 → ⑤ 一键抠图+生成")
+            trellis_falcon_query = gr.Textbox(
+                label="Falcon 搜索词（如: chair / sofa / table / pipe）",
+                placeholder="输入英文物体名称...",
+                scale=2,
+            )
+            trellis_cam_btn = gr.Button("📸 捕获视角", variant="secondary", scale=1)
+            trellis_cam_status = gr.Markdown("（需先启动查看器）")
+            trellis_falcon_gen_btn = gr.Button(
+                "🎯 Falcon 抠图 + 生成 Mesh", variant="primary",
+            )
+            trellis_falcon_preview = gr.Image(label="Falcon 抠图预览", height=300)
+            trellis_falcon_output = gr.JSON(label="生成结果")
 
         # ====== ⑥ 3D 查看器（底部） ======
         gr.Markdown("---\n## ⑥ 3D 查看器")
@@ -1485,6 +1502,103 @@ def build_app() -> gr.Blocks:
             fn=_on_trellis_generate,
             inputs=[trellis_input_image, trellis_name, trellis_seed],
             outputs=trellis_output,
+        )
+
+        # --- TRELLIS 手动流程：视角 + Falcon 抠图 ---
+        _trellis_cam_data: dict = {}
+
+        def _on_trellis_cam():
+            status, data = fetch_camera_state()
+            if data:
+                _trellis_cam_data.clear()
+                _trellis_cam_data.update(data)
+            return status
+
+        trellis_cam_btn.click(fn=_on_trellis_cam, outputs=trellis_cam_status)
+
+        def _on_trellis_falcon_gen(query: str, scene_name: str):
+            """手动流程：捕获视角 → 渲染 → Falcon 分割 → 抠图 → TRELLIS 生成。"""
+            if not query.strip():
+                return None, {"错误": "请输入物体搜索词"}
+            if not _trellis_cam_data:
+                return None, {"错误": "请先点击「捕获视角」"}
+            if not scene_name:
+                return None, {"错误": "请先选择场景"}
+
+            from bim_recon.config import load_config as _lc
+            from bim_recon.falcon_client import FalconClient
+            from bim_recon.mesh_registrar import extract_object_from_render
+            from bim_recon.gs_scene import look_at_pose
+            from PIL import Image as PILImage
+
+            # 1. 获取场景（从缓存或加载）
+            scene = _get_scene(scene_name)
+            if scene is None:
+                return None, {"错误": f"无法加载场景 {scene_name}"}
+
+            # 2. 从相机状态渲染
+            cam = _trellis_cam_data
+            eye = cam.get("position", [0, 0, 0])
+            target = cam.get("look_at", [0, 0, 1])
+            fov = cam.get("fov_degrees", 60)
+            up = cam.get("up", [0, 0, 1])
+            pose = look_at_pose(
+                (eye[0], eye[1], eye[2]),
+                (target[0], target[1], target[2]),
+                up=(up[0], up[1], up[2]),
+            )
+            render_result = scene.render(pose, width=800, height=600, fov_degrees=fov)
+            render_img = PILImage.fromarray(
+                (render_result.colors * 255).clip(0, 255).astype(np.uint8)
+            )
+
+            # 3. Falcon 分割
+            cfg = _lc()
+            falcon = FalconClient()
+            if not falcon.health():
+                return render_img, {"错误": "Falcon 服务不可达，请先启动 falcon_inference_server.py"}
+            detections = falcon.segment(render_img, query.strip(), task="segmentation")
+            if not detections:
+                return render_img, {"错误": f"Falcon 未找到 '{query}'，尝试更换搜索词"}
+
+            # 4. 抠图
+            det_dicts = [
+                {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
+                for d in detections
+            ]
+            clean = extract_object_from_render(render_img, det_dicts)
+            if clean is None:
+                return render_img, {"错误": "抠图失败"}
+
+            # 5. TRELLIS 生成 mesh
+            trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
+            if not trellis.health():
+                return clean, {"错误": "TRELLIS 服务不可达"}
+
+            out_dir = ROOT / "output" / scene_name / "_trellis_meshes"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            clean_path = out_dir / f"{query}_clean.png"
+            clean.save(str(clean_path))
+
+            try:
+                result = trellis.generate_mesh(TrellisMeshRequest(
+                    image_path=clean_path,
+                    output_dir=out_dir,
+                    name=f"{query}_{int(time.time())}",
+                ))
+                return clean, {
+                    "状态": "✅ 抠图+生成成功",
+                    "GLB": str(result.glb_path),
+                    "PLY": str(result.gaussian_path) if result.gaussian_path else None,
+                    "Falcon 检测数": len(detections),
+                }
+            except Exception as e:
+                return clean, {"错误": f"TRELLIS 生成失败: {e}"}
+
+        trellis_falcon_gen_btn.click(
+            fn=_on_trellis_falcon_gen,
+            inputs=[trellis_falcon_query, scene_state],
+            outputs=[trellis_falcon_preview, trellis_falcon_output],
         )
 
     return app
