@@ -1247,37 +1247,58 @@ def build_app() -> gr.Blocks:
             )
             agent_send = gr.Button("发送", variant="primary", scale=1)
 
-        # ====== ⑤b B类构件 Mesh 生成（TRELLIS + Falcon 抠图） ======
+        # ====== ⑤b B类构件 Mesh 生成（TRELLIS） ======
         gr.Markdown("---\n## ⑤b B类构件 Mesh 生成（TRELLIS）")
         gr.Markdown(
-            "**方式一（自动）**：上传已抠好的物体图片 → 生成 Mesh\n"
-            "**方式二（手动）**：在 ⑥ 查看器中选好视角 → 捕获 → 输入物体描述 → Falcon 抠图 → 生成 Mesh\n"
-            "需先启动 TRELLIS 服务。Falcon 抠图需 Falcon 服务在线。"
+            "B 类构件 = 家具/管道/楼梯等复杂异形件，通过 TRELLIS 生成 3D mesh。\n\n"
+            "**自动候选**：管线运行后自动从语义结果中提取 B 类候选，勾选后一键生成\n"
+            "**手动选取**：在 ⑥ 查看器中漫游到目标 → 捕获渲染 → 手动 mask + 输入物体名 → 生成"
         )
-        with gr.Tab("自动上传"):
-            trellis_input_image = gr.Image(
-                label="物体图片（建议透明/白背景）", type="filepath", height=300,
+
+        # B-class mesh state
+        bmesh_scene_state = gr.State("")  # for rendering
+        bmesh_cam_data = gr.State({})     # captured camera
+
+        with gr.Tab("自动候选（从检测结果）"):
+            gr.Markdown("管线运行后，B 类构件（家具等）的 VLM 验证图会显示在下方。勾选要重建的物体。")
+            bmesh_refresh_btn = gr.Button("🔄 刷新候选列表", variant="secondary")
+            bmesh_candidates_cbs = gr.CheckboxGroup(
+                label="B 类候选（勾选要生成 mesh 的构件）", choices=[], value=[],
+            )
+            bmesh_candidate_gallery = gr.Gallery(
+                label="候选预览", columns=4, height=300,
+                show_label=False, object_fit="contain", preview=True,
             )
             with gr.Row():
-                trellis_name = gr.Textbox(label="输出名称", value="b_class_mesh", scale=2)
-                trellis_seed = gr.Number(label="种子", value=1, precision=0, scale=1)
-                trellis_gen_btn = gr.Button("🔲 生成 Mesh", variant="primary", scale=1)
-            trellis_output = gr.JSON(label="生成结果")
+                bmesh_seed_auto = gr.Number(label="种子", value=1, precision=0, scale=1)
+                bmesh_gen_auto_btn = gr.Button("🔲 生成选中项 Mesh", variant="primary", scale=2)
+            bmesh_auto_output = gr.JSON(label="生成结果")
+            bmesh_auto_status = gr.Markdown("")
 
-        with gr.Tab("视角+Falcon 抠图"):
-            gr.Markdown("**步骤**: ① 启动下方查看器 → ② 漫游到目标物体 → ③ 捕获视角 → ④ 输入物体名称 → ⑤ 一键抠图+生成")
-            trellis_falcon_query = gr.Textbox(
-                label="Falcon 搜索词（如: chair / sofa / table / pipe）",
-                placeholder="输入英文物体名称...",
-                scale=2,
+        with gr.Tab("手动选取（视角 + Mask）"):
+            gr.Markdown(
+                "**步骤**：① 启动 ⑥ 查看器 → ② 漫游到目标物体 → ③ 捕获视角 → ④ 在渲染图上用画笔涂出物体 → ⑤ 输入物体名称 → ⑥ 生成"
             )
-            trellis_cam_btn = gr.Button("📸 捕获视角", variant="secondary", scale=1)
-            trellis_cam_status = gr.Markdown("（需先启动查看器）")
-            trellis_falcon_gen_btn = gr.Button(
-                "🎯 Falcon 抠图 + 生成 Mesh", variant="primary",
+            with gr.Row():
+                bmesh_cam_btn = gr.Button("📸 捕获视角并渲染", variant="secondary", scale=1)
+                bmesh_prompt = gr.Textbox(
+                    label="物体名称（英文，如: chair / lamp / sofa）",
+                    placeholder="输入物体名称...",
+                    scale=2,
+                )
+            bmesh_cam_status = gr.Markdown("（需先启动查看器）")
+            bmesh_mask_editor = gr.ImageMask(
+                label="渲染图（用红色画笔涂出要提取的物体）",
+                type="numpy", height=400,
+                layers=False,
+                brush=gr.Brush(colors=["#FF0000"], default_size=30, color_mode="fixed"),
+                transforms=[], sources=[],
             )
-            trellis_falcon_preview = gr.Image(label="Falcon 抠图预览", height=300)
-            trellis_falcon_output = gr.JSON(label="生成结果")
+            with gr.Row():
+                bmesh_seed_manual = gr.Number(label="种子", value=1, precision=0, scale=1)
+                bmesh_gen_manual_btn = gr.Button("🎯 Mask + 生成 Mesh", variant="primary", scale=2)
+            bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
+            bmesh_manual_output = gr.JSON(label="生成结果")
 
         # ====== ⑥ 3D 查看器（底部） ======
         gr.Markdown("---\n## ⑥ 3D 查看器")
@@ -1604,107 +1625,227 @@ def build_app() -> gr.Blocks:
             except Exception as e:
                 return {"错误": f"生成失败: {e}"}
 
-        trellis_gen_btn.click(
-            fn=_on_trellis_generate,
-            inputs=[trellis_input_image, trellis_name, trellis_seed],
-            outputs=trellis_output,
+        # --- B类 Mesh: 自动候选 Tab ---
+        def _refresh_bmesh_candidates(results, scene_name: str):
+            """从检测结果中提取 B 类候选，返回 checkbox choices + gallery images。"""
+            if not results or not scene_name:
+                return gr.update(choices=[], value=[]), []
+            cfg = load_config()
+            b_types = set(cfg.element_routing.b_class_types())
+            choices = []
+            gallery_imgs = []
+            all_elems = results.doors + results.windows  # includes all element types
+            for e in all_elems:
+                if e.element_class not in b_types:
+                    continue
+                label = f"{e.element_class} #{e.result_index}"
+                choices.append(label)
+                if e.image_path and Path(e.image_path).exists():
+                    gallery_imgs.append((e.image_path, label))
+            return gr.update(choices=choices, value=[]), gallery_imgs
+
+        bmesh_refresh_btn.click(
+            fn=_refresh_bmesh_candidates,
+            inputs=[results_state, scene_state],
+            outputs=[bmesh_candidates_cbs, bmesh_candidate_gallery],
+        )
+        # Also auto-refresh when results load
+        results_state.change(
+            fn=_refresh_bmesh_candidates,
+            inputs=[results_state, scene_state],
+            outputs=[bmesh_candidates_cbs, bmesh_candidate_gallery],
         )
 
-        # --- TRELLIS 手动流程：视角 + Falcon 抠图 ---
-        _trellis_cam_data: dict = {}
+        def _on_bmesh_auto_generate(selected: list, results, scene_name: str, seed: int):
+            """对用户勾选的 B 类候选执行 Falcon 抠图 + TRELLIS 生成。"""
+            if not selected:
+                return {"错误": "请先勾选要生成的构件"}, ""
+            if not results:
+                return {"错误": "无检测结果"}, ""
 
-        def _on_trellis_cam():
-            status, data = fetch_camera_state()
-            if data:
-                _trellis_cam_data.clear()
-                _trellis_cam_data.update(data)
-            return status
+            cfg = load_config()
+            b_types = set(cfg.element_routing.b_class_types())
+            trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
+            if not trellis.health():
+                return {"错误": "TRELLIS 服务不可达"}, ""
 
-        trellis_cam_btn.click(fn=_on_trellis_cam, outputs=trellis_cam_status)
-
-        def _on_trellis_falcon_gen(query: str, scene_name: str):
-            """手动流程：捕获视角 → 渲染 → Falcon 分割 → 抠图 → TRELLIS 生成。"""
-            if not query.strip():
-                return None, {"错误": "请输入物体搜索词"}
-            if not _trellis_cam_data:
-                return None, {"错误": "请先点击「捕获视角」"}
-            if not scene_name:
-                return None, {"错误": "请先选择场景"}
-
-            from bim_recon.config import load_config as _lc
             from bim_recon.falcon_client import FalconClient
             from bim_recon.mesh_registrar import extract_object_from_render
-            from bim_recon.gs_scene import look_at_pose
             from PIL import Image as PILImage
 
-            # 1. 获取场景（从缓存或加载）
+            falcon = FalconClient()
+            falcon_ok = falcon.health()
+
+            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            all_results = []
+
+            for e in (results.doors + results.windows):
+                if e.element_class not in b_types:
+                    continue
+                label = f"{e.element_class} #{e.result_index}"
+                if label not in selected:
+                    continue
+
+                img_path = e.image_path
+                if not img_path or not Path(img_path).exists():
+                    all_results.append({"label": label, "错误": "图片不存在"})
+                    continue
+
+                clean_path = Path(img_path)
+                # Falcon mask
+                if falcon_ok:
+                    render = PILImage.open(img_path).convert("RGB")
+                    detections = falcon.segment(render, e.element_class, task="segmentation")
+                    det_dicts = [
+                        {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
+                        for d in detections
+                    ]
+                    clean = extract_object_from_render(render, det_dicts)
+                    if clean is not None:
+                        clean_path = out_dir / f"{e.element_class}_{e.result_index}_clean.png"
+                        clean.save(str(clean_path))
+
+                try:
+                    result = trellis.generate_mesh(TrellisMeshRequest(
+                        image_path=clean_path,
+                        output_dir=out_dir,
+                        name=f"{e.element_class}_{e.result_index}",
+                        seed=int(seed),
+                    ))
+                    all_results.append({
+                        "label": label,
+                        "状态": "✅",
+                        "GLB": str(result.glb_path),
+                    })
+                except Exception as ex:
+                    all_results.append({"label": label, "错误": str(ex)})
+
+            return {"结果": all_results}, ""
+
+        bmesh_gen_auto_btn.click(
+            fn=_on_bmesh_auto_generate,
+            inputs=[bmesh_candidates_cbs, results_state, scene_state, bmesh_seed_auto],
+            outputs=[bmesh_auto_output, bmesh_auto_status],
+        )
+
+        # --- B类 Mesh: 手动选取 Tab ---
+
+        def _on_bmesh_capture(scene_name: str):
+            """捕获视角 → 渲染 → 加载到 ImageMask。"""
+            if not scene_name:
+                return None, "❌ 请先选择场景"
+            status, cam_data = fetch_camera_state()
+            if not cam_data:
+                return None, status
+
             scene = _get_scene(scene_name)
             if scene is None:
-                return None, {"错误": f"无法加载场景 {scene_name}"}
+                return None, f"❌ 无法加载场景 {scene_name}"
 
-            # 2. 从相机状态渲染
-            cam = _trellis_cam_data
+            cam = cam_data
             eye = cam.get("position", [0, 0, 0])
             target = cam.get("look_at", [0, 0, 1])
             fov = cam.get("fov_degrees", 60)
             up = cam.get("up", [0, 0, 1])
+
+            from bim_recon.gs_scene import look_at_pose
             pose = look_at_pose(
                 (eye[0], eye[1], eye[2]),
                 (target[0], target[1], target[2]),
                 up=(up[0], up[1], up[2]),
             )
             render_result = scene.render(pose, width=800, height=600, fov_degrees=fov)
-            render_img = PILImage.fromarray(
-                (render_result.colors * 255).clip(0, 255).astype(np.uint8)
-            )
+            render_arr = (render_result.colors * 255).clip(0, 255).astype(np.uint8)
 
-            # 3. Falcon 分割
-            cfg = _lc()
-            falcon = FalconClient()
-            if not falcon.health():
-                return render_img, {"错误": "Falcon 服务不可达，请先启动 falcon_inference_server.py"}
-            detections = falcon.segment(render_img, query.strip(), task="segmentation")
-            if not detections:
-                return render_img, {"错误": f"Falcon 未找到 '{query}'，尝试更换搜索词"}
+            return render_arr, f"✅ 渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
 
-            # 4. 抠图
-            det_dicts = [
-                {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
-                for d in detections
-            ]
-            clean = extract_object_from_render(render_img, det_dicts)
-            if clean is None:
-                return render_img, {"错误": "抠图失败"}
+        bmesh_cam_btn.click(
+            fn=_on_bmesh_capture,
+            inputs=[scene_state],
+            outputs=[bmesh_mask_editor, bmesh_cam_status],
+        )
 
-            # 5. TRELLIS 生成 mesh
+        def _on_bmesh_manual_generate(mask_editor_val, prompt: str, scene_name: str, seed: int):
+            """从 ImageMask 提取 mask → 清理背景 → TRELLIS 生成。"""
+            if not prompt.strip():
+                return None, {"错误": "请输入物体名称"}
+            if mask_editor_val is None:
+                return None, {"错误": "请先捕获视角并渲染"}
+
+            layers = (mask_editor_val or {}).get("layers", [])
+            if not layers:
+                return None, {"错误": "请用红色画笔涂出要提取的物体"}
+
+            mask_arr = layers[0]
+            if not isinstance(mask_arr, np.ndarray) or mask_arr.ndim < 3:
+                return None, {"错误": f"Mask 格式异常: {type(mask_arr)}"}
+
+            from PIL import Image as PILImage
+
+            # Extract background image from the editor (composite layer)
+            bg = mask_editor_val.get("background")
+            if bg is not None and isinstance(bg, np.ndarray):
+                base_img = PILImage.fromarray(bg.astype(np.uint8)).convert("RGB")
+            else:
+                # Use the mask array itself (RGBA, background is the composite)
+                base_img = PILImage.fromarray(mask_arr[:, :, :3].astype(np.uint8)).convert("RGB")
+
+            # Alpha channel from mask layer = where user drew
+            alpha = mask_arr[:, :, 3] if mask_arr.shape[2] == 4 else np.zeros(mask_arr.shape[:2])
+            has_mask = alpha > 10
+
+            if not has_mask.any():
+                return None, {"错误": "未检测到绘制内容 — 请在渲染图上涂出物体"}
+
+            # Find tight bbox of mask
+            rows = np.any(has_mask, axis=1)
+            cols = np.any(has_mask, axis=0)
+            rmin, rmax = np.where(rows)[0][[0, -1]]
+            cmin, cmax = np.where(cols)[0][[0, -1]]
+
+            # Crop with padding
+            pad = 20
+            h_img, w_img = base_img.size[1], base_img.size[0]
+            rmin = max(0, rmin - pad)
+            rmax = min(h_img, rmax + pad)
+            cmin = max(0, cmin - pad)
+            cmax = min(w_img, cmax + pad)
+
+            cropped = base_img.crop((cmin, rmin, cmax, rmax))
+            alpha_crop = alpha[rmin:rmax, cmin:cmax]
+            rgba = cropped.convert("RGBA")
+            rgba.putalpha(Image.fromarray(alpha_crop.astype(np.uint8), mode="L"))
+
+            cfg = load_config()
             trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
             if not trellis.health():
-                return clean, {"错误": "TRELLIS 服务不可达"}
+                return rgba, {"错误": "TRELLIS 服务不可达"}
 
-            out_dir = ROOT / "output" / scene_name / "_trellis_meshes"
+            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
             out_dir.mkdir(parents=True, exist_ok=True)
-            clean_path = out_dir / f"{query}_clean.png"
-            clean.save(str(clean_path))
+            clean_path = out_dir / f"{prompt}_{int(time.time())}_clean.png"
+            rgba.save(str(clean_path))
 
             try:
                 result = trellis.generate_mesh(TrellisMeshRequest(
                     image_path=clean_path,
                     output_dir=out_dir,
-                    name=f"{query}_{int(time.time())}",
+                    name=f"{prompt}_{int(time.time())}",
+                    seed=int(seed),
                 ))
-                return clean, {
-                    "状态": "✅ 抠图+生成成功",
+                return rgba, {
+                    "状态": "✅ Mask + 生成成功",
                     "GLB": str(result.glb_path),
                     "PLY": str(result.gaussian_path) if result.gaussian_path else None,
-                    "Falcon 检测数": len(detections),
                 }
             except Exception as e:
-                return clean, {"错误": f"TRELLIS 生成失败: {e}"}
+                return rgba, {"错误": f"TRELLIS 生成失败: {e}"}
 
-        trellis_falcon_gen_btn.click(
-            fn=_on_trellis_falcon_gen,
-            inputs=[trellis_falcon_query, scene_state],
-            outputs=[trellis_falcon_preview, trellis_falcon_output],
+        bmesh_gen_manual_btn.click(
+            fn=_on_bmesh_manual_generate,
+            inputs=[bmesh_mask_editor, bmesh_prompt, scene_state, bmesh_seed_manual],
+            outputs=[bmesh_manual_preview, bmesh_manual_output],
         )
 
     return app
