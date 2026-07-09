@@ -54,6 +54,7 @@ from bim_recon.mesh_registrar import (
     extract_object_from_render,
     register_mesh_in_revit,
 )
+from bim_recon.mesh_readiness import render_and_check_mesh_readiness
 from bim_recon.virtual_scanner import VirtualScanner
 from bim_recon.vlm_verifier import VerificationResult, verify_candidates
 from bim_recon.wall_line_extractor import (
@@ -706,13 +707,47 @@ def main() -> int:
             for elem_type, img_path in vlm_images:
                 img_stem = Path(img_path).stem
                 try:
-                    # Step 1: Load the VLM render and use Falcon to extract clean object
-                    clean_image_path = Path(img_path)
+                    cand = candidate_lookup.get(img_stem)
+
+                    # Step 0: Mesh readiness check — render multi-angle, VLM judges suitability
+                    readiness_dir = trellis_dir / "readiness"
+                    if cand and not args.skip_vlm:
+                        readiness = render_and_check_mesh_readiness(
+                            scene=scene,
+                            world_x=cand["world_x"],
+                            world_y=cand["world_y"],
+                            h_min=cand.get("h_min", 0.0),
+                            h_max=cand.get("h_max", 2.0),
+                            scan_center=center,
+                            floor_z=floor_z,
+                            element_class=elem_type,
+                            vlm_api_base=vlm_api_base,
+                            vlm_model=vlm_model,
+                            vlm_api_key=vlm_api_key,
+                            output_dir=readiness_dir,
+                            name_prefix=img_stem,
+                            up_axis=up_axis,
+                        )
+                        if not readiness.is_ready:
+                            print(f"  ✗ {img_stem}: mesh readiness FAILED — {readiness.reason}")
+                            trellis_results.append({
+                                "element": elem_type,
+                                "source_image": img_path,
+                                "error": f"readiness_failed: {readiness.reason}",
+                            })
+                            continue
+                        print(f"  👁 {img_stem}: readiness OK ({readiness.reason})")
+                        assert readiness.best_image_path is not None
+                        best_image: Path = readiness.best_image_path
+                    else:
+                        best_image = Path(img_path)  # fallback: use VLM verification image
+
+                    # Step 1: Falcon mask → clean object image
+                    clean_image_path: Path = best_image
                     if falcon is not None:
                         from PIL import Image as PILImage
-                        render = PILImage.open(img_path).convert("RGB")
-                        query_text = elem_type  # "furniture", "door", etc.
-                        detections = falcon.segment(render, query_text, task="segmentation")
+                        render = PILImage.open(str(best_image)).convert("RGB")
+                        detections = falcon.segment(render, elem_type, task="segmentation")
                         det_dicts = [
                             {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
                             for d in detections
@@ -727,7 +762,7 @@ def main() -> int:
 
                     # Step 2: Send clean image to TRELLIS
                     mesh_result = trellis.generate_mesh(TrellisMeshRequest(
-                        image_path=clean_image_path,
+                        image_path=Path(clean_image_path),
                         output_dir=trellis_dir,
                         name=f"{elem_type}_{img_stem}",
                     ))
