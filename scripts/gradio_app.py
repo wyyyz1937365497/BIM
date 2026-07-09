@@ -818,6 +818,66 @@ def _check_revit_port() -> bool:
         return False
 
 
+def _format_agent_error(e: Exception) -> str:
+    """Format agent errors into user-friendly Chinese messages.
+
+    Detects common LLM API failure modes (rate limit, auth, network, timeout)
+    and provides actionable guidance instead of raw stack traces.
+    """
+    err_str = str(e)
+    err_type = type(e).__name__
+
+    # OpenAI API errors
+    if "429" in err_str or "RateLimitError" in err_type or "余额不足" in err_str:
+        return (
+            "❌ **API 额度不足 / 请求频率超限**\n\n"
+            "LLM API 返回 429 错误，可能原因：\n"
+            "- 账户余额不足，请充值\n"
+            "- 请求过于频繁，请稍后重试\n"
+            "- 免费额度已用完\n\n"
+            f"原始错误：{err_str[:200]}"
+        )
+
+    if "401" in err_str or "AuthenticationError" in err_type or "无效" in err_str and "key" in err_str.lower():
+        return (
+            "❌ **API 认证失败**\n\n"
+            "API Key 无效或已过期。请在 ⚙️ LLM API 配置 面板中检查：\n"
+            "- API Key 是否正确\n"
+            "- API Base URL 是否正确\n\n"
+            f"原始错误：{err_str[:200]}"
+        )
+
+    if "Connection" in err_type or "ConnectionError" in err_type or "Connect" in err_str:
+        return (
+            "❌ **无法连接到 API 服务**\n\n"
+            "可能原因：\n"
+            "- 网络问题（防火墙 / 代理）\n"
+            "- API Base URL 错误\n"
+            "- 服务暂时不可用\n\n"
+            f"原始错误：{err_str[:200]}"
+        )
+
+    if "Timeout" in err_type or "timeout" in err_str.lower():
+        return (
+            "❌ **API 请求超时**\n\n"
+            "LLM 服务响应时间过长，可能原因：\n"
+            "- 服务端负载高\n"
+            "- 请求过于复杂（对话太长）\n"
+            "- 网络延迟\n\n"
+            f"原始错误：{err_str[:200]}"
+        )
+
+    if "Event loop is closed" in err_str:
+        return (
+            "❌ **MCP 连接断开**\n\n"
+            "Revit MCP 子进程的 asyncio 事件循环已关闭。\n"
+            "请点击「💾 保存配置」重置 Agent 连接后重试。"
+        )
+
+    # Generic fallback
+    return f"❌ **Agent 错误** ({err_type})\n\n{err_str[:500]}"
+
+
 def _get_agent(results: PipelineResults | None, scene_name: str):
     """Lazily create a smolagents ToolCallingAgent with Revit MCP tools."""
     global _AGENT_CACHE, _MCP_CM_CACHE
@@ -1458,7 +1518,8 @@ def build_app() -> gr.Blocks:
                     yield history, ""
 
             except Exception as e:
-                history[-1] = {"role": "assistant", "content": f"❌ Agent 错误: {e}"}
+                error_msg = _format_agent_error(e)
+                history[-1] = {"role": "assistant", "content": error_msg}
                 yield history, ""
 
         agent_send.click(

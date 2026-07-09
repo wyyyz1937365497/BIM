@@ -129,17 +129,22 @@ def load_config(path: Path | str | None = None) -> AppConfig:
 
 
 def get_llm_model(config: AppConfig | None = None):
-    """Create a smolagents model instance from config (OpenAI-compatible API)."""
+    """Create a smolagents model instance from config (OpenAI-compatible API).
+
+    Sets ``max_retries=1`` on the underlying OpenAI client so that rate-limit
+    (429) and auth errors fail fast instead of blocking the UI for minutes
+    during exponential backoff.
+    """
     from smolagents import OpenAIServerModel
 
     cfg = config or load_config()
     m = cfg.llm
 
-    # Always use OpenAIServerModel — works with Ollama (/v1), OpenAI, Azure, etc.
     return OpenAIServerModel(
         model_id=m.model,
         api_base=m.api_base,
         api_key=m.api_key or "empty",
+        max_retries=1,
     )
 
 
