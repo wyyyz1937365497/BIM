@@ -14,7 +14,7 @@ of :mod:`bim_recon.virtual_scanner` and :mod:`bim_recon.wall_line_extractor`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -305,10 +305,29 @@ def prefilter_candidates(
     ]
 
 
-# BIM class index mapping (must match data/0/bim_class_names.json)
-BIM_CLASS_INDICES: Dict[str, int] = {
-    "wall": 0, "floor": 1, "ceiling": 2, "door": 3,
-    "window": 4, "column": 5, "beam": 6, "stairs": 7, "furniture": 8,
-}
+# Open-vocabulary label → index resolution. The active label set is built by
+# the pipeline (structural defaults + element semantic labels) and passed to
+# the VirtualScanner; scan points carry argmax indices into THAT set, so every
+# consumer must resolve a label name to its position in the same set.
+def resolve_class_index(semantic_label: str, labels: Sequence[str]) -> int:
+    """Return the position of *semantic_label* in the active *labels* set.
+
+    Raises ValueError if absent.
+    """
+    if semantic_label not in labels:
+        raise ValueError(
+            f"semantic_label '{semantic_label}' not in active label set {list(labels)}"
+        )
+    return labels.index(semantic_label)
+
+
+# Classic 9-class BIM vocabulary (order matches data/bim_class_names.json).
+# Kept as an EXPLICIT fallback for offline tools that re-plot saved scans
+# (which store integer indices, not label names) — not used by the live
+# open-vocabulary pipeline.
+CLASSIC_BIM_VOCAB: Tuple[str, ...] = (
+    "wall", "floor", "ceiling", "door", "window",
+    "column", "beam", "stairs", "furniture",
+)
 
 BIM_STRUCTURAL_CLASSES = {"door", "window", "column"}

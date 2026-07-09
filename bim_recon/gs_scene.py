@@ -15,7 +15,7 @@ import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -341,33 +341,27 @@ class GSScene:
         text_emb_path: Optional[str | Path] = None,
         class_names_path: Optional[str | Path] = None,
     ) -> None:
-        """Load SceneSplat feat.pt and optionally construct a SemanticQuerier.
+        """Load SceneSplat feat.pt and construct an open-vocabulary querier.
 
-        The raw feat tensor is validated then freed — SemanticQuerier loads its
-        own copy from disk, so keeping it here wastes ~4GB on 1.3M Gaussians.
-        ``self._has_feat`` flag replaces the tensor for downstream gate checks.
+        ``feat.pt`` alone is sufficient for open-vocabulary queries — any text
+        label can be encoded on demand with SigLIP2. ``text_emb_path`` +
+        ``class_names_path`` optionally register a warm-cache vocabulary for
+        fast backward-compatible queries over the classic BIM label set.
         """
         from bim_recon.semantics import SemanticQuerier
 
-        raw = torch.load(feat_path, map_location="cpu", weights_only=False)
-        if not isinstance(raw, torch.Tensor):
-            raise TypeError(f"feat.pt must be a Tensor, got {type(raw).__name__}")
-        if raw.shape[0] != self.num_gaussians:
+        self.semantic_querier = SemanticQuerier(
+            feat_path=feat_path,
+            text_emb_path=text_emb_path,
+            class_names_path=class_names_path,
+            device=str(self.device),
+        )
+        if self.semantic_querier.num_gaussians != self.num_gaussians:
             raise ValueError(
-                f"feat.pt has {raw.shape[0]} rows but the scene has "
+                f"feat.pt has {self.semantic_querier.num_gaussians} rows but the scene has "
                 f"{self.num_gaussians} Gaussians"
             )
-        # Validate shape then free — SemanticQuerier will reload from disk
-        del raw
         self._has_feat = True
-
-        if text_emb_path and class_names_path:
-            self.semantic_querier = SemanticQuerier(
-                feat_path=feat_path,
-                text_emb_path=text_emb_path,
-                class_names_path=class_names_path,
-                device=str(self.device),
-            )
 
     def query_semantics(
         self,
@@ -375,8 +369,12 @@ class GSScene:
         mode: str = "dominant",
         threshold: float = 0.52,
         percent: float = 10.0,
+        label_set: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Query Gaussians matching a semantic text label.
+        """Query Gaussians matching a semantic text label (open-vocabulary).
+
+        Any *text* label is accepted — it is encoded on demand with SigLIP2
+        when not in the registered vocabulary.
 
         ``mode`` selects the query strategy:
 
@@ -387,6 +385,11 @@ class GSScene:
           exceeds *threshold*.
         - ``"top_percent"``: The top *percent* % Gaussians by probability.
 
+        ``label_set`` selects the comparison vocabulary for ``"dominant"``
+        mode — an arbitrary list of text labels argmax'd on demand via
+        SigLIP2 (``None`` → registered vocabulary, or ``{text} ∪ registered``
+        for an open-vocab label). Ignored for the other modes.
+
         Returns a dict with keys from the SemanticQuerier query plus
         ``centroid``, ``bounds_min``, ``bounds_max`` (world-space AABB
         of matching Gaussians).
@@ -396,14 +399,14 @@ class GSScene:
         if self.semantic_querier is None:
             raise RuntimeError(
                 "No semantic features loaded. "
-                "Construct with feat_path/text_emb_path/class_names_path."
+                "Construct with feat_path (warm vocab optional for open-vocab)."
             )
         if mode == "dominant":
-            result = self.semantic_querier.query_dominant(text)
+            result = self.semantic_querier.query_dominant(text, label_set=label_set)
         elif mode == "threshold":
-            result = self.semantic_querier.query(text, threshold)
+            result = self.semantic_querier.query(text, threshold, label_set=label_set)
         elif mode == "top_percent":
-            result = self.semantic_querier.query_top_percent(text, percent)
+            result = self.semantic_querier.query_top_percent(text, percent, label_set=label_set)
         else:
             raise ValueError(f"Unknown mode '{mode}'. Use 'dominant', 'threshold', or 'top_percent'.")
 

@@ -40,6 +40,8 @@ sys.path.insert(0, str(ROOT))
 from bim_recon.candidate_extractor import (
     extract_candidates,
     prefilter_candidates,
+    resolve_class_index,
+    CLASSIC_BIM_VOCAB,
 )
 from bim_recon.config import load_config
 from bim_recon.element_config import ElementConfig, get_element_config, list_element_types
@@ -87,12 +89,14 @@ def find_scene_files(data_dir: Path) -> tuple[Path, Path]:
         )
     feat = feat_candidates[0]
     return ply, feat
+def detect_coordinate_system(scene: GSScene, label_set: list[str] | None = None) -> dict:
+    """Auto-detect up_axis, floor_z, ceiling_z, scan center.
 
-
-def detect_coordinate_system(scene: GSScene) -> dict:
-    """Auto-detect up_axis, floor_z, ceiling_z, scan center."""
-    floor_c = np.array(scene.query_semantics("floor", mode="dominant")["centroid"])
-    ceiling_c = np.array(scene.query_semantics("ceiling", mode="dominant")["centroid"])
+    *label_set* is forwarded to the floor/ceiling dominant queries so the
+    argmax runs over the active open-vocabulary label set.
+    """
+    floor_c = np.array(scene.query_semantics("floor", mode="dominant", label_set=label_set)["centroid"])
+    ceiling_c = np.array(scene.query_semantics("ceiling", mode="dominant", label_set=label_set)["centroid"])
     up_axis = int(np.argmax(np.abs(ceiling_c - floor_c)))
     h_axes = [i for i in range(3) if i != up_axis]
     return {
@@ -112,12 +116,12 @@ def extract_walls(
     scans: list,
     center: np.ndarray,
     out_dir: Path,
+    labels: list[str] | None = None,
 ) -> list[dict]:
     """Extract wall lines from multi-height scan data."""
     wall_lines, wall_pts = extract_wall_lines(
         scans,
-        wall_class_idx=0,
-        exclude_classes=[1, 2, 8],
+        labels=labels,
         center=center,
     )
     # Save raw wall lines
@@ -196,6 +200,7 @@ def detect_elements(
     vlm_api_key: str,
     skip_vlm: bool = False,
     falcon: FalconClient | None = None,
+    labels: list[str] | None = None,
 ) -> dict:
     """Detect elements of one type from scan data + VLM verification.
 
@@ -208,11 +213,16 @@ def detect_elements(
     floor_z = coords["floor_z"]
     up_axis = coords["up_axis"]
 
+    # Resolve the element's open-vocabulary semantic label to an index in the
+    # active label set (falls back to the classic 9-class vocab).
+    active_labels = labels if labels is not None else list(CLASSIC_BIM_VOCAB)
+    class_idx = resolve_class_index(cfg.semantic_label, active_labels)
+
     # Extract candidates
     candidates = extract_candidates(
         scans, walls, floor_z, center,
         element_class=cfg.name,
-        class_idx=cfg.class_idx,
+        class_idx=class_idx,
         project_to_walls=cfg.structural,
     )
 
@@ -300,7 +310,8 @@ def detect_elements(
                 hr = detect_element_heights(
                     scene, r.candidate, walls[wi],
                     floor_z, ceiling_z, center,
-                    class_idx=cfg.class_idx,
+                    class_idx=class_idx,
+                    labels=labels,
                     up_axis=up_axis,
                 )
                 spatial_dict = {
@@ -357,6 +368,7 @@ def _generate_element_radars(
     floor_z: float,
     up_axis: int,
     out_dir: Path,
+    label_set: list[str] | None = None,
 ) -> None:
     """Generate multi-panel radar PNG for each detected element type.
 
@@ -369,7 +381,7 @@ def _generate_element_radars(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from bim_recon.virtual_scanner import SEMANTIC_PALETTE
+    from bim_recon.virtual_scanner import label_palette
 
     h_axes = [i for i in range(3) if i != up_axis]
     h0, h1 = h_axes[0], h_axes[1]
@@ -392,13 +404,16 @@ def _generate_element_radars(
     labels = np.concatenate(all_labels)
     dists = np.concatenate(all_dists)
     angles = np.concatenate(all_angles)
-    palette = np.array(SEMANTIC_PALETTE, dtype=np.float64)
+    # Resolve the active open-vocabulary label set (classic 9-class fallback).
+    active_vocab = list(label_set) if label_set is not None else list(CLASSIC_BIM_VOCAB)
+    wall_idx = active_vocab.index("wall") if "wall" in active_vocab else 0
+    palette = np.array(label_palette(max(len(active_vocab), 9)), dtype=np.float64)
 
     for elem_type, result in all_results.items():
         elem_class_idx = None
         try:
             cfg_elem = get_element_config(elem_type)
-            elem_class_idx = cfg_elem.class_idx
+            elem_class_idx = resolve_class_index(cfg_elem.semantic_label, active_vocab)
         except KeyError:
             continue
 
@@ -412,7 +427,7 @@ def _generate_element_radars(
         in_range = (labels >= 0) & (labels < len(palette))
         colors = np.where(in_range[:, None], palette[safe_idx], 0.5)
 
-        wall_mask = labels == 0
+        wall_mask = labels == wall_idx
         target_mask = labels == elem_class_idx
         other_mask = ~wall_mask & ~target_mask
 
@@ -594,15 +609,28 @@ def main() -> int:
     print(f"  PLY:  {ply_path.name}")
     print(f"  Feat: {feat_path.name}")
 
-    scene = GSScene.from_ply(
-        ply_path, feat_path=feat_path,
-        text_emb_path=str(ROOT / "data" / "bim_text_emb.pt"),
-        class_names_path=str(ROOT / "data" / "bim_class_names.json"),
-    )
+    text_emb_path = str(ROOT / "data" / "bim_text_emb.pt")
+    class_names_path = str(ROOT / "data" / "bim_class_names.json")
+    warm_kwargs: dict = {}
+    if Path(text_emb_path).exists() and Path(class_names_path).exists():
+        warm_kwargs = {"text_emb_path": text_emb_path, "class_names_path": class_names_path}
+    scene = GSScene.from_ply(ply_path, feat_path=feat_path, **warm_kwargs)
     print(f"  Gaussians: {scene.num_gaussians}")
 
+    # Build the active open-vocabulary label set: structural defaults + the
+    # semantic label of every requested element type (deduped, structural first).
+    structural_labels = ["wall", "floor", "ceiling"]
+    element_labels: list[str] = []
+    for elem_type in args.elements:
+        try:
+            element_labels.append(get_element_config(elem_type).semantic_label)
+        except KeyError:
+            pass
+    labels = list(dict.fromkeys(structural_labels + element_labels))
+    print(f"  Open-vocab label set ({len(labels)}): {labels}")
+
     # === Stage 2: Detect coordinate system ===
-    coords = detect_coordinate_system(scene)
+    coords = detect_coordinate_system(scene, label_set=labels)
     center = coords["center"]
     floor_z = coords["floor_z"]
     ceiling_z = coords["ceiling_z"]
@@ -612,7 +640,7 @@ def main() -> int:
 
     # === Stage 3: Multi-height scan (shared) ===
     print(f"\n--- Stage 1: Radar Scan ({args.num_heights} heights) ---")
-    scanner = VirtualScanner(scene, up_axis=up_axis)
+    scanner = VirtualScanner(scene, up_axis=up_axis, labels=labels)
     scans = multi_height_scan(
         scanner, center, floor_z, ceiling_z,
         num_heights=args.num_heights, num_views=8, width=512,
@@ -622,7 +650,7 @@ def main() -> int:
 
     # === Stage 4: Wall extraction ===
     print(f"\n--- Stage 2: Wall Extraction ---")
-    walls = extract_walls(scans, np.array(center), out_dir)
+    walls = extract_walls(scans, np.array(center), out_dir, labels=labels)
     print(f"  Extracted {len(walls)} wall segments")
 
     # Snap endpoints
@@ -645,6 +673,7 @@ def main() -> int:
             cfg, scans, walls_snapped, coords, scene,
             out_dir, vlm_api_base, vlm_model, vlm_api_key, args.skip_vlm,
             falcon=falcon,
+            labels=labels,
         )
         all_results[elem_type] = result
 
@@ -660,7 +689,7 @@ def main() -> int:
         elem_path.write_text(json.dumps(elem_json, indent=2), encoding="utf-8")
 
     # === Stage 5b: Generate per-element radar plots ===
-    _generate_element_radars(scans, walls_snapped, all_results, center, floor_z, up_axis, out_dir)
+    _generate_element_radars(scans, walls_snapped, all_results, center, floor_z, up_axis, out_dir, label_set=labels)
 
     # === Stage 5c: B-class mesh generation + placement via TRELLIS (optional) ===
     trellis_results: list[dict] = []

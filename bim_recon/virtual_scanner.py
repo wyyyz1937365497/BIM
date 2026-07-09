@@ -38,6 +38,25 @@ SEMANTIC_PALETTE: List[Tuple[float, float, float]] = [
 ]
 
 
+def label_palette(n: int) -> List[Tuple[float, float, float]]:
+    """Return *n* distinct colours for an arbitrary open-vocabulary label set.
+
+    Reuses the hand-tuned :data:`SEMANTIC_PALETTE` for the first 9 entries
+    (so classic BIM classes keep their colours), then generates additional
+    HSV-spread colours for any labels beyond that.
+    """
+    base = list(SEMANTIC_PALETTE)
+    if n <= len(base):
+        return base[:n]
+    import colorsys
+    extra = []
+    for i in range(len(base), n):
+        h = (i * 0.618033988749895) % 1.0  # golden-angle hue spread
+        r, g, b = colorsys.hsv_to_rgb(h, 0.65, 0.90)
+        extra.append((r, g, b))
+    return base + extra
+
+
 @dataclass
 class ScanResult:
     """A 360° horizontal laser scan from a 3DGS scene."""
@@ -72,21 +91,42 @@ class VirtualScanner:
     render pass with class-index-encoded Gaussian colors.
     """
 
-    def __init__(self, scene: GSScene, up_axis: int = 2):
+    def __init__(
+        self,
+        scene: "GSScene",
+        up_axis: int = 2,
+        labels: Optional[List[str]] = None,
+    ):
+        """Construct the scanner.
+
+        ``labels`` selects an open-vocabulary label set for semantic tagging:
+        each scan point is tagged with the argmax class over *labels*
+        (encoded on demand via SigLIP2). When ``None``, the querier's
+        registered (warm-cache) vocabulary is used.
+        """
         self.scene = scene
         self.up_axis = up_axis
         self.h_axes = [i for i in range(3) if i != up_axis]
         self._has_semantics = (
             scene.semantic_querier is not None and scene._has_feat
         )
+        # The ordered label set scan points are classified against; used for
+        # legend resolution and the colour-ramp divisor.
+        self.label_names: List[str] = []
         # Cache semantic color encoding (rebuilt per-scan was wasteful)
         self._semantic_colors: Optional[torch.Tensor] = None
         self._num_classes = 0
         if self._has_semantics:
             querier = scene.semantic_querier
             if querier is not None:
-                dominant = querier.get_dominant_labels()
-                self._num_classes = querier.num_classes
+                if labels is not None:
+                    dominant = querier.get_dominant_labels(labels)
+                    self.label_names = list(labels)
+                    self._num_classes = len(labels)
+                else:
+                    dominant = querier.get_dominant_labels()
+                    self.label_names = list(querier.registered_labels)
+                    self._num_classes = querier.num_classes
                 N = scene.num_gaussians
                 enc = torch.zeros((N, 3), dtype=torch.float32, device=scene.device)
                 if self._num_classes > 1:
@@ -234,6 +274,7 @@ def save_scan_plot(
     output_path: str,
     max_distance: float = 15.0,
     title: Optional[str] = None,
+    label_names: Optional[List[str]] = None,
 ) -> str:
     """Save the scan as a radar-style PNG with semantic color-coding.
 
@@ -258,10 +299,10 @@ def save_scan_plot(
     dists = scan.distances[mask]
     pts = scan.points_2d[mask]
 
-    # Determine colors: semantic palette or uniform blue.
     if scan.semantic_labels is not None:
         labels = scan.semantic_labels[mask]
-        palette = np.array(SEMANTIC_PALETTE, dtype=np.float64)
+        n_colors = int(labels.max()) + 1 if labels.size > 0 else len(SEMANTIC_PALETTE)
+        palette = np.array(label_palette(max(n_colors, len(SEMANTIC_PALETTE))), dtype=np.float64)
         safe_idx = np.clip(labels, 0, len(palette) - 1)
         in_range = (labels >= 0) & (labels < len(palette))
         colors = np.where(in_range[:, None], palette[safe_idx], 0.5)
@@ -292,17 +333,22 @@ def save_scan_plot(
     if scan.semantic_labels is not None:
         present = sorted(set(scan.semantic_labels[mask].tolist()))
         from matplotlib.patches import Patch
-        from pathlib import Path
-        class_names_path = Path(__file__).resolve().parent.parent / "data" / "bim_class_names.json"
-        import json
-        try:
-            names_map = json.loads(class_names_path.read_text())
-            names = [k for k, v in sorted(names_map.items(), key=lambda x: x[1])]
-        except Exception:
-            names = [f"class_{i}" for i in range(len(SEMANTIC_PALETTE))]
+        n_legend = (max(present) + 1) if present else len(SEMANTIC_PALETTE)
+        legend_palette = label_palette(max(n_legend, len(SEMANTIC_PALETTE)))
+        if label_names is not None:
+            names = list(label_names)
+        else:
+            from pathlib import Path
+            class_names_path = Path(__file__).resolve().parent.parent / "data" / "bim_class_names.json"
+            import json
+            try:
+                names_map = json.loads(class_names_path.read_text())
+                names = [k for k, v in sorted(names_map.items(), key=lambda x: x[1])]
+            except Exception:
+                names = [f"class_{i}" for i in range(len(legend_palette))]
         legend_elems = [
             Patch(
-                facecolor=SEMANTIC_PALETTE[l] if 0 <= l < len(SEMANTIC_PALETTE) else (0.5, 0.5, 0.5),
+                facecolor=legend_palette[l] if 0 <= l < len(legend_palette) else (0.5, 0.5, 0.5),
                 label=names[l] if l < len(names) else f"class_{l}",
             )
             for l in present

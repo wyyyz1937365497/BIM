@@ -285,7 +285,7 @@ def _prepare_results(res: PipelineResults):
 
 
 def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
-                           falcon: bool, skip_vlm: bool):
+                           furniture: bool, falcon: bool, skip_vlm: bool):
     """生成器：实时流式输出管线子进程日志，完成后自动加载结果。
 
     yield 10 个值: (console, out_dir, results, summary, radar_gallery,
@@ -300,6 +300,11 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
         elems.append("door")
     if windows:
         elems.append("window")
+    if furniture:
+        # Auto-include every B-class type from config routing (furniture, …)
+        # so the TRELLIS mesh tab has candidates to show.
+        b_types = load_config().element_routing.b_class_types()
+        elems.extend(t for t in b_types if t not in elems)
     if not elems:
         yield ("❌ 错误：至少选择一种构件类型", "", None, "", None, [], [], None,
                gr.update(), gr.update())
@@ -389,7 +394,7 @@ def _find_element(results: PipelineResults, elem_label: str):
         target_idx = int(parts[-1].split()[0])
     except ValueError:
         return None
-    for e in results.doors + results.windows:
+    for e in results.elements:
         if e.result_index == target_idx and e.element_class == elem_class:
             return e
     return None
@@ -732,7 +737,7 @@ def resegment_from_viewpoint(
     else:
         new_overlay_path = None
 
-    # 6. Update ElementResult — replace frozen dataclass with updated copy
+    # 6. Update ElementResult — replace dataclass with updated copy
     from dataclasses import replace as dc_replace
     updated_hd = dict(hd) if hd else {}
     updated_hd["sill_height"] = round(sill, 3)
@@ -746,11 +751,11 @@ def resegment_from_viewpoint(
         elevation_image=new_elev_path or elem.elevation_image,
         overlay_image=new_overlay_path or elem.overlay_image,
     )
-    # Replace in the results lists
-    elem_list = results.doors if elem.element_class == "door" else results.windows
-    for idx, e in enumerate(elem_list):
-        if e.result_index == elem.result_index:
-            elem_list[idx] = new_elem
+    # Replace the matched element in the canonical elements list.
+    # (doors/windows are read-only filtered views of results.elements.)
+    for idx, e in enumerate(results.elements):
+        if e.result_index == elem.result_index and e.element_class == elem.element_class:
+            results.elements[idx] = new_elem
             break
 
     dims = {
@@ -1128,6 +1133,7 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             cb_doors = gr.Checkbox(True, label="门")
             cb_windows = gr.Checkbox(True, label="窗")
+            cb_furniture = gr.Checkbox(True, label="家具 (B类)")
             cb_falcon = gr.Checkbox(True, label="Falcon 分割")
             cb_skipvlm = gr.Checkbox(False, label="跳过 VLM")
             run_btn = gr.Button("🚀 运行管线", variant="primary")
@@ -1382,7 +1388,7 @@ def build_app() -> gr.Blocks:
         )
         run_btn.click(
             fn=run_pipeline_streaming,
-            inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
+            inputs=[scene_state, cb_doors, cb_windows, cb_furniture, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
                       radar_gallery, vlm_gallery, seg_gallery, report_json,
                      vlm_review_cbs, elem_sel],
@@ -1634,7 +1640,7 @@ def build_app() -> gr.Blocks:
             b_types = set(cfg.element_routing.b_class_types())
             choices = []
             gallery_imgs = []
-            all_elems = results.doors + results.windows  # includes all element types
+            all_elems = results.elements  # all element types incl. B-class (furniture, …)
             for e in all_elems:
                 if e.element_class not in b_types:
                     continue
@@ -1680,7 +1686,7 @@ def build_app() -> gr.Blocks:
             out_dir.mkdir(parents=True, exist_ok=True)
             all_results = []
 
-            for e in (results.doors + results.windows):
+            for e in results.elements:
                 if e.element_class not in b_types:
                     continue
                 label = f"{e.element_class} #{e.result_index}"

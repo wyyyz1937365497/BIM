@@ -10,7 +10,7 @@ Usage::
     from bim_recon.element_config import get_element_config
 
     cfg = get_element_config("window")
-    candidates = extract_candidates(..., element_class=cfg.name, class_idx=cfg.class_idx, ...)
+    candidates = extract_candidates(..., element_class=cfg.name, class_idx=idx, ...)  # idx resolved from cfg.semantic_label
     filtered = prefilter_candidates(candidates, cfg.min_width, cfg.min_points)
     results = verify_candidates(..., element_class=cfg.name, ...)
 """
@@ -25,7 +25,7 @@ class ElementConfig:
     """Configuration for a BIM element type in the extraction pipeline."""
 
     name: str               # "door", "window", "furniture", ...
-    class_idx: int          # semantic class index in feat.pt
+    semantic_label: str    # open-vocabulary text label queried in feat.pt (e.g. "door", "bed")
     structural: bool        # True = project to walls, False = free-standing DBSCAN
     min_width: float        # minimum candidate width (meters)
     min_points: int         # minimum scan points per candidate
@@ -50,7 +50,7 @@ class ElementConfig:
 ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
     "door": ElementConfig(
         name="door",
-        class_idx=3,
+        semantic_label="door",
         structural=True,
         min_width=0.7,
         min_points=100,
@@ -59,7 +59,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
     ),
     "window": ElementConfig(
         name="window",
-        class_idx=4,
+        semantic_label="window",
         structural=True,
         min_width=0.5,
         min_points=50,
@@ -68,7 +68,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
     ),
     "column": ElementConfig(
         name="column",
-        class_idx=5,
+        semantic_label="column",
         structural=True,
         min_width=0.2,
         min_points=80,
@@ -77,7 +77,7 @@ ELEMENT_CONFIGS: Dict[str, ElementConfig] = {
     ),
     "furniture": ElementConfig(
         name="furniture",
-        class_idx=8,
+        semantic_label="furniture",
         structural=False,   # free-standing → DBSCAN clustering
         min_width=0.3,
         min_points=50,

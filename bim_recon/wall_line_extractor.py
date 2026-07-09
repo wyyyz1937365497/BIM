@@ -20,7 +20,7 @@ Pipeline:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -47,6 +47,38 @@ class WallLine:
             "length": round(self.length, 4),
             "num_points": self.num_points,
         }
+
+
+# --- Open-vocabulary wall label resolution -----------------------------------
+# Wall extraction keeps wall-surface points and discards floor/ceiling/furniture.
+# These label NAMES are resolved to indices in the active label set (built by
+# the pipeline and passed to the VirtualScanner); scans carry argmax indices
+# into THAT set.
+WALL_LABEL = "wall"
+WALL_EXCLUDE_LABELS: Tuple[str, ...] = ("floor", "ceiling", "furniture")
+# Classic 9-class fallback (matches data/bim_class_names.json) for callers that
+# have no explicit label set (offline re-processing of saved scans).
+_CLASSIC_VOCAB: Tuple[str, ...] = (
+    "wall", "floor", "ceiling", "door", "window",
+    "column", "beam", "stairs", "furniture",
+)
+
+
+def resolve_wall_indices(
+    labels: Optional[Sequence[str]] = None,
+    wall_label: str = WALL_LABEL,
+    exclude_labels: Sequence[str] = WALL_EXCLUDE_LABELS,
+) -> Tuple[int, List[int]]:
+    """Resolve wall + exclude label names to integer indices.
+
+    When *labels* is given, names are mapped to their positions in it (missing
+    exclude labels are skipped). When *labels* is None, the classic 9-class
+    vocabulary is used as a backward-compatible fallback.
+    """
+    vocab = list(labels) if labels is not None else list(_CLASSIC_VOCAB)
+    wall_idx = vocab.index(wall_label) if wall_label in vocab else 0
+    excl = [vocab.index(n) for n in exclude_labels if n in vocab]
+    return wall_idx, excl
 
 
 def multi_height_scan(
@@ -90,6 +122,7 @@ def extract_wall_points(
     scans: List[ScanResult],
     wall_class_idx: int = 0,
     exclude_classes: Optional[List[int]] = None,
+    labels: Optional[Sequence[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Collect wall-tagged points from multi-height scans.
 
@@ -100,13 +133,19 @@ def extract_wall_points(
 
     Args:
         scans: List of ScanResult with semantic_labels.
-        wall_class_idx: The class index for "wall" (used when exclude_classes is None).
         exclude_classes: If given, keep all points except these classes.
             Typical: [1, 2, 8] = floor, ceiling, furniture.
+        labels: Optional open-vocabulary label set the scans' ``semantic_labels``
+            index into. When given (and ``exclude_classes`` is None), wall and
+            exclude indices are resolved from :data:`WALL_LABEL` /
+            :data:`WALL_EXCLUDE_LABELS` by name.
 
     Returns:
         (points_2d, heights) — (N, 2) XY coords and (N,) scan heights.
     """
+    # Resolve open-vocabulary label names → indices when a label set is given.
+    if labels is not None and exclude_classes is None:
+        wall_class_idx, exclude_classes = resolve_wall_indices(labels)
     all_pts: List[np.ndarray] = []
     all_h: List[np.ndarray] = []
     exclude_list = list(exclude_classes) if exclude_classes is not None else None
@@ -194,6 +233,7 @@ def extract_wall_lines(
     scans: List[ScanResult],
     wall_class_idx: int = 0,
     exclude_classes: Optional[List[int]] = None,
+    labels: Optional[Sequence[str]] = None,
     center: Optional[np.ndarray] = None,
     grid_resolution: float = 0.05,
     morph_kernel_size: int = 7,
@@ -218,6 +258,10 @@ def extract_wall_lines(
         wall_class_idx: Class index for "wall" (used when exclude_classes is None).
         exclude_classes: Keep all points except these classes.
             Default [1, 2, 8] = floor, ceiling, furniture.
+        labels: Optional open-vocabulary label set the scans' ``semantic_labels``
+            index into. When given (and ``exclude_classes`` is None), wall and
+            exclude indices are resolved by name from :data:`WALL_LABEL` /
+            :data:`WALL_EXCLUDE_LABELS`.
         center: Unused (kept for API compatibility with callers).
         grid_resolution: Occupancy grid resolution in meters per pixel.
         morph_kernel_size: Closing kernel size in pixels (bridges gaps of
@@ -235,7 +279,10 @@ def extract_wall_lines(
 
     # --- Step 1: Collect wall points ---
     if exclude_classes is None:
-        exclude_classes = [1, 2, 8]  # floor, ceiling, furniture
+        if labels is not None:
+            wall_class_idx, exclude_classes = resolve_wall_indices(labels)
+        else:
+            exclude_classes = [1, 2, 8]  # floor, ceiling, furniture (classic fallback)
     wall_pts, _ = extract_wall_points(scans, wall_class_idx, exclude_classes)
     if len(wall_pts) < 10:
         return [], wall_pts

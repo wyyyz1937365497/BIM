@@ -13,7 +13,6 @@ import pytest
 
 from bim_recon.candidate_extractor import (
     Candidate,
-    BIM_CLASS_INDICES,
     extract_candidates,
     prefilter_candidates,
     project_point_to_wall,

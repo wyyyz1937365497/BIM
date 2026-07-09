@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Results data
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ElementResult:
     """One detected element (door or window) with all metadata."""
     element_class: str
@@ -37,16 +37,29 @@ class ElementResult:
     overlay_image: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PipelineResults:
-    """All results from a pipeline run, loaded from the output directory."""
+    """All results from a pipeline run, loaded from the output directory.
+
+    ``elements`` holds every detected element (doors, windows, furniture, …)
+    regardless of type. ``doors`` / ``windows`` are read-only filtered views;
+    B-class types (furniture, …) are reached via :attr:`elements` so the
+    TRELLIS mesh tab can surface them.
+    """
     out_dir: Path
     walls: list[dict[str, Any]]
-    doors: list[ElementResult]
-    windows: list[ElementResult]
+    elements: list[ElementResult]
     coords: dict[str, Any]
     wall_topdown_image: str | None = None
     report: dict[str, Any] | None = None
+
+    @property
+    def doors(self) -> list[ElementResult]:
+        return [e for e in self.elements if e.element_class == "door"]
+
+    @property
+    def windows(self) -> list[ElementResult]:
+        return [e for e in self.elements if e.element_class == "window"]
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +104,23 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 
 def load_results(out_dir: Path) -> PipelineResults:
-    """Load all pipeline results from an output directory."""
+    """Load all pipeline results from an output directory.
+
+    Discovers every ``*_verified.json`` (doors, windows, furniture, …) so
+    B-class elements flow in automatically without hardcoding filenames.
+    """
     walls = json.loads((out_dir / "wall_lines_snapped.json").read_text("utf-8"))
     report = json.loads((out_dir / "pipeline_report.json").read_text("utf-8"))
     coords = report.get("coords", {})
 
     topdown = str(out_dir / "wall_lines_topdown.png")
 
-    doors = _load_elements(out_dir, "doors_verified.json")
-    windows = _load_elements(out_dir, "windows_verified.json")
+    elements: list[ElementResult] = []
+    for vf in sorted(out_dir.glob("*_verified.json")):
+        elements.extend(_load_elements(out_dir, vf.name))
 
     return PipelineResults(
-        out_dir=out_dir, walls=walls, doors=doors, windows=windows,
+        out_dir=out_dir, walls=walls, elements=elements,
         coords=coords, wall_topdown_image=topdown, report=report,
     )
 

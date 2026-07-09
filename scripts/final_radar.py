@@ -24,6 +24,19 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+def _classic_class_index(name: str) -> int:
+    """Return the classic 9-class vocabulary index for ``name``.
+
+    Scans store integer semantic indices but not the label names, so the
+    open-vocabulary ``ElementConfig.semantic_label`` string must be resolved
+    against the classic vocabulary in ``data/bim_class_names.json`` (a
+    ``{name: index}`` mapping). The path is relative to the repo root (the
+    parent of ``scripts/``). Returns -1 if ``name`` is absent.
+    """
+    with open(ROOT / "data" / "bim_class_names.json") as f:
+        names = json.load(f)
+    return int(names.get(name, -1))
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -97,10 +110,15 @@ def main() -> int:
         for l in labels
     ])
 
+    # Resolve classic-vocab indices: scans store integer label indices but not
+    # the label names, so map the open-vocabulary semantic_label strings back.
+    target_idx = _classic_class_index(cfg.semantic_label)
+    wall_idx = _classic_class_index("wall")  # robustly 0 in the classic vocab
+
     # Plot non-target, non-wall points faintly
-    other_mask = ~((labels == 0) | (labels == cfg.class_idx))
-    wall_mask = labels == 0
-    target_mask = labels == cfg.class_idx
+    other_mask = ~((labels == wall_idx) | (labels == target_idx))
+    wall_mask = labels == wall_idx
+    target_mask = labels == target_idx
 
     if other_mask.sum() > 0:
         ax_polar.scatter(angles_rad[other_mask], dists[other_mask],

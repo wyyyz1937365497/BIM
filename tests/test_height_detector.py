@@ -104,7 +104,7 @@ class _MockScene:
         def __init__(self, parent):
             self._parent = parent
 
-        def get_dominant_labels(self):
+        def get_dominant_labels(self, labels=None):
             return np.zeros(100, dtype=np.int32)
 
         @property

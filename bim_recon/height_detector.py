@@ -207,6 +207,7 @@ def detect_element_heights(
     ceiling_z: float,
     scan_center: Tuple[float, float],
     class_idx: int,
+    labels: Optional[List[str]] = None,
     up_axis: int = 2,
     coarse_step: float = 0.2,
     fine_step: float = 0.02,
@@ -224,7 +225,8 @@ def detect_element_heights(
         floor_z: Floor level (up-axis world coordinate, metres).
         ceiling_z: Ceiling level (metres).
         scan_center: Room centre used to orient the inward normal.
-        class_idx: Semantic class index for this element type.
+        class_idx: Semantic class index for this element type (position in *labels*, or in the querier's registered vocabulary when *labels* is None).
+        labels: Optional open-vocabulary label set the scan's ``semantic_labels`` are indices into. When given, the dominant-label colour ramp is built by argmax over *labels* (encoded on demand via SigLIP2); when None, the registered (warm-cache) vocabulary is used.
         up_axis: Up axis (0=x, 1=y, 2=z).
         coarse_step: Coarse scan interval (metres).
         fine_step: Fine scan interval (metres).
@@ -244,8 +246,8 @@ def detect_element_heights(
     num_classes = 0
     if class_idx is not None and scene.semantic_querier is not None and scene._has_feat:
         querier = scene.semantic_querier
-        dominant = querier.get_dominant_labels()
-        num_classes = querier.num_classes
+        dominant = querier.get_dominant_labels(labels)
+        num_classes = len(labels) if labels is not None else querier.num_classes
         n = scene.num_gaussians
         enc = torch.zeros((n, 3), dtype=torch.float32, device=scene.device)
         if num_classes > 1:

@@ -39,6 +39,7 @@ from bim_recon.floorplan import ManualProvider
 from bim_recon.floorplan_registration import register_floorplan
 from bim_recon.gs_scene import CameraPose, GSScene, look_at_pose
 from bim_recon.wall_fitter import FloorPlanGuidedFitter, WallFitter
+from bim_recon.virtual_scanner import label_palette
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +305,7 @@ def build_server(state: ServerState) -> FastMCP:
         if text_query is not None and not s.has_semantics:
             raise RuntimeError(
                 "text_query requires semantic features. "
-                "Start the server with --feat --text-emb --class-names."
+                "Start the server with --feat."
             )
         x0, y0, x1, y1 = bbox_xyxy
         pose = _parse_camera(eye, target, up)
@@ -356,13 +357,13 @@ def build_server(state: ServerState) -> FastMCP:
         Returns JSON: class, num_gaussians, mean_confidence, centroid,
         bounds_min, bounds_max, indices (first 100).
 
-        Requires semantic features (--feat --text-emb --class-names).
+        Requires semantic features (--feat).
         """
         s = _require_state()
         if not s.has_semantics:
             raise RuntimeError(
                 "query_semantics requires semantic features. "
-                "Start the server with --feat --text-emb --class-names."
+                "Start the server with --feat."
             )
         result = s.scene.query_semantics(
             text_query, mode=mode, threshold=threshold, percent=percent,
@@ -378,6 +379,7 @@ def build_server(state: ServerState) -> FastMCP:
         eye: List[float],
         target: List[float],
         text_query: Optional[str] = None,
+        text_queries: Optional[List[str]] = None,
         up: Optional[List[float]] = None,
         fov_degrees: float = 60.0,
         width: int = 800,
@@ -385,11 +387,23 @@ def build_server(state: ServerState) -> FastMCP:
     ) -> MCPImage:
         """Render the 3DGS scene from a viewpoint with semantic coloring.
 
-        If *text_query* given: matching Gaussians → red, others → cyan.
-        If *text_query* is None: each Gaussian colored by its dominant class
-        using a fixed BIM palette (see _BIM_PALETTE).
+        Highlight mode (*text_query* given): Gaussians whose dominant label
+        matches the open-vocabulary text_query → red, others → cyan.
+        ``text_query`` is open-vocabulary — any free-text label is encoded
+        on demand with SigLIP2 (no pre-registered vocabulary needed).
 
-        Requires semantic features (--feat --text-emb --class-names).
+        Global mode (*text_query* is None): each Gaussian is colored by its
+        dominant label. Two sub-cases:
+          - *text_queries* given (open-vocabulary global palette): the
+            dominant label is the argmax over ``text_queries`` and each
+            Gaussian is colored by palette[label_palette index]. Useful when
+            the server was started with ``--feat`` only (no warm cache).
+          - *text_queries* is None: requires a warm-cache vocabulary
+            (``--text-emb``/``--class-names`` at startup); colors use the
+            fixed BIM palette (_BIM_PALETTE). Raises a RuntimeError if no
+            warm cache is loaded.
+
+        Requires semantic features (--feat).
 
         Returns: PNG image (HxWx3, 8-bit).
         """
@@ -397,7 +411,7 @@ def build_server(state: ServerState) -> FastMCP:
         if not s.has_semantics:
             raise RuntimeError(
                 "render_semantic_overlay requires semantic features. "
-                "Start the server with --feat --text-emb --class-names."
+                "Start the server with --feat."
             )
         scene = s.scene
         querier = scene.semantic_querier
@@ -423,14 +437,34 @@ def build_server(state: ServerState) -> FastMCP:
                         [1.0, 0.0, 0.0], device=dev,
                     )
             else:
-                # Global mode: color by dominant class via palette
-                dominant = querier.get_dominant_labels()  # (N,) int32 numpy
+                # Global mode: color each Gaussian by its dominant label.
                 overlay = torch.zeros((N, 3), dtype=torch.float32, device=dev)
-                for c_idx, color in enumerate(_BIM_PALETTE):
-                    if c_idx >= querier.num_classes:
-                        break
-                    mask_c = torch.as_tensor(dominant == c_idx, device=dev)
-                    overlay[mask_c] = torch.tensor(color, device=dev)
+                if text_queries is not None:
+                    # Open-vocabulary global palette: argmax over text_queries,
+                    # indices are positions into text_queries.
+                    if len(text_queries) == 0:
+                        raise ValueError("text_queries must be a non-empty list of labels")
+                    dominant = querier.get_dominant_labels(text_queries)  # (N,) int32
+                    palette = label_palette(len(text_queries))
+                    for c_idx, color in enumerate(palette):
+                        mask_c = torch.as_tensor(dominant == c_idx, device=dev)
+                        overlay[mask_c] = torch.tensor(color, device=dev)
+                elif querier.num_classes > 0:
+                    # Classic warm-cache behaviour: argmax over the registered
+                    # vocabulary, coloured with the fixed BIM palette.
+                    dominant = querier.get_dominant_labels()  # (N,) int32
+                    for c_idx, color in enumerate(_BIM_PALETTE):
+                        if c_idx >= querier.num_classes:
+                            break
+                        mask_c = torch.as_tensor(dominant == c_idx, device=dev)
+                        overlay[mask_c] = torch.tensor(color, device=dev)
+                else:
+                    raise RuntimeError(
+                        "render_semantic_overlay global mode requires either a "
+                        "warm-cache vocabulary (start with --feat --text-emb "
+                        "--class-names) or an explicit text_queries list. "
+                        "Pass text_queries to colour by open-vocabulary labels."
+                    )
             scene.colors = overlay
             result = scene.render(pose, width=width, height=height, fov_degrees=fov_degrees)
         finally:
@@ -457,13 +491,13 @@ def build_server(state: ServerState) -> FastMCP:
         ``up_axis`` auto-detected from floor centroid if None (0=x,1=y,2=z).
         Wall height computed from floor→ceiling centroid distance.
 
-        Requires semantic features (--feat --text-emb --class-names).
+        Requires semantic features (--feat).
         """
         s = _require_state()
         if not s.has_semantics:
             raise RuntimeError(
                 "fit_walls requires semantic features. "
-                "Start the server with --feat --text-emb --class-names."
+                "Start the server with --feat."
             )
         scene = s.scene
 
@@ -525,13 +559,13 @@ def build_server(state: ServerState) -> FastMCP:
 
             {"walls": [{"x1": 0, "y1": 0, "x2": 5, "y2": 0}, ...]}
 
-        Requires semantic features (--feat --text-emb --class-names).
+        Requires semantic features (--feat).
         """
         s = _require_state()
         if not s.has_semantics:
             raise RuntimeError(
                 "fit_walls_guided requires semantic features. "
-                "Start the server with --feat --text-emb --class-names."
+                "Start the server with --feat."
             )
         scene = s.scene
 
@@ -631,12 +665,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
 
-    # Determine whether semantic features are fully specified.
-    sem_args = [args.feat, args.text_emb, args.class_names]
-    has_semantics = all(sem_args)
-    if any(sem_args) and not has_semantics:
-        print("ERROR: --feat, --text-emb, and --class-names must be provided together "
-              "(got only some).", file=sys.stderr)
+    # --feat alone enables open-vocabulary semantics; --text-emb/--class-names
+    # are an optional warm cache.
+    has_semantics = bool(args.feat)
+    if (args.text_emb or args.class_names) and not args.feat:
+        print("ERROR: --text-emb/--class-names require --feat "
+              "(warm-cache options need a feature tensor).", file=sys.stderr)
         return 2
 
     if args.demo:
@@ -680,8 +714,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Loaded {len(cameras)} training cameras", file=sys.stderr)
 
     if has_semantics and scene.semantic_querier is not None and scene._has_feat:
-        print(f"Semantic features enabled: {scene.semantic_querier.num_classes} classes, "
-              f"768-dim features", file=sys.stderr)
+        n_gauss = scene.semantic_querier.num_gaussians
+        n_classes = scene.semantic_querier.num_classes
+        if n_classes > 0:
+            print(f"Semantic features enabled: open-vocabulary (SigLIP2), "
+                  f"{n_gauss} Gaussians, {n_classes} warm-cache classes",
+                  file=sys.stderr)
+        else:
+            print(f"Semantic features enabled: open-vocabulary (SigLIP2), "
+                  f"{n_gauss} Gaussians", file=sys.stderr)
 
     state = ServerState(
         scene=scene,

@@ -1,12 +1,19 @@
 #!/usr/bin/env python
-"""Generate SigLIP2 text embeddings for BIM class vocabulary.
+"""Generate SigLIP2 text embeddings for the BIM class vocabulary (OPTIONAL warm cache).
 
 Produces two files in the output directory:
   - bim_text_emb.pt      (C, 768) float32, L2-normalized
   - bim_class_names.json  {"class_name": index, ...}
 
-The embeddings are compatible with SceneSplat's feat.pt: cosine similarity
-between feat (N,768) and text_emb (C,768) gives per-Gaussian class probabilities.
+These files are an OPTIONAL performance cache. Since the pipeline is now
+open-vocabulary, `feat.pt` alone is sufficient to run end-to-end: any text
+label is encoded on demand via SigLIP2 at query time. Providing these files
+avoids re-encoding the structural vocabulary (wall/floor/ceiling/door/window/...)
+on every query, so they are still recommended for batch pipeline runs.
+
+When present, cosine similarity between feat (N,768) and text_emb (C,768)
+yields per-Gaussian class probabilities for the registered labels. Custom
+labels not in this cache are always queryable via on-demand encoding.
 
 Usage:
     python scripts/encode_bim_labels.py

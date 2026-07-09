@@ -15,7 +15,7 @@ class TestGetElementConfig:
     def test_door_config(self):
         cfg = get_element_config("door")
         assert cfg.name == "door"
-        assert cfg.class_idx == 3
+        assert cfg.semantic_label == "door"
         assert cfg.structural is True
         assert cfg.min_width == 0.7
         assert cfg.min_points == 100
@@ -23,20 +23,20 @@ class TestGetElementConfig:
     def test_window_config(self):
         cfg = get_element_config("window")
         assert cfg.name == "window"
-        assert cfg.class_idx == 4
+        assert cfg.semantic_label == "window"
         assert cfg.structural is True
         assert cfg.min_width == 0.5
 
     def test_furniture_config(self):
         cfg = get_element_config("furniture")
         assert cfg.name == "furniture"
-        assert cfg.class_idx == 8
+        assert cfg.semantic_label == "furniture"
         assert cfg.structural is False  # free-standing
 
     def test_column_config(self):
         cfg = get_element_config("column")
         assert cfg.name == "column"
-        assert cfg.class_idx == 5
+        assert cfg.semantic_label == "column"
         assert cfg.structural is True
 
     def test_unknown_raises(self):
