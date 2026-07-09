@@ -144,7 +144,7 @@ def get_llm_model(config: AppConfig | None = None):
         model_id=m.model,
         api_base=m.api_base,
         api_key=m.api_key or "empty",
-        max_retries=1,
+        client_kwargs={"max_retries": 1},
     )
 
 
