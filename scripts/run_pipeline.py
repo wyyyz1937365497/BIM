@@ -723,11 +723,18 @@ def main() -> int:
         for elem_type, result in all_results.items():
             if elem_type not in b_class_types:
                 continue
-            verify_subdir = trellis_dir.parent / f"verify_{elem_type}"
-            if not verify_subdir.exists():
-                continue
-            for img_file in sorted(verify_subdir.glob("*.png")):
-                vlm_images.append((elem_type, str(img_file)))
+            verify_subdir = out_dir / f"verify_{elem_type}"
+            for r in result.get("results", []):
+                # VLM-rejected views must NOT reach Falcon/TRELLIS — only
+                # confirmed candidates proceed to segmentation + mesh gen.
+                if r.get("confirmed") is not True:
+                    continue
+                img_name = r.get("image_path", "")
+                if not img_name:
+                    continue
+                img_path = verify_subdir / img_name
+                if img_path.exists():
+                    vlm_images.append((elem_type, str(img_path)))
 
         print(f"  B-class types ({', '.join(sorted(b_class_types)) or 'none'}): "
               f"{len(vlm_images)} images to process")

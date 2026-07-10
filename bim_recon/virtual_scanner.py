@@ -140,6 +140,7 @@ class VirtualScanner:
         num_views: int = 8,
         fov: float = 60.0,
         width: int = 1024,
+        scan_render_height: int = 16,
     ) -> ScanResult:
         """Render a 360° horizontal scan at ``height`` from ``center_2d``.
 
@@ -150,12 +151,20 @@ class VirtualScanner:
              encoding, so each pixel's color reveals the dominant feat.pt
              class at the hit surface.
 
+        Only the **middle row** of each rendered image is used (it corresponds
+        to the camera's horizontal plane).  *scan_render_height* controls how
+        many rows are rendered — the default of 16 (one gsplat tile row)
+        produces depth values identical to a full square image but renders
+        ~64× fewer pixels, eliminating most GPU→CPU transfer overhead.
+
         Args:
             center_2d: (x, y) scan center in world horizontal plane.
             height: World up-axis coordinate of the scan plane.
             num_views: Number of azimuth viewpoints (8 × 60° = 480° coverage).
             fov: Horizontal FOV per view in degrees.
             width: Rendered image width per view.
+            scan_render_height: Rendered image height (rows). Only the middle
+                row is used; smaller = faster. Must be even.
 
         Returns:
             ScanResult with angles, distances, world XY points, and optional
@@ -175,7 +184,7 @@ class VirtualScanner:
 
         fx = 0.5 * width / math.tan(0.5 * math.radians(fov))
         cx_pix = width / 2.0
-        render_h = width  # square image so middle row = camera height
+        render_h = scan_render_height  # thin strip — only middle row is used
         middle_v = render_h // 2
 
         # Pre-compute pixel coordinates for vectorized unprojection

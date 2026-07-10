@@ -64,8 +64,11 @@ def default_text_encoder_factory(model_name: str) -> TextEncoder:
             prompts, padding=True, truncation=True, max_length=64,
             return_tensors="pt",
         )
-        out = model(**batch)
-        emb = out.pooler_output  # (L, 768) — transformers 5.x
+        out = model.get_text_features(**batch)
+        if isinstance(out, torch.Tensor):
+            emb = out
+        else:
+            emb = out.pooler_output  # transformers 5.x
         emb = torch.nn.functional.normalize(emb, dim=-1)
         return emb.detach().cpu().float()
 
@@ -190,7 +193,7 @@ class SemanticQuerier:
             for lab, row in zip(missing, new):
                 self._emb_cache[lab] = row
         rows = [self._emb_cache[lab] for lab in labels]
-        emb = torch.stack(rows, dim=0).to(self._device).float()  # (L, 768)
+        emb = torch.stack([r.to(self._device).float() for r in rows], dim=0)
         return torch.nn.functional.normalize(emb, dim=-1)
 
     def _probs_for_labels(self, labels: Sequence[str]) -> torch.Tensor:

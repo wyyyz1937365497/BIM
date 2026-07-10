@@ -285,7 +285,7 @@ def _prepare_results(res: PipelineResults):
 
 
 def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
-                           furniture: bool, falcon: bool, skip_vlm: bool):
+                           falcon: bool, skip_vlm: bool):
     """生成器：实时流式输出管线子进程日志，完成后自动加载结果。
 
     yield 10 个值: (console, out_dir, results, summary, radar_gallery,
@@ -300,11 +300,6 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
         elems.append("door")
     if windows:
         elems.append("window")
-    if furniture:
-        # Auto-include every B-class type from config routing (furniture, …)
-        # so the TRELLIS mesh tab has candidates to show.
-        b_types = load_config().element_routing.b_class_types()
-        elems.extend(t for t in b_types if t not in elems)
     if not elems:
         yield ("❌ 错误：至少选择一种构件类型", "", None, "", None, [], [], None,
                gr.update(), gr.update())
@@ -1133,7 +1128,6 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             cb_doors = gr.Checkbox(True, label="门")
             cb_windows = gr.Checkbox(True, label="窗")
-            cb_furniture = gr.Checkbox(True, label="家具 (B类)")
             cb_falcon = gr.Checkbox(True, label="Falcon 分割")
             cb_skipvlm = gr.Checkbox(False, label="跳过 VLM")
             run_btn = gr.Button("🚀 运行管线", variant="primary")
@@ -1257,7 +1251,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown("---\n## ⑤b B类构件 Mesh 生成（TRELLIS）")
         gr.Markdown(
             "B 类构件 = 家具/管道/楼梯等复杂异形件，通过 TRELLIS 生成 3D mesh。\n\n"
-            "**自动候选**：管线运行后自动从语义结果中提取 B 类候选，勾选后一键生成\n"
+            "**VLM 自动探索**：VLM 在场景中 360° 自主探索，Falcon 分割 + 3D 定位\n"
             "**手动选取**：在 ⑥ 查看器中漫游到目标 → 捕获渲染 → 手动 mask + 输入物体名 → 生成"
         )
 
@@ -1265,21 +1259,31 @@ def build_app() -> gr.Blocks:
         bmesh_scene_state = gr.State("")  # for rendering
         bmesh_cam_data = gr.State({})     # captured camera
 
-        with gr.Tab("自动候选（从检测结果）"):
-            gr.Markdown("管线运行后，B 类构件（家具等）的 VLM 验证图会显示在下方。勾选要重建的物体。")
-            bmesh_refresh_btn = gr.Button("🔄 刷新候选列表", variant="secondary")
-            bmesh_candidates_cbs = gr.CheckboxGroup(
-                label="B 类候选（勾选要生成 mesh 的构件）", choices=[], value=[],
+        with gr.Tab("VLM 自动探索"):
+            gr.Markdown(
+                "VLM 在场景中自动旋转 360°，每个视角用 Falcon 检测物体，"
+                "3D 定位后加入队列。\n"
+                "需要先启动 Falcon server "
+                "(`falcon_inference_server.py --port 8390`)。"
             )
-            bmesh_candidate_gallery = gr.Gallery(
-                label="候选预览", columns=4, height=300,
+            explore_query = gr.Textbox(
+                label="搜索物体（逗号分隔）",
+                value="chair, table, sofa, cabinet, bed, lamp, vase, plant",
+                interactive=True,
+            )
+            explore_btn = gr.Button("🔍 开始 VLM 探索", variant="primary")
+            explore_console = gr.Textbox(
+                label="探索进度", lines=8, interactive=False,
+                placeholder="点击「开始 VLM 探索」后，进度将在此显示...",
+            )
+            explore_gallery = gr.Gallery(
+                label="发现的物体", columns=4, height=300,
                 show_label=False, object_fit="contain", preview=True,
             )
+            explore_results = gr.State([])  # list of found objects
             with gr.Row():
-                bmesh_seed_auto = gr.Number(label="种子", value=1, precision=0, scale=1)
-                bmesh_gen_auto_btn = gr.Button("🔲 生成选中项 Mesh", variant="primary", scale=2)
-            bmesh_auto_output = gr.JSON(label="生成结果")
-            bmesh_auto_status = gr.Markdown("")
+                explore_queue_btn = gr.Button("📦 全部加入 TRELLIS 队列", variant="secondary")
+            explore_output = gr.JSON(label="队列状态")
 
         with gr.Tab("手动选取（视角 + Mask）"):
             gr.Markdown(
@@ -1388,7 +1392,7 @@ def build_app() -> gr.Blocks:
         )
         run_btn.click(
             fn=run_pipeline_streaming,
-            inputs=[scene_state, cb_doors, cb_windows, cb_furniture, cb_falcon, cb_skipvlm],
+            inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
                       radar_gallery, vlm_gallery, seg_gallery, report_json,
                      vlm_review_cbs, elem_sel],
@@ -1631,108 +1635,134 @@ def build_app() -> gr.Blocks:
             except Exception as e:
                 return {"错误": f"生成失败: {e}"}
 
-        # --- B类 Mesh: 自动候选 Tab ---
-        def _refresh_bmesh_candidates(results, scene_name: str):
-            """从检测结果中提取 B 类候选，返回 checkbox choices + gallery images。"""
-            if not results or not scene_name:
-                return gr.update(choices=[], value=[]), []
-            cfg = load_config()
-            b_types = set(cfg.element_routing.b_class_types())
-            choices = []
-            gallery_imgs = []
-            all_elems = results.elements  # all element types incl. B-class (furniture, …)
-            for e in all_elems:
-                if e.element_class not in b_types:
-                    continue
-                label = f"{e.element_class} #{e.result_index}"
-                choices.append(label)
-                if e.image_path and Path(e.image_path).exists():
-                    gallery_imgs.append((e.image_path, label))
-            return gr.update(choices=choices, value=[]), gallery_imgs
+        # --- B类 Mesh: VLM 自动探索 Tab ---
+        def run_vlm_exploration(scene_name: str, query: str):
+            """VLM 在场景中自动 360° 探索 B 类物体。"""
+            if not scene_name:
+                yield "❌ 未选择场景", [], []
+                return
+            ply_path = ROOT / "data" / f"{scene_name}.ply"
+            if not ply_path.exists():
+                yield f"❌ PLY 不存在: {ply_path}", [], []
+                return
+            feat_path = ROOT / "output" / scene_name / f"{scene_name}_feat.pt"
+            yield f"正在加载场景 {scene_name}...", [], []
 
-        bmesh_refresh_btn.click(
-            fn=_refresh_bmesh_candidates,
-            inputs=[results_state, scene_state],
-            outputs=[bmesh_candidates_cbs, bmesh_candidate_gallery],
-        )
-        # Also auto-refresh when results load
-        results_state.change(
-            fn=_refresh_bmesh_candidates,
-            inputs=[results_state, scene_state],
-            outputs=[bmesh_candidates_cbs, bmesh_candidate_gallery],
-        )
-
-        def _on_bmesh_auto_generate(selected: list, results, scene_name: str, seed: int):
-            """对用户勾选的 B 类候选执行 Falcon 抠图 + TRELLIS 生成。"""
-            if not selected:
-                return {"错误": "请先勾选要生成的构件"}, ""
-            if not results:
-                return {"错误": "无检测结果"}, ""
-
-            cfg = load_config()
-            b_types = set(cfg.element_routing.b_class_types())
-            trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
-            if not trellis.health():
-                return {"错误": "TRELLIS 服务不可达"}, ""
-
+            import math, io as _io
+            from bim_recon.gs_scene import GSScene
             from bim_recon.falcon_client import FalconClient
-            from bim_recon.mesh_registrar import extract_object_from_render
-            from PIL import Image as PILImage
+            from bim_recon.mcp_explorer import (
+                ExplorerState, _render_current, _save_view, _estimate_3d,
+            )
+            from PIL import Image as _PIL
 
-            falcon = FalconClient()
-            falcon_ok = falcon.health()
+            scene = GSScene.from_ply(
+                str(ply_path),
+                feat_path=str(feat_path) if feat_path.exists() else None,
+            )
+            mn = scene.means.min(dim=0).values.cpu().numpy()
+            mx = scene.means.max(dim=0).values.cpu().numpy()
+            explore_dir = ROOT / "output" / scene_name / "explore"
+            state = ExplorerState(
+                scene=scene, explore_dir=explore_dir,
+                bounds_min=tuple(mn.tolist()), bounds_max=tuple(mx.tolist()),
+            )
+            state.cam_eye = [
+                float((mn[0] + mx[0]) / 2), float(mn[1]) + 1.5,
+                float((mn[2] + mx[2]) / 2),
+            ]
+            state.cam_yaw = 0.0
+            state.initialized = True
+            explore_dir.mkdir(parents=True, exist_ok=True)
 
-            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            all_results = []
+            falcon = FalconClient(port=8390)
+            if not falcon.health():
+                yield "❌ Falcon 服务不可达 (127.0.0.1:8390)，请先启动", [], []
+                return
 
-            for e in results.elements:
-                if e.element_class not in b_types:
-                    continue
-                label = f"{e.element_class} #{e.result_index}"
-                if label not in selected:
-                    continue
+            labels = [l.strip() for l in query.split(",") if l.strip()]
+            found_objects: list = []
+            gallery_items: list = []
 
-                img_path = e.image_path
-                if not img_path or not Path(img_path).exists():
-                    all_results.append({"label": label, "错误": "图片不存在"})
-                    continue
+            for angle_idx in range(8):
+                angle = angle_idx * 45
+                state.cam_yaw = math.radians(angle)
+                png, _result, pose = _render_current(state)
+                _save_view(state, png)
+                img = _PIL.open(_io.BytesIO(png))
+                console = f"视角 {angle}° ({angle_idx+1}/8) — 检测 {len(labels)} 类物体...\n"
+                for label in labels:
+                    try:
+                        dets = falcon.segment(img, label, task="detection")
+                    except Exception as ex:
+                        console += f"  ⚠ {label}: 检测失败 ({ex})\n"
+                        continue
+                    for det in dets:
+                        pos3d = _estimate_3d(
+                            scene, pose, det.bbox,
+                            state.width, state.height, state.cam_fov,
+                        )
+                        if pos3d is None:
+                            continue
+                        is_dup = any(
+                            o["label"] == label and
+                            math.sqrt(sum(
+                                (o["position_3d"][i] - round(pos3d[i], 2)) ** 2
+                                for i in range(3)
+                            )) < 0.3
+                            for o in found_objects
+                        )
+                        if is_dup:
+                            continue
+                        state.obj_counter += 1
+                        obj_id = f"obj_{state.obj_counter:03d}"
+                        obj_view = _save_view(state, png, suffix=f"_{label}_{obj_id}")
+                        found_objects.append({
+                            "id": obj_id, "label": label,
+                            "position_3d": [round(v, 2) for v in pos3d],
+                            "view": obj_view, "trellis_status": "pending",
+                        })
+                        gallery_items.append((obj_view, f"{label} #{obj_id}"))
+                        console += (f"  ✓ {label} at "
+                                    f"({pos3d[0]:.1f}, {pos3d[1]:.1f}, {pos3d[2]:.1f})\n")
+                console += f"累计发现 {len(found_objects)} 个物体\n"
+                yield console, gallery_items, found_objects
 
-                clean_path = Path(img_path)
-                # Falcon mask
-                if falcon_ok:
-                    render = PILImage.open(img_path).convert("RGB")
-                    detections = falcon.segment(render, e.element_class, task="segmentation")
-                    det_dicts = [
-                        {"bbox": d.bbox, "mask_bbox": d.mask_bbox, "mask_area_ratio": d.mask_area_ratio}
-                        for d in detections
-                    ]
-                    clean = extract_object_from_render(render, det_dicts)
-                    if clean is not None:
-                        clean_path = out_dir / f"{e.element_class}_{e.result_index}_clean.png"
-                        clean.save(str(clean_path))
+            from collections import Counter
+            counts = Counter(o["label"] for o in found_objects)
+            summary = f"✅ 探索完成！共发现 {len(found_objects)} 个物体:\n"
+            for label, count in counts.most_common():
+                summary += f"  {label}: {count}\n"
+            yield summary, gallery_items, found_objects
 
-                try:
-                    result = trellis.generate_mesh(TrellisMeshRequest(
-                        image_path=clean_path,
-                        output_dir=out_dir,
-                        name=f"{e.element_class}_{e.result_index}",
-                        seed=int(seed),
-                    ))
-                    all_results.append({
-                        "label": label,
-                        "状态": "✅",
-                        "GLB": str(result.glb_path),
-                    })
-                except Exception as ex:
-                    all_results.append({"label": label, "错误": str(ex)})
+        explore_btn.click(
+            fn=run_vlm_exploration,
+            inputs=[scene_state, explore_query],
+            outputs=[explore_console, explore_gallery, explore_results],
+        )
 
-            return {"结果": all_results}, ""
+        def _queue_all_for_trellis(found_objects: list, scene_name: str):
+            if not found_objects:
+                return {"错误": "没有已发现的物体"}
+            queue_dir = ROOT / "output" / (scene_name or "default") / "trellis_queue"
+            queue_dir.mkdir(parents=True, exist_ok=True)
+            queued = 0
+            for obj in found_objects:
+                entry = {
+                    "object_id": obj["id"], "label": obj["label"],
+                    "image_path": obj["view"], "position_3d": obj["position_3d"],
+                }
+                (queue_dir / f"{obj['id']}.json").write_text(
+                    json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8",
+                )
+                queued += 1
+            return {"状态": f"已加入 {queued} 个物体到 TRELLIS 队列",
+                    "队列目录": str(queue_dir)}
 
-        bmesh_gen_auto_btn.click(
-            fn=_on_bmesh_auto_generate,
-            inputs=[bmesh_candidates_cbs, results_state, scene_state, bmesh_seed_auto],
-            outputs=[bmesh_auto_output, bmesh_auto_status],
+        explore_queue_btn.click(
+            fn=_queue_all_for_trellis,
+            inputs=[explore_results, scene_state],
+            outputs=[explore_output],
         )
 
         # --- B类 Mesh: 手动选取 Tab ---
