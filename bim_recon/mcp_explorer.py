@@ -451,6 +451,10 @@ def build_server(state: ExplorerState) -> FastMCP:
             "trellis_status": "pending",
         }
         s.found.append(obj)
+        # Persist to disk so external UIs (Gradio) can sync the gallery.
+        (s.explore_dir / "found_objects.json").write_text(
+            json.dumps(s.found, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
         print(f"[explorer] tagged {obj_id} '{label}' at "
               f"({pos3d[0]:.2f}, {pos3d[1]:.2f}, {pos3d[2]:.2f})", file=sys.stderr)
         return json.dumps({"status": "tagged", **obj}, indent=2, ensure_ascii=False)

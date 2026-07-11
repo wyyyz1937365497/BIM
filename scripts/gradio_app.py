@@ -1091,6 +1091,82 @@ def agent_chat(
         return f"❌ Agent 错误: {e}"
 
 
+
+# ---------------------------------------------------------------------------
+# Explorer Agent (smolagents + Explorer MCP) — mirrors Revit agent
+# ---------------------------------------------------------------------------
+
+_EXP_AGENT_CACHE: Any = None
+_EXP_MCP_CM: Any = None
+
+
+def _reset_explorer_agent():
+    """Kill old explorer subprocess + clear caches."""
+    global _EXP_AGENT_CACHE, _EXP_MCP_CM
+    if _EXP_MCP_CM is not None:
+        try:
+            _EXP_MCP_CM.__exit__(None, None, None)
+        except Exception:
+            pass
+    _EXP_AGENT_CACHE = None
+    _EXP_MCP_CM = None
+
+
+def _get_explorer_agent(scene_name: str):
+    """Create a ToolCallingAgent connected to the explorer MCP server."""
+    global _EXP_AGENT_CACHE, _EXP_MCP_CM
+    if _EXP_AGENT_CACHE is not None:
+        return _EXP_AGENT_CACHE
+
+    from smolagents import ToolCollection, ToolCallingAgent
+    from mcp import StdioServerParameters
+
+    ply_path = ROOT / "data" / f"{scene_name}.ply"
+    if not ply_path.exists():
+        raise FileNotFoundError(f"PLY 不存在: {ply_path}")
+    feat_path = ROOT / "output" / scene_name / f"{scene_name}_feat.pt"
+
+    mcp_args = ["-m", "bim_recon.mcp_explorer", "--ply", str(ply_path)]
+    if feat_path.exists():
+        mcp_args.extend(["--feat", str(feat_path)])
+    mcp_args.extend(["--explore-dir", str(ROOT / "output" / scene_name / "explore")])
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=mcp_args,
+    )
+    _EXP_MCP_CM = ToolCollection.from_mcp(server_params, trust_remote_code=True)
+    tool_collection = _EXP_MCP_CM.__enter__()
+    tool_list = tool_collection.tools
+
+    cfg = load_config()
+    model = get_llm_model(cfg)
+
+    instructions = (
+        "你是一个室内场景探索者。你在 3D Gaussian Splatting 渲染的房间中，"
+        "任务是找到所有 B 类物体（家具、装饰品、电器等）并记录 3D 位置。\n\n"
+        "## 探索策略\n"
+        "1. 首先调用 explore_init 初始化（如果尚未初始化）\n"
+        "2. 系统性地旋转 360°：每次 turn(45) 后 detect_objects\n"
+        "3. 搜索词要多样：chair, table, sofa, cabinet, bed, lamp, vase, plant, shelf, desk\n"
+        "4. 每个检测到的物体调用 tag_object 记录\n"
+        "5. 如果视角不好（看不到物体），step('forward', 1.0) 移动位置\n"
+        "6. 完成后调用 list_found 查看汇总\n\n"
+        "## 重要\n"
+        "- 每次只处理一个视角，不要一次旋转太多\n"
+        "- tag_object 的 bbox 是归一化坐标 [0,1]，从 detect_objects 的返回值中获取\n"
+        "- 用 get_status 确认当前位置和已发现物体数量\n"
+    )
+
+    agent = ToolCallingAgent(
+        tools=tool_list,
+        model=model,
+        instructions=instructions,
+        max_steps=50,
+    )
+    _EXP_AGENT_CACHE = agent
+    return agent
+
 # ---------------------------------------------------------------------------
 # UI — 先定义所有组件，最后统一绑定事件
 # ---------------------------------------------------------------------------
@@ -1261,27 +1337,37 @@ def build_app() -> gr.Blocks:
 
         with gr.Tab("VLM 自动探索"):
             gr.Markdown(
-                "VLM 在场景中自动旋转 360°，每个视角用 Falcon 检测物体，"
-                "3D 定位后加入队列。\n"
-                "需要先启动 Falcon server "
-                "(`falcon_inference_server.py --port 8390`)。"
+                "VLM Agent 在 3DGS 场景中自主导航，通过 Falcon 检测细粒度物体。\n"
+                "需要 Falcon server (端口 8390) 运行中。\n\n"
+                "**流程**：设置初始视角 → 初始化 → 在对话中引导 Agent 搜索物体"
             )
-            explore_query = gr.Textbox(
-                label="搜索物体（逗号分隔）",
-                value="chair, table, sofa, cabinet, bed, lamp, vase, plant",
-                interactive=True,
+            with gr.Accordion("📍 初始视角设置", open=True):
+                with gr.Row():
+                    init_eye_x = gr.Number(label="位置 X", value=0.0)
+                    init_eye_y = gr.Number(label="高度 Y", value=1.5,
+                                           info="人眼高度约 1.5m")
+                    init_eye_z = gr.Number(label="位置 Z", value=0.0)
+                    init_yaw = gr.Number(label="朝向 (°)", value=0.0,
+                                         info="0=+X, 90=+Z, 180=-X, 270=-Z")
+                explore_init_btn = gr.Button("🚀 初始化探索 Agent", variant="primary")
+                explore_init_status = gr.Markdown("")
+            explore_chatbot = gr.Chatbot(
+                label="VLM 探索过程", height=400, type="messages",
+                placeholder="初始化后，输入指令如「搜索房间内所有椅子和桌子」",
             )
-            explore_btn = gr.Button("🔍 开始 VLM 探索", variant="primary")
-            explore_console = gr.Textbox(
-                label="探索进度", lines=8, interactive=False,
-                placeholder="点击「开始 VLM 探索」后，进度将在此显示...",
-            )
+            with gr.Row():
+                explore_input = gr.Textbox(
+                    label="指令", scale=4,
+                    placeholder="如：搜索房间内所有椅子、桌子、柜子、花瓶",
+                )
+                explore_send = gr.Button("发送", variant="primary", scale=1)
             explore_gallery = gr.Gallery(
-                label="发现的物体", columns=4, height=300,
+                label="已发现物体", columns=4, height=250,
                 show_label=False, object_fit="contain", preview=True,
             )
-            explore_results = gr.State([])  # list of found objects
+            explore_results = gr.State([])
             with gr.Row():
+                explore_refresh_btn = gr.Button("🔄 刷新已发现物体", variant="secondary")
                 explore_queue_btn = gr.Button("📦 全部加入 TRELLIS 队列", variant="secondary")
             explore_output = gr.JSON(label="队列状态")
 
@@ -1635,122 +1721,135 @@ def build_app() -> gr.Blocks:
             except Exception as e:
                 return {"错误": f"生成失败: {e}"}
 
-        # --- B类 Mesh: VLM 自动探索 Tab ---
-        def run_vlm_exploration(scene_name: str, query: str):
-            """VLM 在场景中自动 360° 探索 B 类物体。"""
+        # --- B类 Mesh: VLM Agent 探索 Tab ---
+        def _explorer_init(scene_name: str, ex: float, ey: float, ez: float, yaw: float):
+            """初始化探索 Agent：启动 MCP 子进程 + 首条消息。"""
             if not scene_name:
-                yield "❌ 未选择场景", [], []
-                return
-            ply_path = ROOT / "data" / f"{scene_name}.ply"
-            if not ply_path.exists():
-                yield f"❌ PLY 不存在: {ply_path}", [], []
-                return
-            feat_path = ROOT / "output" / scene_name / f"{scene_name}_feat.pt"
-            yield f"正在加载场景 {scene_name}...", [], []
+                return "❌ 未选择场景", []
+            try:
+                _reset_explorer_agent()
+                agent = _get_explorer_agent(scene_name)
+                msg = (
+                    f"请在位置 ({ex}, {ey}, {ez}) 以朝向 {yaw}° 初始化探索。"
+                    f"调用 explore_init(center_x={ex}, center_z={ez}, "
+                    f"eye_height={ey}, initial_yaw={yaw})，"
+                    f"然后简要描述你看到的场景（2-3 句话）。"
+                )
+                response = agent.run(msg)
+                chat = [{"role": "assistant", "content": str(response)}]
+                return f"✅ Agent 已初始化。", chat
+            except Exception as e:
+                return _format_agent_error(e), []
 
-            import math, io as _io
-            from bim_recon.gs_scene import GSScene
-            from bim_recon.falcon_client import FalconClient
-            from bim_recon.mcp_explorer import (
-                ExplorerState, _render_current, _save_view, _estimate_3d,
-            )
-            from PIL import Image as _PIL
-
-            scene = GSScene.from_ply(
-                str(ply_path),
-                feat_path=str(feat_path) if feat_path.exists() else None,
-            )
-            mn = scene.means.min(dim=0).values.cpu().numpy()
-            mx = scene.means.max(dim=0).values.cpu().numpy()
-            explore_dir = ROOT / "output" / scene_name / "explore"
-            state = ExplorerState(
-                scene=scene, explore_dir=explore_dir,
-                bounds_min=tuple(mn.tolist()), bounds_max=tuple(mx.tolist()),
-            )
-            state.cam_eye = [
-                float((mn[0] + mx[0]) / 2), float(mn[1]) + 1.5,
-                float((mn[2] + mx[2]) / 2),
-            ]
-            state.cam_yaw = 0.0
-            state.initialized = True
-            explore_dir.mkdir(parents=True, exist_ok=True)
-
-            falcon = FalconClient(port=8390)
-            if not falcon.health():
-                yield "❌ Falcon 服务不可达 (127.0.0.1:8390)，请先启动", [], []
-                return
-
-            labels = [l.strip() for l in query.split(",") if l.strip()]
-            found_objects: list = []
-            gallery_items: list = []
-
-            for angle_idx in range(8):
-                angle = angle_idx * 45
-                state.cam_yaw = math.radians(angle)
-                png, _result, pose = _render_current(state)
-                _save_view(state, png)
-                img = _PIL.open(_io.BytesIO(png))
-                console = f"视角 {angle}° ({angle_idx+1}/8) — 检测 {len(labels)} 类物体...\n"
-                for label in labels:
-                    try:
-                        dets = falcon.segment(img, label, task="detection")
-                    except Exception as ex:
-                        console += f"  ⚠ {label}: 检测失败 ({ex})\n"
-                        continue
-                    for det in dets:
-                        pos3d = _estimate_3d(
-                            scene, pose, det.bbox,
-                            state.width, state.height, state.cam_fov,
-                        )
-                        if pos3d is None:
-                            continue
-                        is_dup = any(
-                            o["label"] == label and
-                            math.sqrt(sum(
-                                (o["position_3d"][i] - round(pos3d[i], 2)) ** 2
-                                for i in range(3)
-                            )) < 0.3
-                            for o in found_objects
-                        )
-                        if is_dup:
-                            continue
-                        state.obj_counter += 1
-                        obj_id = f"obj_{state.obj_counter:03d}"
-                        obj_view = _save_view(state, png, suffix=f"_{label}_{obj_id}")
-                        found_objects.append({
-                            "id": obj_id, "label": label,
-                            "position_3d": [round(v, 2) for v in pos3d],
-                            "view": obj_view, "trellis_status": "pending",
-                        })
-                        gallery_items.append((obj_view, f"{label} #{obj_id}"))
-                        console += (f"  ✓ {label} at "
-                                    f"({pos3d[0]:.1f}, {pos3d[1]:.1f}, {pos3d[2]:.1f})\n")
-                console += f"累计发现 {len(found_objects)} 个物体\n"
-                yield console, gallery_items, found_objects
-
-            from collections import Counter
-            counts = Counter(o["label"] for o in found_objects)
-            summary = f"✅ 探索完成！共发现 {len(found_objects)} 个物体:\n"
-            for label, count in counts.most_common():
-                summary += f"  {label}: {count}\n"
-            yield summary, gallery_items, found_objects
-
-        explore_btn.click(
-            fn=run_vlm_exploration,
-            inputs=[scene_state, explore_query],
-            outputs=[explore_console, explore_gallery, explore_results],
+        explore_init_btn.click(
+            fn=_explorer_init,
+            inputs=[scene_state, init_eye_x, init_eye_y, init_eye_z, init_yaw],
+            outputs=[explore_init_status, explore_chatbot],
         )
 
-        def _queue_all_for_trellis(found_objects: list, scene_name: str):
-            if not found_objects:
+        def _explorer_respond(message: str, history: list, scene_name: str):
+            """流式显示 Agent 探索过程（思考 + 工具调用）。"""
+            if not message.strip():
+                yield history, ""
+                return
+            history = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": ""},
+            ]
+            try:
+                agent = _get_explorer_agent(scene_name)
+                from smolagents import PlanningStep, FinalAnswerStep
+
+                steps_lines: list[str] = []
+                current_step_lines: list[str] = []
+                final_answer = ""
+
+                for step in agent.run(message, stream=True):
+                    updated = False
+                    if isinstance(step, PlanningStep):
+                        steps_lines.append(f"📋 **计划**: {step.plan}")
+                        updated = True
+                    elif hasattr(step, "tool_calls") and step.tool_calls:
+                        current_step_lines = []
+                        for tc in step.tool_calls:
+                            name = tc.name if hasattr(tc, "name") else str(tc)
+                            args_str = str(tc.arguments) if hasattr(tc, "arguments") else ""
+                            if len(args_str) > 200:
+                                args_str = args_str[:200] + "…"
+                            current_step_lines.append(f"🔧 **调用**: `{name}`({args_str})")
+                        if hasattr(step, "observations") and step.observations:
+                            obs = str(step.observations)[:300]
+                            current_step_lines.append(f"   ↳ {obs}")
+                        updated = True
+                    elif isinstance(step, FinalAnswerStep):
+                        final_answer = str(step.output) if hasattr(step, "output") else str(step)
+                        updated = True
+
+                    if updated:
+                        parts = ["🤔 **Agent 探索中...**\n"]
+                        parts.extend(steps_lines)
+                        parts.extend(current_step_lines)
+                        if final_answer:
+                            parts = [final_answer]
+                        history[-1] = {"role": "assistant", "content": "\n".join(parts)}
+                        yield history, ""
+
+                if not final_answer and steps_lines:
+                    history[-1] = {"role": "assistant", "content": "\n".join(steps_lines)}
+                    yield history, ""
+            except Exception as e:
+                history[-1] = {"role": "assistant", "content": _format_agent_error(e)}
+                yield history, ""
+
+        explore_send.click(
+            fn=_explorer_respond,
+            inputs=[explore_input, explore_chatbot, scene_state],
+            outputs=[explore_chatbot, explore_input],
+        )
+        explore_input.submit(
+            fn=_explorer_respond,
+            inputs=[explore_input, explore_chatbot, scene_state],
+            outputs=[explore_chatbot, explore_input],
+        )
+
+        def _refresh_explore_gallery(scene_name: str):
+            """从 found_objects.json 读取已发现物体。"""
+            if not scene_name:
+                return [], []
+            found_path = ROOT / "output" / scene_name / "explore" / "found_objects.json"
+            if not found_path.exists():
+                return [], []
+            found = json.loads(found_path.read_text(encoding="utf-8"))
+            gallery = [
+                (o["best_view"], f'{o["label"]} #{o["id"]}')
+                for o in found if o.get("best_view") and Path(o["best_view"]).exists()
+            ]
+            return gallery, found
+
+        explore_refresh_btn.click(
+            fn=_refresh_explore_gallery,
+            inputs=[scene_state],
+            outputs=[explore_gallery, explore_results],
+        )
+
+        def _queue_all_for_trellis(scene_name: str):
+            """从 found_objects.json 读取，写入 TRELLIS 队列。"""
+            if not scene_name:
+                return {"错误": "未选择场景"}
+            found_path = ROOT / "output" / scene_name / "explore" / "found_objects.json"
+            if not found_path.exists():
                 return {"错误": "没有已发现的物体"}
-            queue_dir = ROOT / "output" / (scene_name or "default") / "trellis_queue"
+            found = json.loads(found_path.read_text(encoding="utf-8"))
+            if not found:
+                return {"错误": "没有已发现的物体"}
+            queue_dir = ROOT / "output" / scene_name / "trellis_queue"
             queue_dir.mkdir(parents=True, exist_ok=True)
             queued = 0
-            for obj in found_objects:
+            for obj in found:
                 entry = {
                     "object_id": obj["id"], "label": obj["label"],
-                    "image_path": obj["view"], "position_3d": obj["position_3d"],
+                    "image_path": obj.get("best_view", ""),
+                    "position_3d": obj.get("position_3d", [0, 0, 0]),
                 }
                 (queue_dir / f"{obj['id']}.json").write_text(
                     json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8",
@@ -1761,7 +1860,7 @@ def build_app() -> gr.Blocks:
 
         explore_queue_btn.click(
             fn=_queue_all_for_trellis,
-            inputs=[explore_results, scene_state],
+            inputs=[scene_state],
             outputs=[explore_output],
         )
 
