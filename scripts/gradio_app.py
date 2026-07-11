@@ -1352,7 +1352,7 @@ def build_app() -> gr.Blocks:
                 explore_init_btn = gr.Button("🚀 初始化探索 Agent", variant="primary")
                 explore_init_status = gr.Markdown("")
             explore_chatbot = gr.Chatbot(
-                label="VLM 探索过程", height=400, type="messages",
+                label="VLM 探索过程", height=400,
                 placeholder="初始化后，输入指令如「搜索房间内所有椅子和桌子」",
             )
             with gr.Row():
