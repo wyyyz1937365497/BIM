@@ -281,13 +281,17 @@ def detect_elements(
             if falcon is not None:
                 # --- Falcon online: authoritative segmentation ---
                 elev_path = str(out_dir / f"{cfg.name}_{i}_elevation.png")
-                spatial = extract_spatial(
-                    falcon, scene, r.candidate, walls[wi],
-                    floor_z, ceiling_z, center,
-                    element_name=cfg.name,
-                    up_axis=up_axis,
-                    save_image_path=elev_path,
-                )
+                try:
+                    spatial = extract_spatial(
+                        falcon, scene, r.candidate, walls[wi],
+                        floor_z, ceiling_z, center,
+                        element_name=cfg.name,
+                        up_axis=up_axis,
+                        save_image_path=elev_path,
+                    )
+                except (TimeoutError, OSError, Exception) as ex:
+                    print(f"    [{cfg.name}] #{i}: Falcon 超时/错误 ({ex})，跳过")
+                    continue
                 if spatial is not None:
                     spatial_dict = {
                         "sill_height": spatial.sill_height,
