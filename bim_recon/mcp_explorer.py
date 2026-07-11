@@ -206,9 +206,9 @@ def build_server(state: ExplorerState) -> FastMCP:
 
     @mcp.tool()
     def explore_init(
-        center_x: Optional[float] = None,
-        center_z: Optional[float] = None,
-        eye_height: Optional[float] = None,
+        center_x: float = 0.0,
+        center_z: float = 0.0,
+        eye_height: float = 1.5,
         initial_yaw: float = 0.0,
     ) -> Any:
         """Initialise the explorer at the room centre (or a custom position).
