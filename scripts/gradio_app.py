@@ -1343,12 +1343,11 @@ def build_app() -> gr.Blocks:
             )
             with gr.Accordion("📍 初始视角设置", open=True):
                 with gr.Row():
-                    init_eye_x = gr.Number(label="位置 X", value=0.0)
-                    init_eye_y = gr.Number(label="高度 Y", value=1.5,
-                                           info="人眼高度约 1.5m")
-                    init_eye_z = gr.Number(label="位置 Z", value=0.0)
-                    init_yaw = gr.Number(label="朝向 (°)", value=0.0,
-                                         info="0=+X, 90=+Z, 180=-X, 270=-Z")
+                    explore_cam_btn = gr.Button("📸 从查看器获取视角", variant="secondary", scale=1)
+                    explore_cam_status = gr.Markdown(
+                        "先在 **⑥ 查看器** 中漫游到目标位置，再点击上方按钮获取视角。", scale=2,
+                    )
+                explore_cam_data = gr.State({})
                 explore_init_btn = gr.Button("🚀 初始化探索 Agent", variant="primary")
                 explore_init_status = gr.Markdown("")
             explore_chatbot = gr.Chatbot(
@@ -1722,28 +1721,42 @@ def build_app() -> gr.Blocks:
                 return {"错误": f"生成失败: {e}"}
 
         # --- B类 Mesh: VLM Agent 探索 Tab ---
-        def _explorer_init(scene_name: str, ex: float, ey: float, ez: float, yaw: float):
-            """初始化探索 Agent：启动 MCP 子进程 + 首条消息。"""
+        explore_cam_btn.click(
+            fn=fetch_camera_state,
+            outputs=[explore_cam_status, explore_cam_data],
+        )
+
+        def _explorer_init(scene_name: str, camera_data: dict):
+            """初始化探索 Agent：用查看器视角 + 启动 MCP 子进程 + 首条消息。"""
             if not scene_name:
                 return "❌ 未选择场景", []
+            if not camera_data or "position" not in camera_data:
+                return "⚠️ 请先点击「📸 从查看器获取视角」", []
+            import math
+            pos = camera_data["position"]
+            look = camera_data["look_at"]
+            eye_x, eye_y, eye_z = float(pos[0]), float(pos[1]), float(pos[2])
+            dx, dz = float(look[0]) - eye_x, float(look[2]) - eye_z
+            yaw = round(math.degrees(math.atan2(dz, dx)), 1)
             try:
                 _reset_explorer_agent()
                 agent = _get_explorer_agent(scene_name)
                 msg = (
-                    f"请在位置 ({ex}, {ey}, {ez}) 以朝向 {yaw}° 初始化探索。"
-                    f"调用 explore_init(center_x={ex}, center_z={ez}, "
-                    f"eye_height={ey}, initial_yaw={yaw})，"
+                    f"请在位置 ({eye_x:.2f}, {eye_y:.2f}, {eye_z:.2f}) "
+                    f"以朝向 {yaw}° 初始化探索。"
+                    f"调用 explore_init(center_x={eye_x:.2f}, center_z={eye_z:.2f}, "
+                    f"eye_height={eye_y:.2f}, initial_yaw={yaw})，"
                     f"然后简要描述你看到的场景（2-3 句话）。"
                 )
                 response = agent.run(msg)
                 chat = [{"role": "assistant", "content": str(response)}]
-                return f"✅ Agent 已初始化。", chat
+                return f"✅ Agent 已初始化 (视角来自查看器: {eye_x:.1f}, {eye_y:.1f}, {eye_z:.1f}, yaw={yaw}°)", chat
             except Exception as e:
                 return _format_agent_error(e), []
 
         explore_init_btn.click(
             fn=_explorer_init,
-            inputs=[scene_state, init_eye_x, init_eye_y, init_eye_z, init_yaw],
+            inputs=[scene_state, explore_cam_data],
             outputs=[explore_init_status, explore_chatbot],
         )
 
