@@ -211,6 +211,7 @@ def falcon_ring_scan(
     floor_z: float,
     ceiling_z: float,
     falcon: "FalconClient",
+    out_dir: Path,
     query: str = "door, window",
     up_axis: int = 2,
     num_views: int = 8,
@@ -268,45 +269,97 @@ def falcon_ring_scan(
         img = _PIL.fromarray(
             (result.colors * 255).clip(0, 255).astype(np.uint8)
         )
+        # Save the rendered view for gallery display
+        view_path = out_dir / f"falcon_scan_view_{i}.png"
+        img.save(str(view_path))
+        h_axes_local = h_axes
 
         # View matrix for backprojection
         viewmat = pose.to_viewmat()
-        R_c2w = viewmat[:3, :3].T  # world-to-camera → camera-to-world
+        R_c2w = viewmat[:3, :3].T
         eye_np = np.array(eye, dtype=np.float64)
+
+        def _unproject(px, py, d_val):
+            """Unproject a pixel + depth to world coordinates."""
+            px_c = max(0, min(img_size - 1, int(px)))
+            py_c = max(0, min(img_size - 1, int(py)))
+            x_c = (px_c - img_size / 2.0) / fx * d_val
+            y_c = (py_c - img_size / 2.0) / fx * d_val
+            return R_c2w @ np.array([x_c, y_c, d_val]) + eye_np
 
         for label in labels:
             try:
-                dets = falcon.segment(img, label, task="detection")
+                dets = falcon.segment(img, label, task="segmentation")
             except Exception as ex:
                 print(f"    [falcon_scan] view {i} '{label}': error ({ex})")
                 continue
             for det in dets:
-                u = int((det.bbox["x"] + det.bbox["w"] / 2) * img_size)
-                v = int((det.bbox["y"] + det.bbox["h"] / 2) * img_size)
-                u = max(0, min(img_size - 1, u))
-                v = max(0, min(img_size - 1, v))
-                d = float(result.depth[v, u])
-                if d < 0.1:
+                # Use mask_bbox if available (tighter), else detection bbox
+                mb = det.mask_bbox or det.bbox
+                bx, by, bw, bh = mb["x"], mb["y"], mb["w"], mb["h"]
+
+                # Sample depth at center
+                cu = (bx + bw / 2) * img_size
+                cv = (by + bh / 2) * img_size
+                d_center = float(result.depth[
+                    max(0, min(img_size-1, int(cv))),
+                    max(0, min(img_size-1, int(cu)))
+                ])
+                if d_center < 0.1:
                     continue
-                # Unproject pixel → camera space → world space
-                x_c = (u - img_size / 2.0) / fx * d
-                y_c = (v - img_size / 2.0) / fx * d
-                P_cam = np.array([x_c, y_c, d], dtype=np.float64)
-                P_world = (R_c2w @ P_cam + eye_np).tolist()
-                # Dedup
+
+                # Unproject center → world position
+                P_center = _unproject(cu, cv, d_center)
+                P_world = P_center.tolist()
+
+                # Dedup by position
                 if any(
                     math.sqrt(sum((P_world[j] - p[j]) ** 2 for j in range(3))) < 0.3
                     for p in seen_pos
                 ):
                     continue
                 seen_pos.append(P_world)
+
+                # Extract spatial measurements from depth at mask edges
+                # Bottom-center → sill height, Top-center → header height
+                d_bottom = float(result.depth[
+                    max(0, min(img_size-1, int((by + bh) * img_size))),
+                    max(0, min(img_size-1, int(cu)))
+                ])
+                d_top = float(result.depth[
+                    max(0, min(img_size-1, int(by * img_size))),
+                    max(0, min(img_size-1, int(cu)))
+                ])
+                d_bottom = d_bottom if d_bottom > 0.1 else d_center
+                d_top = d_top if d_top > 0.1 else d_center
+
+                P_bottom = _unproject(cu, (by + bh) * img_size, d_bottom)
+                P_top = _unproject(cu, by * img_size, d_top)
+
+                sill_h = float(P_bottom[up_axis]) - floor_z
+                header_h = float(P_top[up_axis]) - floor_z
+
+                # Width: left-right at center height
+                P_left = _unproject(bx * img_size, cv, d_center)
+                P_right = _unproject((bx + bw) * img_size, cv, d_center)
+                width_m = math.sqrt(
+                    (P_right[h_axes_local[0]] - P_left[h_axes_local[0]]) ** 2 +
+                    (P_right[h_axes_local[1]] - P_left[h_axes_local[1]]) ** 2
+                )
+
                 found.append({
                     "label": label,
                     "bbox": det.bbox,
+                    "mask_bbox": mb,
                     "world_pos": [round(c, 3) for c in P_world],
                     "view_index": i,
                     "azimuth_deg": round(math.degrees(az), 1),
-                    "depth": round(d, 3),
+                    "depth": round(d_center, 3),
+                    "sill_height": round(sill_h, 3),
+                    "header_height": round(header_h, 3),
+                    "element_height": round(max(0, header_h - sill_h), 3),
+                    "width_m": round(width_m, 3),
+                    "method": "falcon_center_depth",
                 })
 
         n_new = sum(1 for f in found if f["view_index"] == i)
@@ -328,13 +381,11 @@ def _detect_from_falcon(
 ) -> dict:
     """Process Falcon ring scan detections into pipeline result format.
 
-    Each detection is assigned to the nearest wall, then an elevation view
-    is rendered and Falcon segments it for precise spatial extent.
+    Uses spatial measurements (sill/header/width) extracted directly from
+    the center-view depth map — no elevation rendering needed.
     """
     from bim_recon.candidate_extractor import Candidate, project_point_to_wall
-    from bim_recon.spatial_extractor import extract_spatial
 
-    center = coords["center"]
     floor_z = coords["floor_z"]
     ceiling_z = coords["ceiling_z"]
     h_axes = [j for j in range(3) if j != up_axis]
@@ -360,53 +411,44 @@ def _detect_from_falcon(
         if best_wi is None:
             continue
 
-        wall = walls[best_wi]
-        wall_len = float(wall.get("length", 1.0))
+        sill = det.get("sill_height", 0.0)
+        header = det.get("header_height", sill + 1.0)
+        width_m = det.get("width_m", 0.8)
+        elem_h = det.get("element_height", max(0, header - sill))
+
         cand = Candidate(
             element_class=cfg.name, class_idx=0, wall_idx=best_wi,
-            t_min=max(0, best_t - 0.1), t_max=min(1, best_t + 0.1),
+            t_min=max(0, best_t - 0.05), t_max=min(1, best_t + 0.05),
             theta_center=det["azimuth_deg"], theta_span=10.0,
             r_mean=det["depth"],
-            h_min=0.0, h_max=ceiling_z - floor_z,
-            width_m=float(det["bbox"]["w"]) * 2.0,
-            num_points=100,
+            h_min=sill, h_max=header,
+            width_m=width_m, num_points=100,
             world_x=world_h[0], world_y=world_h[1],
         )
 
-        elev_path = str(out_dir / f"{cfg.name}_falcon_{i}_elevation.png")
-        try:
-            spatial = extract_spatial(
-                falcon, scene, cand, wall,
-                floor_z, ceiling_z, center,
-                element_name=cfg.name,
-                up_axis=up_axis,
-                save_image_path=elev_path,
-            )
-        except Exception as ex:
-            print(f"    [{cfg.name}] falcon #{i}: elevation error ({ex})")
-            spatial = None
+        # Reference the ring scan view image (saved by falcon_ring_scan)
+        view_img = f"falcon_scan_view_{det.get('view_index', 0)}.png"
+        view_path = out_dir / view_img
 
         d = {
             "candidate": cand.to_dict(),
             "confirmed": True,
-            "image_path": Path(elev_path).name if Path(elev_path).exists() else "",
+            "image_path": view_img if view_path.exists() else "",
             "vlm_response": "falcon_ring_scan",
+            "height_detection": {
+                "sill_height": sill,
+                "header_height": header,
+                "element_height": elem_h,
+                "width_m": width_m,
+                "t_min": best_t, "t_max": best_t,
+                "confidence": 0.85,
+                "method": det.get("method", "falcon_center_depth"),
+            },
         }
-
-        if spatial is not None:
-            d["height_detection"] = {
-                "sill_height": spatial.sill_height,
-                "header_height": spatial.header_height,
-                "element_height": spatial.element_height,
-                "width_m": spatial.width_m,
-                "t_min": spatial.t_min, "t_max": spatial.t_max,
-                "confidence": spatial.confidence, "method": spatial.method,
-            }
-            confirmed_count += 1
-            print(f"    [{cfg.name}] falcon #{i}: sill={spatial.sill_height:.3f}m "
-                  f"header={spatial.header_height:.3f}m ({spatial.method})")
-        else:
-            print(f"    [{cfg.name}] falcon #{i}: no spatial data")
+        confirmed_count += 1
+        print(f"    [{cfg.name}] falcon #{i}: sill={sill:.3f}m "
+              f"header={header:.3f}m w={width_m:.3f}m "
+              f"({det.get('method', 'center_depth')})")
         result_dicts.append(d)
 
     return {
@@ -902,7 +944,7 @@ def main() -> int:
     if falcon is not None:
         print(f"\n--- Stage 3: Falcon Ring Scan ---")
         falcon_dets = falcon_ring_scan(
-            scene, center, floor_z, ceiling_z, falcon,
+            scene, center, floor_z, ceiling_z, falcon, out_dir,
             query="door, window", up_axis=up_axis,
         )
         print(f"  Falcon detected {len(falcon_dets)} objects total")
