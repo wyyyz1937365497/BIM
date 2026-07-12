@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import atexit
 import logging
 import shutil
 import subprocess
@@ -142,6 +143,21 @@ def _wait_for_port(port: int, timeout: float = MAX_PORT_WAIT_S) -> bool:
     return False
 
 
+_CHILD_PROCS: list = []
+
+def _kill_child_procs():
+    """Kill all tracked child processes (viewer, pipeline, etc.)."""
+    for p in _CHILD_PROCS:
+        if p.poll() is None:  # still running
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _CHILD_PROCS.clear()
+
+atexit.register(_kill_child_procs)
+
+
 def start_viewer(scene_name: str) -> str:
     if not scene_name:
         return '<p style="color:red">请先选择场景</p>'
@@ -155,12 +171,13 @@ def start_viewer(scene_name: str) -> str:
         f'for /f "tokens=5" %a in (\'netstat -aon ^| findstr :{VIEWER_PORT} ^| findstr LISTENING\') do taskkill /f /pid %a',
         shell=True, capture_output=True,
     )
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, str(ROOT / "scripts" / "run_viewer.py"),
          "--input-root", input_root, "--feature-path", feat_path,
          "--port", str(VIEWER_PORT)],
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
+    _CHILD_PROCS.append(proc)
     if not _wait_for_port(VIEWER_PORT):
         return f'<p style="color:red">查看器启动失败 (端口 {VIEWER_PORT})</p>'
     return (f'<iframe src="http://127.0.0.1:{VIEWER_PORT}" '

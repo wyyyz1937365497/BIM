@@ -138,7 +138,11 @@ def generate(req: GenerateRequest):
             texture_size=req.texture_size,
             verbose=False,
         )
-        glb.export(str(glb_path))
+        # Export via trimesh.Scene to ensure textures are properly embedded
+        # in the GLB binary (direct Trimesh.export() can lose PBR textures).
+        import trimesh
+        scene = trimesh.Scene([glb])
+        scene.export(str(glb_path))
         outputs["gaussian"][0].save_ply(str(gaussian_path))
     except Exception as e:
         logger.error("GLB/PLY export failed: %s", e)
