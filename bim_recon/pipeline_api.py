@@ -147,16 +147,21 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
         overlay_candidates = list(out_dir.glob(f"*_{result_index}_elevation_overlay.png"))
         elevation_img = str(elevation_candidates[0]) if elevation_candidates else None
         overlay_img = str(overlay_candidates[0]) if overlay_candidates else None
-        # VLM verification images: stored in verify_<class>/ subdirectory
+        # VLM verification image: guard against empty name → directory path
         vlm_name = r.get("image_path", "")
-        vlm_path = out_dir / f"verify_{elem_class}" / vlm_name
-        if not vlm_path.exists():
-            vlm_path = out_dir / vlm_name  # fallback to flat layout
+        vlm_path = None
+        if vlm_name:
+            candidate_path = out_dir / f"verify_{elem_class}" / vlm_name
+            if not candidate_path.is_file():
+                candidate_path = out_dir / vlm_name
+            if candidate_path.is_file():
+                vlm_path = candidate_path
+        image_path_str = str(vlm_path) if vlm_path else ""
         results.append(ElementResult(
             element_class=elem_class,
             confirmed=r.get("confirmed", False),
             vlm_response=r.get("vlm_response", ""),
-            image_path=str(vlm_path) if vlm_path.exists() else "",
+            image_path=image_path_str,
             world_x=c.get("world_x", 0.0),
             world_y=c.get("world_y", 0.0),
             wall_idx=c.get("wall_idx", -1),
