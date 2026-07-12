@@ -477,6 +477,34 @@ class GSScene:
         """Render multiple poses. Currently loops; can be batched later."""
         return [self.render(p, width, height, fov_degrees) for p in poses]
 
+    @staticmethod
+    def render_validated(
+        scene: "GSScene",
+        pose: CameraPose,
+        width: int,
+        height: int,
+        fov_degrees: float = 60.0,
+        min_coverage: float = 0.05,
+        min_depth: float = 0.15,
+    ) -> Tuple[Optional[RenderResult], str, float]:
+        """Render and validate the viewpoint.
+
+        Returns ``(result, reason, metric)``:
+          - result: RenderResult if valid, None if the viewpoint is bad.
+          - reason: ``"ok"``, ``"low_coverage"``, or ``"too_close"``.
+          - metric: coverage ratio or min-depth (metres).
+        """
+        result = scene.render(pose, width, height, fov_degrees)
+        coverage = float((result.alpha > 0.1).mean())
+        if coverage < min_coverage:
+            return None, "low_coverage", coverage
+        valid_depths = result.depth[result.alpha > 0.1]
+        if len(valid_depths) > 0:
+            md = float(valid_depths.min())
+            if md < min_depth:
+                return None, "too_close", md
+        return result, "ok", coverage
+
     # ---- selection ----------------------------------------------------------
 
     def select_by_mask(

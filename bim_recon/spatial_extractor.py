@@ -129,46 +129,53 @@ def render_elevation(
     target_xy = np.array([candidate.world_x, candidate.world_y], dtype=np.float64)
     target_along = float(np.dot(target_xy - wall_start, wall_dir))
 
-    # FOV to cover full wall height + margin
-    margin = 0.3  # metres
-    fov_rad = 2.0 * math.atan((wall_height / 2.0 + margin) / camera_dist)
-    fov_deg = math.degrees(fov_rad)
-
-    # Horizontal / vertical extent at wall surface (fy = fx in fov_to_intrinsics)
-    extent_h = 2.0 * camera_dist * math.tan(fov_rad / 2.0)
-    extent_v = extent_h  # square image → square extent
-
-    cam_h = wall_height / 2.0  # mid-height above floor
-
+    # Retry loop: validate render, pull back if camera is inside geometry.
+    result = None
+    margin = 0.3
+    cam_h = wall_height / 2.0
     h_axes = [i for i in range(3) if i != up_axis]
 
-    eye_xy = target_xy + normal * camera_dist
-    eye = [0.0, 0.0, 0.0]
-    eye[h_axes[0]] = float(eye_xy[0])
-    eye[h_axes[1]] = float(eye_xy[1])
-    eye[up_axis] = floor_z + cam_h
+    for attempt, factor in enumerate([1.0, 1.5, 2.0, 3.0]):
+        adj_dist = camera_dist * factor
+        fov_rad = 2.0 * math.atan((wall_height / 2.0 + margin) / adj_dist)
+        fov_deg = math.degrees(fov_rad)
+        extent_h = 2.0 * adj_dist * math.tan(fov_rad / 2.0)
+        extent_v = extent_h
 
-    tgt = [0.0, 0.0, 0.0]
-    tgt[h_axes[0]] = float(target_xy[0])
-    tgt[h_axes[1]] = float(target_xy[1])
-    tgt[up_axis] = floor_z + cam_h
+        eye_xy = target_xy + normal * adj_dist
+        eye = [0.0, 0.0, 0.0]
+        eye[h_axes[0]] = float(eye_xy[0])
+        eye[h_axes[1]] = float(eye_xy[1])
+        eye[up_axis] = floor_z + cam_h
+        tgt = [0.0, 0.0, 0.0]
+        tgt[h_axes[0]] = float(target_xy[0])
+        tgt[h_axes[1]] = float(target_xy[1])
+        tgt[up_axis] = floor_z + cam_h
+        up = [0.0, 0.0, 0.0]
+        up[up_axis] = 1.0
+        pose = look_at_pose(
+            (eye[0], eye[1], eye[2]),
+            (tgt[0], tgt[1], tgt[2]),
+            (up[0], up[1], up[2]),
+        )
 
-    up = [0.0, 0.0, 0.0]
-    up[up_axis] = 1.0
+        from bim_recon.gs_scene import GSScene
+        result, reason, metric = GSScene.render_validated(
+            scene, pose, img_size, img_size, fov_deg,
+        )
+        if result is not None:
+            camera_dist = adj_dist  # use the distance that worked
+            break
+        if attempt < 3:
+            print(f"    viewpoint invalid ({reason}={metric:.2f}), "
+                  f"retry at {adj_dist:.1f}m ...")
 
-    pose = look_at_pose(
-        (eye[0], eye[1], eye[2]),
-        (tgt[0], tgt[1], tgt[2]),
-        (up[0], up[1], up[2]),
-    )
+    if result is None:
+        return None, None
 
-    result = scene.render(
-        pose, width=img_size, height=img_size, fov_degrees=fov_deg,
-    )
     img = Image.fromarray(
         (result.colors * 255).clip(0, 255).astype(np.uint8)
     )
-
     params = ElevationParams(
         camera_dist=camera_dist,
         fov_degrees=fov_deg,
@@ -307,12 +314,13 @@ def extract_spatial(
     Returns:
         :class:`SpatialResult` or ``None`` if Falcon finds nothing.
     """
-    # 1. Render elevation
+    # 1. Render elevation (with viewpoint validation + auto-retry)
     img, params = render_elevation(
         scene, candidate, wall, floor_z, ceiling_z,
         scan_center, up_axis, camera_dist, img_size,
     )
-
+    if img is None:
+        return None  # all viewpoints invalid, skip this candidate
     if save_image_path:
         img.save(save_image_path)
 

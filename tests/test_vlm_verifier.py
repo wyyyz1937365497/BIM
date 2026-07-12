@@ -239,6 +239,8 @@ class TestVerifyCandidatesMock:
         mock_scene = MagicMock()
         mock_result = MagicMock()
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
+        mock_result.alpha = np.ones((10, 10), dtype=np.float32)
+        mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
         with patch("bim_recon.vlm_verifier.query_vlm",
@@ -269,6 +271,8 @@ class TestVerifyCandidatesMock:
         mock_scene = MagicMock()
         mock_result = MagicMock()
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
+        mock_result.alpha = np.ones((10, 10), dtype=np.float32)
+        mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
         with patch("bim_recon.vlm_verifier.query_vlm",
@@ -296,6 +300,8 @@ class TestVerifyCandidatesMock:
         mock_scene = MagicMock()
         mock_result = MagicMock()
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
+        mock_result.alpha = np.ones((10, 10), dtype=np.float32)
+        mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
         with patch("bim_recon.vlm_verifier.query_vlm",
@@ -336,6 +342,8 @@ class TestVerifyCandidatesMock:
         mock_scene = MagicMock()
         mock_result = MagicMock()
         mock_result.colors = np.zeros((10, 10, 3), dtype=np.float32)
+        mock_result.alpha = np.ones((10, 10), dtype=np.float32)
+        mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
 
         with patch("bim_recon.vlm_verifier.query_ollama",

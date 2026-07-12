@@ -324,6 +324,7 @@ def verify_candidates(
     prompt = _build_prompt(element_class, vlm_hint)
 
     # Phase 1: Render all images sequentially (GPU is single-threaded)
+    from bim_recon.gs_scene import GSScene
     rendered: List[tuple] = []  # (index, candidate, img_path, eye, target, used_fov)
     for i, cand in enumerate(candidates):
         eye, target, used_fov = candidate_to_viewpoint(
@@ -332,15 +333,30 @@ def verify_candidates(
             scan_center, floor_z, fov=fov,
             up_axis=up_axis,
         )
-        pose = look_at_pose(
-            (eye[0], eye[1], eye[2]),
-            (target[0], target[1], target[2]),
-            up=(up_vec[0], up_vec[1], up_vec[2]),
-        )
-        render_result = scene.render(
-            pose, width=image_width, height=image_height,
-            fov_degrees=used_fov,
-        )
+        # Retry: validate render, pull back if camera is inside geometry.
+        render_result = None
+        for factor in [1.0, 1.5, 2.0, 3.0]:
+            adj_eye = [eye[j] + (eye[j] - target[j]) * (factor - 1.0)
+                       for j in range(3)]
+            pose = look_at_pose(
+                (adj_eye[0], adj_eye[1], adj_eye[2]),
+                (target[0], target[1], target[2]),
+                up=(up_vec[0], up_vec[1], up_vec[2]),
+            )
+            render_result, reason, metric = GSScene.render_validated(
+                scene, pose, image_width, image_height, used_fov,
+            )
+            if render_result is not None:
+                eye = adj_eye  # use the working position
+                break
+            if factor < 3.0:
+                print(f"    [{element_class}] #{i}: viewpoint invalid "
+                      f"({reason}={metric:.2f}), retry {factor:.1f}x ...")
+
+        if render_result is None:
+            print(f"    [{element_class}] #{i}: all viewpoints invalid, skipping")
+            continue
+
         wall_tag = f"w{cand.wall_idx}" if cand.wall_idx is not None else "free"
         img_name = f"verify_{element_class}_{i}_{wall_tag}.png"
         img_path = str(output_dir / img_name)
