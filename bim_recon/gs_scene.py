@@ -505,6 +505,59 @@ class GSScene:
                 return None, "too_close", md
         return result, "ok", coverage
 
+
+    # ---- occupancy-aware camera placement ─────────────────────────────
+
+    _occ_tree = None
+    _occ_radii: Optional[np.ndarray] = None
+
+    def build_occupancy(self) -> None:
+        """Build a KD-Tree from Gaussian means for occupancy queries.
+
+        Called lazily on first use; cached for the scene's lifetime.
+        Effective radii are capped at 0.3 m so that huge outlier Gaussians
+        (background, sky) don't block the entire scene.
+        """
+        from scipy.spatial import cKDTree
+        means_np = self.means.cpu().numpy()
+        scales_np = self.scales.cpu().numpy()
+        radii = scales_np.max(axis=1) * 3.0          # 3-sigma
+        self._occ_radii = np.minimum(radii, 0.3)      # cap outliers
+        self._occ_tree = cKDTree(means_np)
+
+    def is_position_free(self, point, margin: float = 0.05) -> bool:
+        """True if *point* (3-array) is outside all Gaussians (with margin)."""
+        if self._occ_tree is None:
+            self.build_occupancy()
+        p = np.asarray(point, dtype=np.float64)
+        dist, idx = self._occ_tree.query(p)
+        return float(dist) > float(self._occ_radii[idx]) + margin
+
+    def find_free_position(
+        self,
+        start,
+        direction,
+        max_dist: float = 5.0,
+        step: float = 0.1,
+        margin: float = 0.05,
+    ) -> Tuple[Optional[list], float]:
+        """March along *direction* from *start*; return first free position.
+
+        Returns ``(position, distance)`` or ``(None, max_dist)``.
+        """
+        if self._occ_tree is None:
+            self.build_occupancy()
+        d = np.asarray(direction, dtype=np.float64)
+        norm = np.linalg.norm(d)
+        if norm < 1e-9:
+            return None, max_dist
+        d /= norm
+        s = np.asarray(start, dtype=np.float64)
+        for dist in np.arange(step, max_dist + step, step):
+            pos = s + d * dist
+            if self.is_position_free(pos, margin):
+                return pos.tolist(), float(dist)
+        return None, max_dist
     # ---- selection ----------------------------------------------------------
 
     def select_by_mask(

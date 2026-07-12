@@ -242,6 +242,7 @@ class TestVerifyCandidatesMock:
         mock_result.alpha = np.ones((10, 10), dtype=np.float32)
         mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
+        mock_scene.find_free_position.return_value = (None, 5.0)
 
         with patch("bim_recon.vlm_verifier.query_vlm",
                    return_value="CONFIRMED\nA door is visible."):
@@ -274,6 +275,7 @@ class TestVerifyCandidatesMock:
         mock_result.alpha = np.ones((10, 10), dtype=np.float32)
         mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
+        mock_scene.find_free_position.return_value = (None, 5.0)
 
         with patch("bim_recon.vlm_verifier.query_vlm",
                    return_value="REJECTED\nNo door here."):
@@ -303,6 +305,7 @@ class TestVerifyCandidatesMock:
         mock_result.alpha = np.ones((10, 10), dtype=np.float32)
         mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
+        mock_scene.find_free_position.return_value = (None, 5.0)
 
         with patch("bim_recon.vlm_verifier.query_vlm",
                    side_effect=ConnectionError("VLM offline")):
@@ -345,6 +348,7 @@ class TestVerifyCandidatesMock:
         mock_result.alpha = np.ones((10, 10), dtype=np.float32)
         mock_result.depth = np.full((10, 10), 1.0, dtype=np.float32)
         mock_scene.render.return_value = mock_result
+        mock_scene.find_free_position.return_value = (None, 5.0)
 
         with patch("bim_recon.vlm_verifier.query_ollama",
                    return_value="CONFIRMED"):
