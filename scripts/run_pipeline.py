@@ -94,16 +94,32 @@ def detect_coordinate_system(scene: GSScene, label_set: list[str] | None = None)
 
     *label_set* is forwarded to the floor/ceiling dominant queries so the
     argmax runs over the active open-vocabulary label set.
+
+    If the semantic floor/ceiling detection produces an implausible room
+    height (< 1.5 m), falls back to the Gaussian position distribution
+    (1st/99th percentile along the detected up-axis).
     """
     floor_c = np.array(scene.query_semantics("floor", mode="dominant", label_set=label_set)["centroid"])
     ceiling_c = np.array(scene.query_semantics("ceiling", mode="dominant", label_set=label_set)["centroid"])
     up_axis = int(np.argmax(np.abs(ceiling_c - floor_c)))
     h_axes = [i for i in range(3) if i != up_axis]
+    floor_z = float(floor_c[up_axis])
+    ceiling_z = float(ceiling_c[up_axis])
+
+    # Validate detected height; fall back to Gaussian distribution if implausible.
+    if ceiling_z - floor_z < 1.5:
+        coords = scene.means[:, up_axis].cpu().numpy()
+        floor_z = float(np.percentile(coords, 1))
+        ceiling_z = float(np.percentile(coords, 99))
+        print(f"  ⚠ Semantic height detection implausible "
+              f"(<1.5m); geometric fallback: floor={floor_z:.3f}, "
+              f"ceiling={ceiling_z:.3f}, height={ceiling_z-floor_z:.3f}m")
+
     return {
         "up_axis": up_axis,
         "h_axes": h_axes,
-        "floor_z": float(floor_c[up_axis]),
-        "ceiling_z": float(ceiling_c[up_axis]),
+        "floor_z": floor_z,
+        "ceiling_z": ceiling_z,
         "center": (float(floor_c[h_axes[0]]), float(floor_c[h_axes[1]])),
     }
 

@@ -135,7 +135,7 @@ def render_elevation(
     cam_h = wall_height / 2.0
     h_axes = [i for i in range(3) if i != up_axis]
 
-    for attempt, factor in enumerate([1.0, 1.5, 2.0, 3.0]):
+    for attempt, factor in enumerate([1.0, 0.5, 1.5, 0.3, 2.0]):
         adj_dist = camera_dist * factor
         fov_rad = 2.0 * math.atan((wall_height / 2.0 + margin) / adj_dist)
         fov_deg = math.degrees(fov_rad)

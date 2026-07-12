@@ -335,7 +335,7 @@ def verify_candidates(
         )
         # Retry: validate render, pull back if camera is inside geometry.
         render_result = None
-        for factor in [1.0, 1.5, 2.0, 3.0]:
+        for factor in [1.0, 0.5, 1.5, 0.3, 2.0]:
             adj_eye = [eye[j] + (eye[j] - target[j]) * (factor - 1.0)
                        for j in range(3)]
             pose = look_at_pose(
