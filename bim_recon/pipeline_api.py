@@ -167,7 +167,8 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
             wall_idx=c.get("wall_idx", -1),
             result_index=result_index,
             height_detection=hd,
-            elevation_image=elevation_img if elevation_img and Path(elevation_img).exists() else None,
+            elevation_image=(elevation_img if elevation_img and Path(elevation_img).exists()
+                              else image_path_str) if image_path_str else None,
             overlay_image=overlay_img if overlay_img and Path(overlay_img).exists() else None,
         ))
     return results
