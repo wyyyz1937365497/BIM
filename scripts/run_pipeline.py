@@ -386,10 +386,12 @@ def _detect_from_falcon(
             print(f"    [{cfg.name}] falcon #{i}: elevation error ({ex})")
             spatial = None
 
-        d = cand.to_dict()
-        d["confirmed"] = True
-        d["image_path"] = Path(elev_path).name if Path(elev_path).exists() else ""
-        d["vlm_response"] = "falcon_ring_scan"
+        d = {
+            "candidate": cand.to_dict(),
+            "confirmed": True,
+            "image_path": Path(elev_path).name if Path(elev_path).exists() else "",
+            "vlm_response": "falcon_ring_scan",
+        }
 
         if spatial is not None:
             d["height_detection"] = {
