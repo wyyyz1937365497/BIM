@@ -201,6 +201,222 @@ def snap_wall_endpoints(walls: list[dict], threshold: float = 0.5) -> list[dict]
 
 
 # ---------------------------------------------------------------------------
+# Falcon ring scan: direct 2D detection + depth backprojection
+# ---------------------------------------------------------------------------
+
+
+def falcon_ring_scan(
+    scene: GSScene,
+    center: tuple[float, float],
+    floor_z: float,
+    ceiling_z: float,
+    falcon: "FalconClient",
+    query: str = "door, window",
+    up_axis: int = 2,
+    num_views: int = 8,
+    img_size: int = 768,
+) -> list[dict]:
+    """360° Falcon detection at mid-height with depth backprojection.
+
+    Renders a full-perspective panorama ring at eye level, runs Falcon
+    detection on each view, and backprojects detections to 3D world
+    coordinates using the rendered depth map.
+
+    Returns a list of dicts:
+      ``{label, bbox, world_pos, view_index, azimuth_deg, depth}``
+    """
+    import math
+    import io as _io
+    from PIL import Image as _PIL
+    from bim_recon.gs_scene import GSScene as _GS, look_at_pose
+
+    mid_z = (floor_z + ceiling_z) / 2.0
+    h_axes = [i for i in range(3) if i != up_axis]
+    cx, cy = float(center[0]), float(center[1])
+    fov = 60.0
+    fx = 0.5 * img_size / math.tan(0.5 * math.radians(fov))
+    labels = [l.strip() for l in query.split(",") if l.strip()]
+
+    found: list[dict] = []
+    seen_pos: list[list[float]] = []  # for dedup
+
+    for i in range(num_views):
+        az = math.radians(i * (360.0 / num_views))
+        eye = [0.0, 0.0, 0.0]
+        eye[h_axes[0]] = cx
+        eye[h_axes[1]] = cy
+        eye[up_axis] = mid_z
+        tgt = [0.0, 0.0, 0.0]
+        tgt[h_axes[0]] = cx + math.cos(az)
+        tgt[h_axes[1]] = cy + math.sin(az)
+        tgt[up_axis] = mid_z
+        up = [0.0, 0.0, 0.0]
+        up[up_axis] = 1.0
+        pose = look_at_pose(
+            (eye[0], eye[1], eye[2]),
+            (tgt[0], tgt[1], tgt[2]),
+            (up[0], up[1], up[2]),
+        )
+
+        result, reason, _met = _GS.render_validated(
+            scene, pose, img_size, img_size, fov,
+        )
+        if result is None:
+            print(f"    [falcon_scan] view {i} ({i*45}°): invalid ({reason}), skip")
+            continue
+
+        img = _PIL.fromarray(
+            (result.colors * 255).clip(0, 255).astype(np.uint8)
+        )
+
+        # View matrix for backprojection
+        viewmat = pose.to_viewmat()
+        R_c2w = viewmat[:3, :3].T  # world-to-camera → camera-to-world
+        eye_np = np.array(eye, dtype=np.float64)
+
+        for label in labels:
+            try:
+                dets = falcon.segment(img, label, task="detection")
+            except Exception as ex:
+                print(f"    [falcon_scan] view {i} '{label}': error ({ex})")
+                continue
+            for det in dets:
+                u = int((det.bbox["x"] + det.bbox["w"] / 2) * img_size)
+                v = int((det.bbox["y"] + det.bbox["h"] / 2) * img_size)
+                u = max(0, min(img_size - 1, u))
+                v = max(0, min(img_size - 1, v))
+                d = float(result.depth[v, u])
+                if d < 0.1:
+                    continue
+                # Unproject pixel → camera space → world space
+                x_c = (u - img_size / 2.0) / fx * d
+                y_c = (v - img_size / 2.0) / fx * d
+                P_cam = np.array([x_c, y_c, d], dtype=np.float64)
+                P_world = (R_c2w @ P_cam + eye_np).tolist()
+                # Dedup
+                if any(
+                    math.sqrt(sum((P_world[j] - p[j]) ** 2 for j in range(3))) < 0.3
+                    for p in seen_pos
+                ):
+                    continue
+                seen_pos.append(P_world)
+                found.append({
+                    "label": label,
+                    "bbox": det.bbox,
+                    "world_pos": [round(c, 3) for c in P_world],
+                    "view_index": i,
+                    "azimuth_deg": round(math.degrees(az), 1),
+                    "depth": round(d, 3),
+                })
+
+        n_new = sum(1 for f in found if f["view_index"] == i)
+        print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
+              f"(total {len(found)})")
+
+    return found
+
+
+def _detect_from_falcon(
+    falcon_dets: list[dict],
+    walls: list[dict],
+    coords: dict,
+    scene: GSScene,
+    cfg: ElementConfig,
+    falcon: "FalconClient",
+    out_dir: Path,
+    up_axis: int,
+) -> dict:
+    """Process Falcon ring scan detections into pipeline result format.
+
+    Each detection is assigned to the nearest wall, then an elevation view
+    is rendered and Falcon segments it for precise spatial extent.
+    """
+    from bim_recon.candidate_extractor import Candidate, project_point_to_wall
+    from bim_recon.spatial_extractor import extract_spatial
+
+    center = coords["center"]
+    floor_z = coords["floor_z"]
+    ceiling_z = coords["ceiling_z"]
+    h_axes = [j for j in range(3) if j != up_axis]
+
+    result_dicts = []
+    confirmed_count = 0
+
+    for i, det in enumerate(falcon_dets):
+        world_h = [det["world_pos"][h_axes[0]], det["world_pos"][h_axes[1]]]
+
+        # Find nearest wall
+        best_wi, best_t, best_dist = None, 0.5, float("inf")
+        for wi, wall in enumerate(walls):
+            ws = np.array([wall["x1"], wall["y1"]])
+            we = np.array([wall["x2"], wall["y2"]])
+            t, dist = project_point_to_wall(
+                np.array(world_h), ws, we,
+            )
+            if dist < best_dist:
+                best_dist = dist
+                best_wi = wi
+                best_t = t
+        if best_wi is None:
+            continue
+
+        wall = walls[best_wi]
+        wall_len = float(wall.get("length", 1.0))
+        cand = Candidate(
+            element_class=cfg.name, class_idx=0, wall_idx=best_wi,
+            t_min=max(0, best_t - 0.1), t_max=min(1, best_t + 0.1),
+            theta_center=det["azimuth_deg"], theta_span=10.0,
+            r_mean=det["depth"],
+            h_min=0.0, h_max=ceiling_z - floor_z,
+            width_m=float(det["bbox"]["w"]) * 2.0,
+            num_points=100,
+            world_x=world_h[0], world_y=world_h[1],
+        )
+
+        elev_path = str(out_dir / f"{cfg.name}_falcon_{i}_elevation.png")
+        try:
+            spatial = extract_spatial(
+                falcon, scene, cand, wall,
+                floor_z, ceiling_z, center,
+                element_name=cfg.name,
+                up_axis=up_axis,
+                save_image_path=elev_path,
+            )
+        except Exception as ex:
+            print(f"    [{cfg.name}] falcon #{i}: elevation error ({ex})")
+            spatial = None
+
+        d = cand.to_dict()
+        d["confirmed"] = True
+        d["image_path"] = Path(elev_path).name if Path(elev_path).exists() else ""
+        d["vlm_response"] = "falcon_ring_scan"
+
+        if spatial is not None:
+            d["height_detection"] = {
+                "sill_height": spatial.sill_height,
+                "header_height": spatial.header_height,
+                "element_height": spatial.element_height,
+                "width_m": spatial.width_m,
+                "t_min": spatial.t_min, "t_max": spatial.t_max,
+                "confidence": spatial.confidence, "method": spatial.method,
+            }
+            confirmed_count += 1
+            print(f"    [{cfg.name}] falcon #{i}: sill={spatial.sill_height:.3f}m "
+                  f"header={spatial.header_height:.3f}m ({spatial.method})")
+        else:
+            print(f"    [{cfg.name}] falcon #{i}: no spatial data")
+        result_dicts.append(d)
+
+    return {
+        "element": cfg.name,
+        "total_candidates": len(falcon_dets),
+        "after_prefilter": len(falcon_dets),
+        "confirmed": confirmed_count,
+        "rejected": 0,
+        "results": result_dicts,
+    }
+
+# ---------------------------------------------------------------------------
 # Element detection (doors, windows, ...)
 # ---------------------------------------------------------------------------
 
@@ -679,8 +895,26 @@ def main() -> int:
     snapped_path.write_text(json.dumps(walls_snapped, indent=2), encoding="utf-8")
     print(f"  Snapped walls saved: {snapped_path}")
 
-    # === Stage 5: Element detection ===
-    print(f"\n--- Stage 3: Element Detection ---")
+    # === Stage 5: Falcon ring scan (direct detection, if available) ===
+    falcon_dets: list[dict] = []
+    if falcon is not None:
+        print(f"\n--- Stage 3: Falcon Ring Scan ---")
+        falcon_dets = falcon_ring_scan(
+            scene, center, floor_z, ceiling_z, falcon,
+            query="door, window", up_axis=up_axis,
+        )
+        print(f"  Falcon detected {len(falcon_dets)} objects total")
+        # Save detections
+        (out_dir / "falcon_ring_scan.json").write_text(
+            json.dumps(falcon_dets, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        # Group by label
+        from collections import Counter
+        for label, count in Counter(d["label"] for d in falcon_dets).most_common():
+            print(f"    {label}: {count}")
+
+    # === Stage 5b: Element detection ===
+    print(f"\n--- Stage 3b: Element Detection ---")
     all_results = {}
     for elem_type in args.elements:
         try:
@@ -689,12 +923,25 @@ def main() -> int:
             print(f"  Unknown element type '{elem_type}', skipping")
             continue
 
-        result = detect_elements(
-            cfg, scans, walls_snapped, coords, scene,
-            out_dir, vlm_api_base, vlm_model, vlm_api_key, args.skip_vlm,
-            falcon=falcon,
-            labels=labels,
-        )
+        # If Falcon ring scan found this element type, use those detections
+        # as pre-confirmed candidates (skip SceneSplat + VLM).
+        elem_falcon_dets = [
+            d for d in falcon_dets if d["label"] == cfg.semantic_label
+        ]
+        if elem_falcon_dets:
+            print(f"  [{elem_type}] Using {len(elem_falcon_dets)} Falcon detections "
+                  f"(bypassing SceneSplat + VLM)")
+            result = _detect_from_falcon(
+                elem_falcon_dets, walls_snapped, coords, scene,
+                cfg, falcon, out_dir, up_axis,
+            )
+        else:
+            result = detect_elements(
+                cfg, scans, walls_snapped, coords, scene,
+                out_dir, vlm_api_base, vlm_model, vlm_api_key, args.skip_vlm,
+                falcon=falcon,
+                labels=labels,
+            )
         all_results[elem_type] = result
 
         # Save per-element JSON
