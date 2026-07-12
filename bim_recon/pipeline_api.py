@@ -142,34 +142,30 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
         c = r.get("candidate", {})
         hd = r.get("height_detection")
         elem_class = c.get("element_class", "")
-        # Elevation images: search by result index
-        elevation_candidates = list(out_dir.glob(f"*_{result_index}_elevation.png"))
-        overlay_candidates = list(out_dir.glob(f"*_{result_index}_elevation_overlay.png"))
-        elevation_img = str(elevation_candidates[0]) if elevation_candidates else None
-        overlay_img = str(overlay_candidates[0]) if overlay_candidates else None
-        # VLM verification image: guard against empty name → directory path
-        vlm_name = r.get("image_path", "")
-        vlm_path = None
-        if vlm_name:
-            candidate_path = out_dir / f"verify_{elem_class}" / vlm_name
-            if not candidate_path.is_file():
-                candidate_path = out_dir / vlm_name
-            if candidate_path.is_file():
-                vlm_path = candidate_path
-        image_path_str = str(vlm_path) if vlm_path else ""
+        # Resolve view image (falcon_scan_view or verify_* pattern)
+        view_name = r.get("image_path", "")
+        view_path = None
+        if view_name:
+            for candidate in [
+                out_dir / f"verify_{elem_class}" / view_name,
+                out_dir / view_name,
+            ]:
+                if candidate.is_file():
+                    view_path = candidate
+                    break
+        view_str = str(view_path) if view_path else ""
         results.append(ElementResult(
             element_class=elem_class,
             confirmed=r.get("confirmed", False),
             vlm_response=r.get("vlm_response", ""),
-            image_path=image_path_str,
+            image_path=view_str,
             world_x=c.get("world_x", 0.0),
             world_y=c.get("world_y", 0.0),
             wall_idx=c.get("wall_idx", -1),
             result_index=result_index,
             height_detection=hd,
-            elevation_image=(elevation_img if elevation_img and Path(elevation_img).exists()
-                              else image_path_str) if image_path_str else None,
-            overlay_image=overlay_img if overlay_img and Path(overlay_img).exists() else None,
+            elevation_image=view_str if view_str else None,
+            overlay_image=None,
         ))
     return results
 
