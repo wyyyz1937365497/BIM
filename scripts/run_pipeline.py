@@ -269,9 +269,6 @@ def falcon_ring_scan(
         img = _PIL.fromarray(
             (result.colors * 255).clip(0, 255).astype(np.uint8)
         )
-        # Save the rendered view for gallery display
-        view_path = out_dir / f"falcon_scan_view_{i}.png"
-        img.save(str(view_path))
         h_axes_local = h_axes
 
         # View matrix for backprojection
@@ -362,11 +359,23 @@ def falcon_ring_scan(
                     "method": "falcon_center_depth",
                 })
 
+        # Draw segmentation mask_bbox annotations on the view image
+        from PIL import ImageDraw
+        annotated = img.copy()
+        draw = ImageDraw.Draw(annotated)
         n_new = sum(1 for f in found if f["view_index"] == i)
+        for vd in [f for f in found if f["view_index"] == i]:
+            mb = vd.get("mask_bbox", vd["bbox"])
+            x1 = int(mb["x"] * img_size)
+            y1 = int(mb["y"] * img_size)
+            x2 = int((mb["x"] + mb["w"]) * img_size)
+            y2 = int((mb["y"] + mb["h"]) * img_size)
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+            draw.text((x1 + 4, y1 + 4), vd["label"], fill="red")
+        view_path = out_dir / f"falcon_scan_view_{i}.png"
+        annotated.save(str(view_path))
         print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
               f"(total {len(found)})")
-
-    return found
 
 
 def _detect_from_falcon(
