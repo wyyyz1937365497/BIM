@@ -291,25 +291,23 @@ def falcon_ring_scan(
                 print(f"    [falcon_scan] view {i} '{label}': error ({ex})")
                 continue
             for det in dets:
-                # Use mask_bbox if available (tighter), else detection bbox
+                # Falcon bbox is CENTER-based: {x: cx, y: cy, w, h} normalized
                 mb = det.mask_bbox or det.bbox
-                bx, by, bw, bh = mb["x"], mb["y"], mb["w"], mb["h"]
+                cx_n, cy_n, w_n, h_n = mb["x"], mb["y"], mb["w"], mb["h"]
 
-                # Sample depth at center
-                cu = (bx + bw / 2) * img_size
-                cv = (by + bh / 2) * img_size
+                # Depth at center pixel
+                cu = cx_n * img_size
+                cv = cy_n * img_size
                 d_center = float(result.depth[
-                    max(0, min(img_size-1, int(cv))),
-                    max(0, min(img_size-1, int(cu)))
+                    max(0, min(img_size - 1, int(cv))),
+                    max(0, min(img_size - 1, int(cu)))
                 ])
                 if d_center < 0.1:
                     continue
 
-                # Unproject center → world position
                 P_center = _unproject(cu, cv, d_center)
                 P_world = P_center.tolist()
 
-                # Dedup by position
                 if any(
                     math.sqrt(sum((P_world[j] - p[j]) ** 2 for j in range(3))) < 0.3
                     for p in seen_pos
@@ -317,28 +315,27 @@ def falcon_ring_scan(
                     continue
                 seen_pos.append(P_world)
 
-                # Extract spatial measurements from depth at mask edges
-                # Bottom-center → sill height, Top-center → header height
-                d_bottom = float(result.depth[
-                    max(0, min(img_size-1, int((by + bh) * img_size))),
-                    max(0, min(img_size-1, int(cu)))
-                ])
+                # Sill / header from mask bottom / top edges
+                bot_y = (cy_n + h_n / 2) * img_size
+                top_y = (cy_n - h_n / 2) * img_size
+                d_bot = float(result.depth[
+                    max(0, min(img_size - 1, int(bot_y))),
+                    max(0, min(img_size - 1, int(cu)))])
                 d_top = float(result.depth[
-                    max(0, min(img_size-1, int(by * img_size))),
-                    max(0, min(img_size-1, int(cu)))
-                ])
-                d_bottom = d_bottom if d_bottom > 0.1 else d_center
+                    max(0, min(img_size - 1, int(top_y))),
+                    max(0, min(img_size - 1, int(cu)))])
+                d_bot = d_bot if d_bot > 0.1 else d_center
                 d_top = d_top if d_top > 0.1 else d_center
-
-                P_bottom = _unproject(cu, (by + bh) * img_size, d_bottom)
-                P_top = _unproject(cu, by * img_size, d_top)
-
-                sill_h = float(P_bottom[up_axis]) - floor_z
+                P_bot = _unproject(cu, bot_y, d_bot)
+                P_top = _unproject(cu, top_y, d_top)
+                sill_h = float(P_bot[up_axis]) - floor_z
                 header_h = float(P_top[up_axis]) - floor_z
 
-                # Width: left-right at center height
-                P_left = _unproject(bx * img_size, cv, d_center)
-                P_right = _unproject((bx + bw) * img_size, cv, d_center)
+                # Width from mask left / right edges
+                left_x = (cx_n - w_n / 2) * img_size
+                right_x = (cx_n + w_n / 2) * img_size
+                P_left = _unproject(left_x, cv, d_center)
+                P_right = _unproject(right_x, cv, d_center)
                 width_m = math.sqrt(
                     (P_right[h_axes_local[0]] - P_left[h_axes_local[0]]) ** 2 +
                     (P_right[h_axes_local[1]] - P_left[h_axes_local[1]]) ** 2
@@ -346,8 +343,8 @@ def falcon_ring_scan(
 
                 found.append({
                     "label": label,
-                    "bbox": det.bbox,
-                    "mask_bbox": mb,
+                    "bbox": det.bbox, "mask_bbox": mb,
+                    "mask_rle": det.mask_rle, "mask_size": det.mask_size,
                     "world_pos": [round(c, 3) for c in P_world],
                     "view_index": i,
                     "azimuth_deg": round(math.degrees(az), 1),
@@ -359,21 +356,49 @@ def falcon_ring_scan(
                     "method": "falcon_center_depth",
                 })
 
-        # Draw segmentation mask_bbox annotations on the view image
+        # Draw irregular segmentation masks on the view image
+        import base64 as _b64
         from PIL import ImageDraw
-        annotated = img.copy()
-        draw = ImageDraw.Draw(annotated)
+        annotated = img.copy().convert("RGBA")
         n_new = sum(1 for f in found if f["view_index"] == i)
         for vd in [f for f in found if f["view_index"] == i]:
+            det_overlay = _PIL.new("RGBA", (img_size, img_size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(det_overlay)
+            drew_mask = False
+            if vd.get("mask_rle") and vd.get("mask_size"):
+                try:
+                    from pycocotools import mask as mask_utils
+                    counts = _b64.b64decode(vd["mask_rle"])
+                    mask_arr = mask_utils.decode(
+                        {"counts": counts, "size": vd["mask_size"]})
+                    mh, mw = vd["mask_size"]
+                    if mh != img_size or mw != img_size:
+                        mask_arr = np.array(
+                            _PIL.fromarray(mask_arr).resize(
+                                (img_size, img_size), _PIL.NEAREST))
+                    colored = np.zeros((img_size, img_size, 4), dtype=np.uint8)
+                    colored[mask_arr > 0] = [255, 0, 0, 100]
+                    det_overlay = _PIL.fromarray(colored, mode="RGBA")
+                    draw = ImageDraw.Draw(det_overlay)
+                    drew_mask = True
+                except Exception:
+                    pass
+            if not drew_mask:
+                # Fallback: draw mask_bbox outline (center-based)
+                mb = vd.get("mask_bbox", vd["bbox"])
+                x1 = int((mb["x"] - mb["w"] / 2) * img_size)
+                y1 = int((mb["y"] - mb["h"] / 2) * img_size)
+                x2 = int((mb["x"] + mb["w"] / 2) * img_size)
+                y2 = int((mb["y"] + mb["h"] / 2) * img_size)
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 255), width=3)
+            # Label text
             mb = vd.get("mask_bbox", vd["bbox"])
-            x1 = int(mb["x"] * img_size)
-            y1 = int(mb["y"] * img_size)
-            x2 = int((mb["x"] + mb["w"]) * img_size)
-            y2 = int((mb["y"] + mb["h"]) * img_size)
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-            draw.text((x1 + 4, y1 + 4), vd["label"], fill="red")
-        view_path = out_dir / f"falcon_scan_view_{i}.png"
-        annotated.save(str(view_path))
+            tx = int((mb["x"] - mb["w"] / 2) * img_size)
+            ty = int((mb["y"] - mb["h"] / 2) * img_size)
+            draw.text((tx + 4, ty + 4), vd["label"], fill=(255, 0, 0, 255))
+            annotated = _PIL.alpha_composite(annotated, det_overlay)
+
+        annotated.convert("RGB").save(str(out_dir / f"falcon_scan_view_{i}.png"))
         print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
               f"(total {len(found)})")
     return found

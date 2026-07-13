@@ -26,11 +26,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FalconDetection:
-    """One detection returned by the Falcon server."""
+    """One detection returned by the Falcon server.
 
-    bbox: dict                    # {"x","y","w","h"} normalized [0,1]
-    mask_bbox: Optional[dict]     # tight bbox from mask, or None
-    mask_area_ratio: Optional[float]
+    All bbox fields are **center-based** and normalized [0,1]:
+    ``{"x": center_x, "y": center_y, "w": width, "h": height}``.
+    """
+
+    bbox: dict                        # detection bbox (center-based)
+    mask_bbox: Optional[dict] = None  # tight bbox from mask (center-based)
+    mask_area_ratio: Optional[float] = None
+    mask_rle: Optional[str] = None    # base64 COCO RLE counts
+    mask_size: Optional[list] = None  # [H, W] of the mask
 
 
 class FalconClient:
@@ -93,6 +99,8 @@ class FalconClient:
                 bbox=d["bbox"],
                 mask_bbox=d.get("mask_bbox"),
                 mask_area_ratio=d.get("mask_area_ratio"),
+                mask_rle=d.get("mask_rle"),
+                mask_size=d.get("mask_size"),
             ))
         return detections
 
