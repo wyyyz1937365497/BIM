@@ -291,59 +291,112 @@ def falcon_ring_scan(
                 print(f"    [falcon_scan] view {i} '{label}': error ({ex})")
                 continue
             for det in dets:
-                # Falcon bbox is CENTER-based: {x: cx, y: cy, w, h} normalized
-                mb = det.mask_bbox or det.bbox
-                cx_n, cy_n, w_n, h_n = mb["x"], mb["y"], mb["w"], mb["h"]
+                # Decode the irregular mask for accurate boundary extraction
+                mask_arr = None
+                if det.mask_rle and det.mask_size:
+                    try:
+                        import base64 as _b64
+                        from pycocotools import mask as mask_utils
+                        counts = _b64.b64decode(det.mask_rle)
+                        mask_arr = mask_utils.decode(
+                            {"counts": counts, "size": det.mask_size})
+                        mh, mw = det.mask_size
+                        if mh != img_size or mw != img_size:
+                            mask_arr = np.array(_PIL.fromarray(mask_arr).resize(
+                                (img_size, img_size), _PIL.NEAREST))
+                    except Exception:
+                        mask_arr = None
 
-                # Depth at center pixel
-                cu = cx_n * img_size
-                cv = cy_n * img_size
-                d_center = float(result.depth[
-                    max(0, min(img_size - 1, int(cv))),
-                    max(0, min(img_size - 1, int(cu)))
-                ])
+                if mask_arr is not None:
+                    # Use actual mask pixel boundaries (not bbox)
+                    ys, xs = np.where(mask_arr)
+                    cu = float(np.median(xs))       # mask centroid x
+                    cv = float(np.median(ys))       # mask centroid y
+                    bot_y = int(ys.max())           # actual bottom row
+                    top_y = int(ys.min())           # actual top row
+                    # Width: mask extent at centroid row
+                    center_row = max(0, min(img_size - 1, int(cv)))
+                    row_pixels = np.where(mask_arr[center_row])[0]
+                    if len(row_pixels) > 0:
+                        left_x = int(row_pixels[0])
+                        right_x = int(row_pixels[-1])
+                    else:
+                        left_x = right_x = int(cu)
+                else:
+                    # Fallback: use mask_bbox (center-based)
+                    mb = det.mask_bbox or det.bbox
+                    cx_n, cy_n, w_n, h_n = mb["x"], mb["y"], mb["w"], mb["h"]
+                    cu = cx_n * img_size
+                    cv = cy_n * img_size
+                    bot_y = int((cy_n + h_n / 2) * img_size)
+                    top_y = int((cy_n - h_n / 2) * img_size)
+                    left_x = int((cx_n - w_n / 2) * img_size)
+                    right_x = int((cx_n + w_n / 2) * img_size)
+
+                # Clamp to image bounds
+                cu = max(0, min(img_size - 1, int(cu)))
+                cv = max(0, min(img_size - 1, int(cv)))
+                bot_y = max(0, min(img_size - 1, bot_y))
+                top_y = max(0, min(img_size - 1, top_y))
+                left_x = max(0, min(img_size - 1, left_x))
+                right_x = max(0, min(img_size - 1, right_x))
+
+                # Depth at mask centroid (for dedup + fallback)
+                d_center = float(result.depth[cv, cu])
                 if d_center < 0.1:
                     continue
 
-                P_center = _unproject(cu, cv, d_center)
-                P_world = P_center.tolist()
+                if mask_arr is not None:
+                    # ── Vectorised full-mask backprojection ──
+                    # Transform every mask pixel to world coords, then
+                    # compute true 3D extents. Handles perspective automatically.
+                    mys, mxs = np.where(mask_arr)
+                    mds = result.depth[mys, mxs].astype(np.float64)
+                    ok = mds > 0.1
+                    if ok.sum() < 10:
+                        continue
+                    mxs, mys, mds = mxs[ok], mys[ok], mds[ok]
+                    # Camera-space coords for all mask pixels
+                    x_cam = (mxs - img_size / 2.0) / fx * mds
+                    y_cam = (mys - img_size / 2.0) / fx * mds
+                    P_cam = np.stack([x_cam, y_cam, mds], axis=0)  # (3, K)
+                    P_world_k = R_c2w @ P_cam + eye_np.reshape(3, 1)  # (3, K)
 
-                if any(
-                    math.sqrt(sum((P_world[j] - p[j]) ** 2 for j in range(3))) < 0.3
-                    for p in seen_pos
-                ):
-                    continue
-                seen_pos.append(P_world)
-
-                # Sill / header from mask bottom / top edges
-                bot_y = (cy_n + h_n / 2) * img_size
-                top_y = (cy_n - h_n / 2) * img_size
-                d_bot = float(result.depth[
-                    max(0, min(img_size - 1, int(bot_y))),
-                    max(0, min(img_size - 1, int(cu)))])
-                d_top = float(result.depth[
-                    max(0, min(img_size - 1, int(top_y))),
-                    max(0, min(img_size - 1, int(cu)))])
-                d_bot = d_bot if d_bot > 0.1 else d_center
-                d_top = d_top if d_top > 0.1 else d_center
-                P_bot = _unproject(cu, bot_y, d_bot)
-                P_top = _unproject(cu, top_y, d_top)
-                sill_h = float(P_bot[up_axis]) - floor_z
-                header_h = float(P_top[up_axis]) - floor_z
-
-                # Width from mask left / right edges
-                left_x = (cx_n - w_n / 2) * img_size
-                right_x = (cx_n + w_n / 2) * img_size
-                P_left = _unproject(left_x, cv, d_center)
-                P_right = _unproject(right_x, cv, d_center)
-                width_m = math.sqrt(
-                    (P_right[h_axes_local[0]] - P_left[h_axes_local[0]]) ** 2 +
-                    (P_right[h_axes_local[1]] - P_left[h_axes_local[1]]) ** 2
-                )
-
+                    # World-space extents (use percentiles for robustness)
+                    wz = P_world_k[up_axis, :]
+                    sill_h = float(np.percentile(wz, 5)) - floor_z
+                    header_h = float(np.percentile(wz, 95)) - floor_z
+                    wh0 = P_world_k[h_axes_local[0], :]
+                    wh1 = P_world_k[h_axes_local[1], :]
+                    width_m = float(
+                        np.percentile(wh0, 95) - np.percentile(wh0, 5)
+                    )
+                    # 3D centroid
+                    P_world = np.median(P_world_k, axis=1).tolist()
+                    method = "mask_full_backproject"
+                else:
+                    # Fallback: single-point depth at bbox center
+                    P_center = _unproject(cu, cv, d_center)
+                    P_world = P_center.tolist()
+                    d_bot = float(result.depth[bot_y, cu])
+                    d_top = float(result.depth[top_y, cu])
+                    d_bot = d_bot if d_bot > 0.1 else d_center
+                    d_top = d_top if d_top > 0.1 else d_center
+                    P_bot = _unproject(cu, bot_y, d_bot)
+                    P_top = _unproject(cu, top_y, d_top)
+                    sill_h = float(P_bot[up_axis]) - floor_z
+                    header_h = float(P_top[up_axis]) - floor_z
+                    P_left = _unproject(left_x, cv, d_center)
+                    P_right = _unproject(right_x, cv, d_center)
+                    width_m = math.sqrt(
+                        (P_right[h_axes_local[0]] - P_left[h_axes_local[0]]) ** 2 +
+                        (P_right[h_axes_local[1]] - P_left[h_axes_local[1]]) ** 2
+                    )
+                    method = "bbox_center_depth"
                 found.append({
                     "label": label,
-                    "bbox": det.bbox, "mask_bbox": mb,
+                    "bbox": det.bbox,
+                    "mask_bbox": det.mask_bbox or det.bbox,
                     "mask_rle": det.mask_rle, "mask_size": det.mask_size,
                     "world_pos": [round(c, 3) for c in P_world],
                     "view_index": i,
@@ -353,7 +406,7 @@ def falcon_ring_scan(
                     "header_height": round(header_h, 3),
                     "element_height": round(max(0, header_h - sill_h), 3),
                     "width_m": round(width_m, 3),
-                    "method": "falcon_center_depth",
+                    "method": method,
                 })
 
         # Draw irregular segmentation masks on the view image
