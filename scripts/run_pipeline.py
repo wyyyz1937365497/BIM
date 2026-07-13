@@ -376,6 +376,7 @@ def falcon_ring_scan(
         annotated.save(str(view_path))
         print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
               f"(total {len(found)})")
+    return found
 
 
 def _detect_from_falcon(
