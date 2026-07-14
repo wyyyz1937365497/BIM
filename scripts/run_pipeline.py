@@ -408,50 +408,10 @@ def falcon_ring_scan(
                     "width_m": round(width_m, 3),
                     "method": method,
                 })
-
-        # Draw irregular segmentation masks on the view image
-        import base64 as _b64
-        from PIL import ImageDraw
-        annotated = img.copy().convert("RGBA")
+        # Save raw view image (per-detection cropped+annotated images
+        # are created in _detect_from_falcon to avoid duplicates).
         n_new = sum(1 for f in found if f["view_index"] == i)
-        for vd in [f for f in found if f["view_index"] == i]:
-            det_overlay = _PIL.new("RGBA", (img_size, img_size), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(det_overlay)
-            drew_mask = False
-            if vd.get("mask_rle") and vd.get("mask_size"):
-                try:
-                    from pycocotools import mask as mask_utils
-                    counts = _b64.b64decode(vd["mask_rle"])
-                    mask_arr = mask_utils.decode(
-                        {"counts": counts, "size": vd["mask_size"]})
-                    mh, mw = vd["mask_size"]
-                    if mh != img_size or mw != img_size:
-                        mask_arr = np.array(
-                            _PIL.fromarray(mask_arr).resize(
-                                (img_size, img_size), _PIL.NEAREST))
-                    colored = np.zeros((img_size, img_size, 4), dtype=np.uint8)
-                    colored[mask_arr > 0] = [255, 0, 0, 100]
-                    det_overlay = _PIL.fromarray(colored, mode="RGBA")
-                    draw = ImageDraw.Draw(det_overlay)
-                    drew_mask = True
-                except Exception:
-                    pass
-            if not drew_mask:
-                # Fallback: draw mask_bbox outline (center-based)
-                mb = vd.get("mask_bbox", vd["bbox"])
-                x1 = int((mb["x"] - mb["w"] / 2) * img_size)
-                y1 = int((mb["y"] - mb["h"] / 2) * img_size)
-                x2 = int((mb["x"] + mb["w"] / 2) * img_size)
-                y2 = int((mb["y"] + mb["h"] / 2) * img_size)
-                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 255), width=3)
-            # Label text
-            mb = vd.get("mask_bbox", vd["bbox"])
-            tx = int((mb["x"] - mb["w"] / 2) * img_size)
-            ty = int((mb["y"] - mb["h"] / 2) * img_size)
-            draw.text((tx + 4, ty + 4), vd["label"], fill=(255, 0, 0, 255))
-            annotated = _PIL.alpha_composite(annotated, det_overlay)
-
-        annotated.convert("RGB").save(str(out_dir / f"falcon_scan_view_{i}.png"))
+        img.save(str(out_dir / f"falcon_scan_view_{i}.png"))
         print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
               f"(total {len(found)})")
     return found
@@ -514,9 +474,57 @@ def _detect_from_falcon(
             world_x=world_h[0], world_y=world_h[1],
         )
 
-        # Reference the ring scan view image (saved by falcon_ring_scan)
-        view_img = f"falcon_scan_view_{det.get('view_index', 0)}.png"
-        view_path = out_dir / view_img
+        # Create a per-detection cropped+annotated image (unique for gallery)
+        view_img = ""
+        raw_path = out_dir / f"falcon_scan_view_{det.get('view_index', 0)}.png"
+        if raw_path.exists():
+            import base64 as _b64, math as _m
+            from PIL import Image as _PI, ImageDraw as _ID
+            try:
+                base_img = _PI.open(str(raw_path)).convert("RGBA")
+                iw, ih = base_img.size
+                # Draw this detection's mask
+                drew = False
+                if det.get("mask_rle") and det.get("mask_size"):
+                    try:
+                        from pycocotools import mask as mask_utils
+                        counts = _b64.b64decode(det["mask_rle"])
+                        marr = mask_utils.decode(
+                            {"counts": counts, "size": det["mask_size"]})
+                        mh, mw = det["mask_size"]
+                        if mh != ih or mw != iw:
+                            marr = np.array(_PI.fromarray(marr).resize(
+                                (iw, ih), _PI.NEAREST))
+                        overlay = np.zeros((ih, iw, 4), dtype=np.uint8)
+                        overlay[marr > 0] = [255, 0, 0, 100]
+                        base_img = _PI.alpha_composite(
+                            base_img, _PI.fromarray(overlay, mode="RGBA"))
+                        drew = True
+                    except Exception:
+                        pass
+                if not drew:
+                    _mb = det.get("mask_bbox", det["bbox"])
+                    _d = _ID.Draw(base_img)
+                    _d.rectangle([
+                        int((_mb["x"] - _mb["w"]/2) * iw),
+                        int((_mb["y"] - _mb["h"]/2) * ih),
+                        int((_mb["x"] + _mb["w"]/2) * iw),
+                        int((_mb["y"] + _mb["h"]/2) * ih),
+                    ], outline=(255, 0, 0, 255), width=3)
+                # Crop around the mask with 50% margin
+                _mb = det.get("mask_bbox", det["bbox"])
+                cx, cy = _mb["x"] * iw, _mb["y"] * ih
+                hw = _mb["w"] * iw * 0.75
+                hh = _mb["h"] * ih * 0.75
+                crop = base_img.crop((
+                    max(0, int(cx - hw)), max(0, int(cy - hh)),
+                    min(iw, int(cx + hw)), min(ih, int(cy + hh)),
+                )).convert("RGB")
+                det_img = f"{cfg.name}_falcon_{i}.png"
+                crop.save(str(out_dir / det_img))
+                view_img = det_img
+            except Exception:
+                pass
 
         d = {
             "candidate": cand.to_dict(),
