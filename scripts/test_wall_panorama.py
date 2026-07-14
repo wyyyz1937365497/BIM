@@ -28,10 +28,10 @@ def render_wall_elevations(
     up_axis: int = 2,
     out_dir: str | None = None,
     fov: float = 60.0,
-    view_width: int = 768,
-    view_height: int = 512,
+    view_width: int = 1536,
+    view_height: int = 1024,
     step_deg: float = 20.0,
-    mm_per_pixel: float = 5.0,
+    mm_per_pixel: float = 2.0,
 ) -> dict[int, Image.Image]:
     """Generate a true orthographic elevation image for each wall.
 
@@ -195,7 +195,7 @@ def main():
     ap.add_argument("--out-dir", default="output/wall_elevation_test")
     ap.add_argument("--fov", type=float, default=60.0)
     ap.add_argument("--step", type=float, default=20.0)
-    ap.add_argument("--resolution", type=float, default=5.0,
+    ap.add_argument("--resolution", type=float, default=2.0,
                     help="mm per pixel (lower = sharper)")
     args = ap.parse_args()
 
@@ -215,7 +215,6 @@ def main():
           f"{p95[h_axes[1]]-p5[h_axes[1]]:.1f}×"
           f"{ceiling_z-floor_z:.1f}m")
 
-    import json
     if args.walls_json:
         walls_path = args.walls_json
     else:
@@ -227,6 +226,7 @@ def main():
         walls_path = os.path.join(base, candidates[0], "wall_lines_snapped.json") \
             if candidates else None
 
+    import json
     if not walls_path or not os.path.exists(walls_path):
         print("ERROR: No wall_lines_snapped.json. Run the pipeline first.")
         return 1
