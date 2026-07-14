@@ -205,8 +205,9 @@ def snap_wall_endpoints(walls: list[dict], threshold: float = 0.5) -> list[dict]
 # ---------------------------------------------------------------------------
 
 
-def falcon_ring_scan(
+def falcon_wall_scan(
     scene: GSScene,
+    walls: list[dict],
     center: tuple[float, float],
     floor_z: float,
     ceiling_z: float,
@@ -214,89 +215,80 @@ def falcon_ring_scan(
     out_dir: Path,
     query: str = "door, window",
     up_axis: int = 2,
-    num_views: int = 8,
     img_size: int = 768,
 ) -> list[dict]:
-    """360° Falcon detection at mid-height with depth backprojection.
+    """Per-wall Falcon detection: one panoramic view per wall.
 
-    Renders a full-perspective panorama ring at eye level, runs Falcon
-    detection on each view, and backprojects detections to 3D world
-    coordinates using the rendered depth map.
-
-    Returns a list of dicts:
-      ``{label, bbox, world_pos, view_index, azimuth_deg, depth}``
+    For each wall, renders from room center toward the wall midpoint with
+    FOV wide enough to cover the entire wall.  Eliminates duplicate
+    detections (same object seen from multiple 360° views).  Each
+    detection carries its wall_idx and a cropped+annotated image.
     """
     import math
-    import io as _io
-    from PIL import Image as _PIL
+    import base64 as _b64
+    from PIL import Image as _PIL, ImageDraw as _ID
+    from pycocotools import mask as mask_utils
     from bim_recon.gs_scene import GSScene as _GS, look_at_pose
 
     mid_z = (floor_z + ceiling_z) / 2.0
     h_axes = [i for i in range(3) if i != up_axis]
     cx, cy = float(center[0]), float(center[1])
-    fov = 60.0
-    fx = 0.5 * img_size / math.tan(0.5 * math.radians(fov))
     labels = [l.strip() for l in query.split(",") if l.strip()]
-
     found: list[dict] = []
-    seen_pos: list[list[float]] = []  # for dedup
 
-    for i in range(num_views):
-        az = math.radians(i * (360.0 / num_views))
+    for wi, wall in enumerate(walls):
+        ws = np.array([wall["x1"], wall["y1"]], dtype=np.float64)
+        we = np.array([wall["x2"], wall["y2"]], dtype=np.float64)
+        wlen = float(np.linalg.norm(we - ws))
+        wmid = (ws + we) / 2.0
+        wall_dist = float(np.linalg.norm(np.array([cx, cy]) - wmid))
+
+        # FOV to cover the entire wall + 0.3m margin
+        fov_deg = min(
+            math.degrees(2 * math.atan((wlen / 2 + 0.3) / max(wall_dist, 0.5))),
+            110.0,
+        )
+        fx = 0.5 * img_size / math.tan(0.5 * math.radians(fov_deg))
+
         eye = [0.0, 0.0, 0.0]
         eye[h_axes[0]] = cx
         eye[h_axes[1]] = cy
         eye[up_axis] = mid_z
         tgt = [0.0, 0.0, 0.0]
-        tgt[h_axes[0]] = cx + math.cos(az)
-        tgt[h_axes[1]] = cy + math.sin(az)
+        tgt[h_axes[0]] = float(wmid[0])
+        tgt[h_axes[1]] = float(wmid[1])
         tgt[up_axis] = mid_z
         up = [0.0, 0.0, 0.0]
         up[up_axis] = 1.0
-        pose = look_at_pose(
-            (eye[0], eye[1], eye[2]),
-            (tgt[0], tgt[1], tgt[2]),
-            (up[0], up[1], up[2]),
-        )
+        pose = look_at_pose(tuple(eye), tuple(tgt), tuple(up))
 
-        result, reason, _met = _GS.render_validated(
-            scene, pose, img_size, img_size, fov,
-        )
+        result, reason, _ = _GS.render_validated(
+            scene, pose, img_size, img_size, fov_deg)
         if result is None:
-            print(f"    [falcon_scan] view {i} ({i*45}°): invalid ({reason}), skip")
+            print(f"    [wall_scan] wall {wi}: invalid ({reason}), skip")
             continue
 
-        img = _PIL.fromarray(
-            (result.colors * 255).clip(0, 255).astype(np.uint8)
-        )
-        h_axes_local = h_axes
+        img = _PIL.fromarray((result.colors * 255).clip(0, 255).astype(np.uint8))
+        img.save(str(out_dir / f"falcon_wall_{wi}.png"))
 
-        # View matrix for backprojection
         viewmat = pose.to_viewmat()
         R_c2w = viewmat[:3, :3].T
         eye_np = np.array(eye, dtype=np.float64)
-
-        def _unproject(px, py, d_val):
-            """Unproject a pixel + depth to world coordinates."""
-            px_c = max(0, min(img_size - 1, int(px)))
-            py_c = max(0, min(img_size - 1, int(py)))
-            x_c = (px_c - img_size / 2.0) / fx * d_val
-            y_c = (py_c - img_size / 2.0) / fx * d_val
-            return R_c2w @ np.array([x_c, y_c, d_val]) + eye_np
+        annotated = img.convert("RGBA")
+        wall_dets: list[dict] = []
 
         for label in labels:
             try:
                 dets = falcon.segment(img, label, task="segmentation")
             except Exception as ex:
-                print(f"    [falcon_scan] view {i} '{label}': error ({ex})")
+                print(f"    [wall_scan] wall {wi} '{label}': {ex}")
                 continue
             for det in dets:
-                # Decode the irregular mask for accurate boundary extraction
+                mb = det.mask_bbox or det.bbox
+                # Decode mask
                 mask_arr = None
                 if det.mask_rle and det.mask_size:
                     try:
-                        import base64 as _b64
-                        from pycocotools import mask as mask_utils
                         counts = _b64.b64decode(det.mask_rle)
                         mask_arr = mask_utils.decode(
                             {"counts": counts, "size": det.mask_size})
@@ -307,113 +299,92 @@ def falcon_ring_scan(
                     except Exception:
                         mask_arr = None
 
+                # Sampling pixels
                 if mask_arr is not None:
-                    # Use actual mask pixel boundaries (not bbox)
                     ys, xs = np.where(mask_arr)
-                    cu = float(np.median(xs))       # mask centroid x
-                    cv = float(np.median(ys))       # mask centroid y
-                    bot_y = int(ys.max())           # actual bottom row
-                    top_y = int(ys.min())           # actual top row
-                    # Width: mask extent at centroid row
-                    center_row = max(0, min(img_size - 1, int(cv)))
-                    row_pixels = np.where(mask_arr[center_row])[0]
-                    if len(row_pixels) > 0:
-                        left_x = int(row_pixels[0])
-                        right_x = int(row_pixels[-1])
-                    else:
-                        left_x = right_x = int(cu)
+                    cu, cv = int(np.median(xs)), int(np.median(ys))
                 else:
-                    # Fallback: use mask_bbox (center-based)
-                    mb = det.mask_bbox or det.bbox
-                    cx_n, cy_n, w_n, h_n = mb["x"], mb["y"], mb["w"], mb["h"]
-                    cu = cx_n * img_size
-                    cv = cy_n * img_size
-                    bot_y = int((cy_n + h_n / 2) * img_size)
-                    top_y = int((cy_n - h_n / 2) * img_size)
-                    left_x = int((cx_n - w_n / 2) * img_size)
-                    right_x = int((cx_n + w_n / 2) * img_size)
+                    cu = max(0, min(img_size - 1, int(mb["x"] * img_size)))
+                    cv = max(0, min(img_size - 1, int(mb["y"] * img_size)))
 
-                # Clamp to image bounds
-                cu = max(0, min(img_size - 1, int(cu)))
-                cv = max(0, min(img_size - 1, int(cv)))
-                bot_y = max(0, min(img_size - 1, bot_y))
-                top_y = max(0, min(img_size - 1, top_y))
-                left_x = max(0, min(img_size - 1, left_x))
-                right_x = max(0, min(img_size - 1, right_x))
-
-                # Depth at mask centroid (for dedup + fallback)
                 d_center = float(result.depth[cv, cu])
                 if d_center < 0.1:
                     continue
 
+                # Full-mask backprojection
                 if mask_arr is not None:
-                    # ── Vectorised full-mask backprojection ──
-                    # Transform every mask pixel to world coords, then
-                    # compute true 3D extents. Handles perspective automatically.
                     mys, mxs = np.where(mask_arr)
                     mds = result.depth[mys, mxs].astype(np.float64)
                     ok = mds > 0.1
                     if ok.sum() < 10:
                         continue
                     mxs, mys, mds = mxs[ok], mys[ok], mds[ok]
-                    # Camera-space coords for all mask pixels
                     x_cam = (mxs - img_size / 2.0) / fx * mds
                     y_cam = (mys - img_size / 2.0) / fx * mds
-                    P_cam = np.stack([x_cam, y_cam, mds], axis=0)  # (3, K)
-                    P_world_k = R_c2w @ P_cam + eye_np.reshape(3, 1)  # (3, K)
-
-                    # World-space extents (use percentiles for robustness)
-                    wz = P_world_k[up_axis, :]
+                    P_w = R_c2w @ np.stack([x_cam, y_cam, mds], 0) + eye_np.reshape(3, 1)
+                    wz = P_w[up_axis, :]
                     sill_h = float(np.percentile(wz, 5)) - floor_z
                     header_h = float(np.percentile(wz, 95)) - floor_z
-                    wh0 = P_world_k[h_axes_local[0], :]
-                    wh1 = P_world_k[h_axes_local[1], :]
-                    width_m = float(
-                        np.percentile(wh0, 95) - np.percentile(wh0, 5)
-                    )
-                    # 3D centroid
-                    P_world = np.median(P_world_k, axis=1).tolist()
+                    wh0 = P_w[h_axes[0], :]
+                    width_m = float(np.percentile(wh0, 95) - np.percentile(wh0, 5))
+                    P_world = np.median(P_w, axis=1).tolist()
                     method = "mask_full_backproject"
                 else:
-                    # Fallback: single-point depth at bbox center
-                    P_center = _unproject(cu, cv, d_center)
-                    P_world = P_center.tolist()
-                    d_bot = float(result.depth[bot_y, cu])
-                    d_top = float(result.depth[top_y, cu])
-                    d_bot = d_bot if d_bot > 0.1 else d_center
-                    d_top = d_top if d_top > 0.1 else d_center
-                    P_bot = _unproject(cu, bot_y, d_bot)
-                    P_top = _unproject(cu, top_y, d_top)
-                    sill_h = float(P_bot[up_axis]) - floor_z
-                    header_h = float(P_top[up_axis]) - floor_z
-                    P_left = _unproject(left_x, cv, d_center)
-                    P_right = _unproject(right_x, cv, d_center)
-                    width_m = math.sqrt(
-                        (P_right[h_axes_local[0]] - P_left[h_axes_local[0]]) ** 2 +
-                        (P_right[h_axes_local[1]] - P_left[h_axes_local[1]]) ** 2
-                    )
+                    x_c = (cu - img_size / 2.0) / fx * d_center
+                    y_c = (cv - img_size / 2.0) / fx * d_center
+                    P_world = (R_c2w @ np.array([x_c, y_c, d_center]) + eye_np).tolist()
+                    sill_h = header_h = 0.0
+                    width_m = float(mb["w"] * 2.0)
                     method = "bbox_center_depth"
-                found.append({
-                    "label": label,
-                    "bbox": det.bbox,
-                    "mask_bbox": det.mask_bbox or det.bbox,
+
+                wall_dets.append({
+                    "label": label, "bbox": det.bbox, "mask_bbox": mb,
                     "mask_rle": det.mask_rle, "mask_size": det.mask_size,
                     "world_pos": [round(c, 3) for c in P_world],
-                    "view_index": i,
-                    "azimuth_deg": round(math.degrees(az), 1),
-                    "depth": round(d_center, 3),
+                    "wall_idx": wi, "depth": round(d_center, 3),
                     "sill_height": round(sill_h, 3),
                     "header_height": round(header_h, 3),
                     "element_height": round(max(0, header_h - sill_h), 3),
-                    "width_m": round(width_m, 3),
-                    "method": method,
+                    "width_m": round(width_m, 3), "method": method,
                 })
-        # Save raw view image (per-detection cropped+annotated images
-        # are created in _detect_from_falcon to avoid duplicates).
-        n_new = sum(1 for f in found if f["view_index"] == i)
-        img.save(str(out_dir / f"falcon_scan_view_{i}.png"))
-        print(f"    [falcon_scan] view {i} ({i*45}°): +{n_new} new "
-              f"(total {len(found)})")
+
+        # Per-detection cropped+annotated images
+        for di, vd in enumerate(wall_dets):
+            ov = _PIL.new("RGBA", (img_size, img_size), (0, 0, 0, 0))
+            dr = _ID.Draw(ov)
+            mb = vd["mask_bbox"]
+            if vd.get("mask_rle"):
+                try:
+                    counts = _b64.b64decode(vd["mask_rle"])
+                    marr = mask_utils.decode({"counts": counts, "size": vd["mask_size"]})
+                    mh, mw = vd["mask_size"]
+                    if mh != img_size or mw != img_size:
+                        marr = np.array(_PIL.fromarray(marr).resize((img_size, img_size), _PIL.NEAREST))
+                    colored = np.zeros((img_size, img_size, 4), dtype=np.uint8)
+                    colored[marr > 0] = [255, 0, 0, 100]
+                    ov = _PIL.fromarray(colored, "RGBA")
+                    dr = _ID.Draw(ov)
+                except Exception:
+                    pass
+            else:
+                dr.rectangle([int((mb["x"]-mb["w"]/2)*img_size), int((mb["y"]-mb["h"]/2)*img_size),
+                              int((mb["x"]+mb["w"]/2)*img_size), int((mb["y"]+mb["h"]/2)*img_size)],
+                             outline=(255, 0, 0, 255), width=3)
+            dr.text((int((mb["x"]-mb["w"]/2)*img_size)+4, int((mb["y"]-mb["h"]/2)*img_size)+4),
+                    vd["label"], fill=(255, 0, 0, 255))
+            cx_px, cy_px = int(mb["x"]*img_size), int(mb["y"]*img_size)
+            hw, hh = int(mb["w"]*img_size*0.75), int(mb["h"]*img_size*0.75)
+            crop = _PIL.alpha_composite(annotated, ov).crop(
+                (max(0, cx_px-hw), max(0, cy_px-hh),
+                 min(img_size, cx_px+hw), min(img_size, cy_px+hh))).convert("RGB")
+            fname = f"falcon_det_w{wi}_{vd['label']}_{di}.png"
+            crop.save(str(out_dir / fname))
+            vd["image_path"] = fname
+
+        found.extend(wall_dets)
+        print(f"    [wall_scan] wall {wi} ({wlen:.1f}m, fov={fov_deg:.0f}°): "
+              f"{len(wall_dets)} detections")
+
     return found
 
 
@@ -424,129 +395,62 @@ def _detect_from_falcon(
     out_dir: Path,
     up_axis: int,
 ) -> dict:
-    """Process Falcon ring scan detections into pipeline result format.
+    """Convert Falcon wall-scan detections to pipeline result format.
 
-    Uses spatial measurements (sill/header/width) extracted directly from
-    the center-view depth map — no elevation rendering needed.
+    Spatial measurements and per-detection images are already computed in
+    falcon_wall_scan. This function just assigns each detection to its
+    wall position (t-parameter) and builds the result dict.
     """
     from bim_recon.candidate_extractor import Candidate, project_point_to_wall
 
     h_axes = [j for j in range(3) if j != up_axis]
     result_dicts = []
-    confirmed_count = 0
-
 
     for i, det in enumerate(falcon_dets):
-        world_h = [det["world_pos"][h_axes[0]], det["world_pos"][h_axes[1]]]
-
-        # Find nearest wall
-        best_wi, best_t, best_dist = None, 0.5, float("inf")
-        for wi, wall in enumerate(walls):
-            ws = np.array([wall["x1"], wall["y1"]])
-            we = np.array([wall["x2"], wall["y2"]])
-            t, dist = project_point_to_wall(
-                np.array(world_h), ws, we,
-            )
-            if dist < best_dist:
-                best_dist = dist
-                best_wi = wi
-                best_t = t
-        if best_wi is None:
-            continue
+        wi = det["wall_idx"]
+        wall = walls[wi]
+        ws = np.array([wall["x1"], wall["y1"]])
+        we = np.array([wall["x2"], wall["y2"]])
+        world_h = np.array([det["world_pos"][h_axes[0]], det["world_pos"][h_axes[1]]])
+        t_along, _ = project_point_to_wall(world_h, ws, we)
 
         sill = det.get("sill_height", 0.0)
         header = det.get("header_height", sill + 1.0)
         width_m = det.get("width_m", 0.8)
-        elem_h = det.get("element_height", max(0, header - sill))
 
         cand = Candidate(
-            element_class=cfg.name, class_idx=0, wall_idx=best_wi,
-            t_min=max(0, best_t - 0.05), t_max=min(1, best_t + 0.05),
-            theta_center=det["azimuth_deg"], theta_span=10.0,
-            r_mean=det["depth"],
-            h_min=sill, h_max=header,
+            element_class=cfg.name, class_idx=0, wall_idx=wi,
+            t_min=max(0, t_along - 0.05), t_max=min(1, t_along + 0.05),
+            theta_center=0.0, theta_span=10.0,
+            r_mean=det["depth"], h_min=sill, h_max=header,
             width_m=width_m, num_points=100,
-            world_x=world_h[0], world_y=world_h[1],
+            world_x=float(world_h[0]), world_y=float(world_h[1]),
         )
-
-        # Create a per-detection cropped+annotated image (unique for gallery)
-        view_img = ""
-        raw_path = out_dir / f"falcon_scan_view_{det.get('view_index', 0)}.png"
-        if raw_path.exists():
-            import base64 as _b64, math as _m
-            from PIL import Image as _PI, ImageDraw as _ID
-            try:
-                base_img = _PI.open(str(raw_path)).convert("RGBA")
-                iw, ih = base_img.size
-                # Draw this detection's mask
-                drew = False
-                if det.get("mask_rle") and det.get("mask_size"):
-                    try:
-                        from pycocotools import mask as mask_utils
-                        counts = _b64.b64decode(det["mask_rle"])
-                        marr = mask_utils.decode(
-                            {"counts": counts, "size": det["mask_size"]})
-                        mh, mw = det["mask_size"]
-                        if mh != ih or mw != iw:
-                            marr = np.array(_PI.fromarray(marr).resize(
-                                (iw, ih), _PI.NEAREST))
-                        overlay = np.zeros((ih, iw, 4), dtype=np.uint8)
-                        overlay[marr > 0] = [255, 0, 0, 100]
-                        base_img = _PI.alpha_composite(
-                            base_img, _PI.fromarray(overlay, mode="RGBA"))
-                        drew = True
-                    except Exception:
-                        pass
-                if not drew:
-                    _mb = det.get("mask_bbox", det["bbox"])
-                    _d = _ID.Draw(base_img)
-                    _d.rectangle([
-                        int((_mb["x"] - _mb["w"]/2) * iw),
-                        int((_mb["y"] - _mb["h"]/2) * ih),
-                        int((_mb["x"] + _mb["w"]/2) * iw),
-                        int((_mb["y"] + _mb["h"]/2) * ih),
-                    ], outline=(255, 0, 0, 255), width=3)
-                # Crop around the mask with 50% margin
-                _mb = det.get("mask_bbox", det["bbox"])
-                cx, cy = _mb["x"] * iw, _mb["y"] * ih
-                hw = _mb["w"] * iw * 0.75
-                hh = _mb["h"] * ih * 0.75
-                crop = base_img.crop((
-                    max(0, int(cx - hw)), max(0, int(cy - hh)),
-                    min(iw, int(cx + hw)), min(ih, int(cy + hh)),
-                )).convert("RGB")
-                det_img = f"{cfg.name}_falcon_{i}.png"
-                crop.save(str(out_dir / det_img))
-                view_img = det_img
-            except Exception:
-                pass
 
         d = {
             "candidate": cand.to_dict(),
             "confirmed": True,
-            "image_path": view_img,
-            "vlm_response": "falcon_ring_scan",
+            "image_path": det.get("image_path", ""),
+            "vlm_response": "falcon_wall_scan",
             "height_detection": {
                 "sill_height": sill,
                 "header_height": header,
-                "element_height": elem_h,
+                "element_height": det.get("element_height", max(0, header - sill)),
                 "width_m": width_m,
-                "t_min": best_t, "t_max": best_t,
+                "t_min": t_along, "t_max": t_along,
                 "confidence": 0.85,
-                "method": det.get("method", "falcon_center_depth"),
+                "method": det.get("method", "falcon_wall_scan"),
             },
         }
-        confirmed_count += 1
-        print(f"    [{cfg.name}] falcon #{i}: sill={sill:.3f}m "
-              f"header={header:.3f}m w={width_m:.3f}m "
-              f"({det.get('method', 'center_depth')})")
+        print(f"    [{cfg.name}] #{i} (wall {wi}): sill={sill:.3f}m "
+              f"header={header:.3f}m w={width_m:.3f}m")
         result_dicts.append(d)
 
     return {
         "element": cfg.name,
         "total_candidates": len(falcon_dets),
         "after_prefilter": len(falcon_dets),
-        "confirmed": confirmed_count,
+        "confirmed": len(falcon_dets),
         "rejected": 0,
         "results": result_dicts,
     }
@@ -1033,9 +937,9 @@ def main() -> int:
     # === Stage 5: Falcon ring scan (direct detection, if available) ===
     falcon_dets: list[dict] = []
     if falcon is not None:
-        print(f"\n--- Stage 3: Falcon Ring Scan ---")
-        falcon_dets = falcon_ring_scan(
-            scene, center, floor_z, ceiling_z, falcon, out_dir,
+        print(f"\n--- Stage 3: Falcon Wall Scan ---")
+        falcon_dets = falcon_wall_scan(
+            scene, walls_snapped, center, floor_z, ceiling_z, falcon, out_dir,
             query="door, window", up_axis=up_axis,
         )
         print(f"  Falcon detected {len(falcon_dets)} objects total")
