@@ -211,26 +211,6 @@ def query_vlm(
     return resp.choices[0].message.content or ""
 
 
-def query_ollama(
-    image_path: str,
-    prompt: str,
-    model: str = "gemma4:12b",
-    host: str = "localhost",
-    port: int = 11434,
-    timeout: int = 120,
-) -> str:
-    """Backward-compatible wrapper — delegates to :func:`query_vlm`.
-
-    Converts Ollama host/port to the OpenAI-compatible ``/v1`` endpoint.
-    """
-    return query_vlm(
-        image_path,
-        prompt,
-        api_base=f"http://{host}:{port}/v1",
-        model=model,
-        api_key="",
-        timeout=timeout,
-    )
 
 
 def _build_prompt(element_class: str, vlm_hint: str = "") -> str:

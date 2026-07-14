@@ -9,10 +9,7 @@ used by gsplat (``viewmats`` is world-to-camera).
 """
 from __future__ import annotations
 
-import json
 import math
-import struct
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -467,15 +464,6 @@ class GSScene:
             alpha=alpha_np.astype(np.float32),
         )
 
-    def render_batch(
-        self,
-        poses: List[CameraPose],
-        width: int,
-        height: int,
-        fov_degrees: float = 60.0,
-    ) -> List[RenderResult]:
-        """Render multiple poses. Currently loops; can be batched later."""
-        return [self.render(p, width, height, fov_degrees) for p in poses]
 
     @staticmethod
     def render_validated(

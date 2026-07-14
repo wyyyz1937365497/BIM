@@ -350,7 +350,7 @@ class TestVerifyCandidatesMock:
         mock_scene.render.return_value = mock_result
         mock_scene.find_free_position.return_value = (None, 5.0)
 
-        with patch("bim_recon.vlm_verifier.query_ollama",
+        with patch("bim_recon.vlm_verifier.query_vlm",
                    return_value="CONFIRMED"):
             results = verify_candidates(
                 [cand], mock_scene, (0.0, 0.0), 0.0, tmp_path,

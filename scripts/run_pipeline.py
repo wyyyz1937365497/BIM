@@ -58,7 +58,7 @@ from bim_recon.mesh_registrar import (
 )
 from bim_recon.mesh_readiness import render_and_check_mesh_readiness
 from bim_recon.virtual_scanner import VirtualScanner
-from bim_recon.vlm_verifier import VerificationResult, verify_candidates
+from bim_recon.vlm_verifier import verify_candidates
 from bim_recon.wall_line_extractor import (
     extract_wall_lines,
     multi_height_scan,
@@ -420,10 +420,7 @@ def falcon_ring_scan(
 def _detect_from_falcon(
     falcon_dets: list[dict],
     walls: list[dict],
-    coords: dict,
-    scene: GSScene,
     cfg: ElementConfig,
-    falcon: "FalconClient",
     out_dir: Path,
     up_axis: int,
 ) -> dict:
@@ -434,12 +431,10 @@ def _detect_from_falcon(
     """
     from bim_recon.candidate_extractor import Candidate, project_point_to_wall
 
-    floor_z = coords["floor_z"]
-    ceiling_z = coords["ceiling_z"]
     h_axes = [j for j in range(3) if j != up_axis]
-
     result_dicts = []
     confirmed_count = 0
+
 
     for i, det in enumerate(falcon_dets):
         world_h = [det["world_pos"][h_axes[0]], det["world_pos"][h_axes[1]]]
@@ -529,7 +524,7 @@ def _detect_from_falcon(
         d = {
             "candidate": cand.to_dict(),
             "confirmed": True,
-            "image_path": view_img if view_path.exists() else "",
+            "image_path": view_img,
             "vlm_response": "falcon_ring_scan",
             "height_detection": {
                 "sill_height": sill,
@@ -1072,8 +1067,7 @@ def main() -> int:
             print(f"  [{elem_type}] Using {len(elem_falcon_dets)} Falcon detections "
                   f"(bypassing SceneSplat + VLM)")
             result = _detect_from_falcon(
-                elem_falcon_dets, walls_snapped, coords, scene,
-                cfg, falcon, out_dir, up_axis,
+                elem_falcon_dets, walls_snapped, cfg, out_dir, up_axis,
             )
         else:
             result = detect_elements(

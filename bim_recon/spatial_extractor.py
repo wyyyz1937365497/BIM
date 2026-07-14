@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 from PIL import Image, ImageDraw
 
-from bim_recon.falcon_client import FalconClient, FalconDetection
+from bim_recon.falcon_client import FalconClient
 
 if TYPE_CHECKING:
     from bim_recon.candidate_extractor import Candidate
