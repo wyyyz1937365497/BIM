@@ -602,6 +602,38 @@ def main() -> int:
               f"r={me.r_mean:.2f}m w={me.width_m:.2f}m "
               f"(from {me.num_sources} views)")
 
+    # Recalculate widths from combined mask point clouds (more precise
+    # than centroid spread — captures the true extent of large windows
+    # that span multiple views)
+    for me in merged_elements:
+        all_pts_xy = []
+        for si in me.source_indices:
+            if si < len(view_dets) and view_dets[si].mask_points_xy is not None:
+                all_pts_xy.append(view_dets[si].mask_points_xy)
+        if len(all_pts_xy) < 2:
+            continue
+        combined = np.vstack(all_pts_xy)
+        # Project onto wall direction if available
+        if me.wall_idx is not None and me.wall_idx < len(walls_snapped):
+            wl = walls_snapped[me.wall_idx]
+            ws = np.array([wl["x1"], wl["y1"]])
+            we = np.array([wl["x2"], wl["y2"]])
+            wall_dir = we - ws
+            wall_len = np.linalg.norm(wall_dir)
+            if wall_len > 1e-6:
+                wall_dir = wall_dir / wall_len
+                projections = (combined - ws) @ wall_dir
+                true_width = float(np.percentile(projections, 97) -
+                                   np.percentile(projections, 3))
+                if true_width > me.width_m:
+                    print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
+                          f"width updated: {me.width_m:.2f}m -> {true_width:.2f}m")
+                    me.width_m = true_width
+        # Also update world position to centroid of combined cloud
+        me.world_x = float(np.median(combined[:, 0]))
+        me.world_y = float(np.median(combined[:, 1]))
+
+
     # Stage 3d: Targeted VLM verification per merged element
     print(f"\n--- Stage 3d: Targeted VLM Verification ---")
     verify_dir = out_dir / "verify_merged"

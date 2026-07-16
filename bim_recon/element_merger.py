@@ -263,9 +263,14 @@ def merge_detections(
             wy = float(np.average([m["wy"] for m in members], weights=weights))
             theta, r = _world_to_polar(wx, wy, cx, cy)
 
-            # Width: take the max of member widths (widest detection wins,
-            # since narrow detections often miss the frame edges)
-            width = float(np.max([m["width"] for m in members]))
+            # Width: combine centroid spread + max individual mask width.
+            # Individual widths are partial (each view sees only part of
+            # a large window), so the centroid spread captures the full extent.
+            all_wx = np.array([m["wx"] for m in members])
+            all_wy = np.array([m["wy"] for m in members])
+            centroid_spread = max(float(np.ptp(all_wx)), float(np.ptp(all_wy)))
+            max_individual = float(np.max([m["width"] for m in members]))
+            width = max(centroid_spread, max_individual, 0.1)
 
             # Height: take the union (min sill, max header)
             sill = float(np.min([m["sill"] for m in members]))
