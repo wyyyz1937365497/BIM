@@ -112,39 +112,59 @@ def merge_detections(
     up_axis: int = 2,
     merge_threshold: float = 0.5,
     height_tolerance: float = 0.3,
+    walls: Optional[List[Dict[str, Any]]] = None,
 ) -> List[MergedElement]:
     """Merge nearby element detections in polar coordinates.
 
     All detections from all 360° views are projected to (θ, r) and
-    clustered with DBSCAN.  Two detections are neighbours if:
+    clustered.  Two detections are neighbours if:
 
       * Their arc distance in polar space ≤ *merge_threshold* (metres)
       * Their height ranges overlap within *height_tolerance* (metres)
       * They have the same ``element_class`` (label)
+      * **They are on the same wall** (when *walls* is provided)
 
-    Args:
-        detections: List of detection dicts.  Each must have:
-            - ``world_x``, ``world_y`` (or ``world_pos`` [x, y, z])
-            - ``label`` or ``element_class``
-            Optional: ``sill_height``, ``header_height``, ``width_m``,
-            ``wall_idx``, ``confidence``, ``image_path``
-        center: (cx, cy) room center in world XY.
-        up_axis: Which axis is vertical (0/1/2).
-        merge_threshold: Max arc distance to consider same element (metres).
-        height_tolerance: Max height gap to consider same element (metres).
-
-    Returns:
-        List of MergedElement, one per unique physical element.
+    The wall constraint prevents transitive-chaining across corners:
+    without it, a chain of nearby detections can merge windows on
+    different walls into one giant cluster.
     """
     if not detections:
         return []
 
     cx, cy = float(center[0]), float(center[1])
 
+    # --- Wall assignment: project each detection to its nearest wall ---
+    if walls:
+        wall_segments = [
+            (np.array([w["x1"], w["y1"]], dtype=np.float64),
+             np.array([w["x2"], w["y2"]], dtype=np.float64))
+            for w in walls
+        ]
+    else:
+        wall_segments = None
+
+    def _nearest_wall(wx: float, wy: float) -> Optional[int]:
+        if not wall_segments:
+            return None
+        pt = np.array([wx, wy], dtype=np.float64)
+        best_idx, best_dist = 0, 1e18
+        for wi, (ws, we) in enumerate(wall_segments):
+            seg = we - ws
+            seg_len_sq = float(np.dot(seg, seg))
+            if seg_len_sq < 1e-12:
+                d = float(np.linalg.norm(pt - ws))
+            else:
+                t = max(0.0, min(1.0, float(np.dot(pt - ws, seg) / seg_len_sq)))
+                closest = ws + t * seg
+                d = float(np.linalg.norm(pt - closest))
+            if d < best_dist:
+                best_dist = d
+                best_idx = wi
+        return best_idx
+
     # Normalise each detection into a common format
     normals: List[Dict[str, Any]] = []
     for i, det in enumerate(detections):
-        # World position
         wx = det.get("world_x")
         wy = det.get("world_y")
         if wx is None or wy is None:
@@ -154,16 +174,13 @@ def merge_detections(
             else:
                 continue
 
-        # Element class
         ec = det.get("element_class") or det.get("label") or "unknown"
-
-        # Heights
         sill = float(det.get("sill_height", 0.0))
         header = float(det.get("header_height", sill))
         if header <= sill:
             header = sill + float(det.get("element_height", 0.0))
-
         theta, r = _world_to_polar(float(wx), float(wy), cx, cy)
+        wi = _nearest_wall(float(wx), float(wy))
 
         normals.append({
             "idx": i,
@@ -175,7 +192,7 @@ def merge_detections(
             "sill": sill,
             "header": header,
             "width": float(det.get("width_m", 0.0)),
-            "wall_idx": det.get("wall_idx"),
+            "wall_idx": wi,
             "confidence": float(det.get("confidence", 0.5)),
             "image_path": det.get("image_path"),
             "depth": float(det.get("depth", 0.0)),
@@ -209,6 +226,10 @@ def merge_detections(
                 for j in range(n):
                     if labels[j] != -1:
                         continue
+                    # Wall constraint: only merge detections on the same wall
+                    if wall_segments is not None:
+                        if group[cur]["wall_idx"] != group[j]["wall_idx"]:
+                            continue
                     # Check polar distance
                     dist = _angular_distance(
                         group[cur]["theta"], group[cur]["r"],

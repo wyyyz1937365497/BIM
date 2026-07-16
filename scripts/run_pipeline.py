@@ -594,7 +594,8 @@ def main() -> int:
     ]
     merged_elements = merge_detections(
         merge_input, center, up_axis=up_axis,
-        merge_threshold=1.5, height_tolerance=0.5)
+        merge_threshold=1.5, height_tolerance=0.5,
+        walls=walls_snapped)
     print(f"  Merged: {len(view_dets)} raw -> {len(merged_elements)} unique")
     for me in merged_elements:
         print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
