@@ -221,7 +221,7 @@ def _result_dir_from_label(scene_name: str, label: str) -> str:
 def _prepare_results(res: PipelineResults):
     """从 PipelineResults 准备 UI 输出元组。
 
-    返回顺序: (results, summary, vlm_imgs, seg_imgs, radar_imgs, report,
+    返回顺序: (results, summary, vlm_imgs, radar_imgs, report,
                vlm_cb_update, elem_dd_update)
     """
     logger.info("=" * 60)
@@ -265,16 +265,6 @@ def _prepare_results(res: PipelineResults):
         else:
             logger.warning(f"  ✗ VLM 图不存在: {e.image_path}")
 
-    # Seg gallery: show overlay if available, else elevation image
-    seg_imgs = []
-    for e in (res.doors + res.windows):
-        status = '✓' if e.confirmed is True else ('✗' if e.confirmed is False else '⚠️')
-        if e.overlay_image and Path(e.overlay_image).exists():
-            seg_imgs.append((e.overlay_image, f"{e.element_class} #{e.result_index} ({status} Falcon)"))
-            logger.info(f"  ✓ 添加 Falcon overlay: {e.overlay_image}")
-        elif e.elevation_image and Path(e.elevation_image).exists():
-            seg_imgs.append((e.elevation_image, f"{e.element_class} #{e.result_index} ({status} elevation)"))
-            logger.info(f"  ✓ 添加 elevation 图: {e.elevation_image}")
     
     summary = (f"### 结果\n- 墙体: {len(res.walls)}\n"
                f"- 门: {sum(1 for d in res.doors if d.confirmed)}/{len(res.doors)} 已确认\n"
@@ -286,24 +276,9 @@ def _prepare_results(res: PipelineResults):
     logger.info(f"最终统计: radar_imgs={len(radar_imgs)}, vlm_imgs={len(vlm_imgs)}, seg_imgs={len(seg_imgs)}")
     logger.info("=" * 60)
 
-    # print() 始终输出到 stdout，作为 logger 不可靠时的后备调试手段
-    print("\n" + "=" * 60, flush=True)
-    print(f"[DEBUG _prepare_results] 门={len(res.doors)} 窗={len(res.windows)} 墙={len(res.walls)}", flush=True)
-    for e in (res.doors + res.windows):
-        img_ok = bool(e.image_path and Path(e.image_path).exists())
-        ovl_ok = bool(e.overlay_image and Path(e.overlay_image).exists())
-        elv_ok = bool(e.elevation_image and Path(e.elevation_image).exists())
-        print(f"  {e.element_class}#{e.result_index} confirmed={e.confirmed} "
-              f"vlm_img={'✓' if img_ok else '✗'} seg_overlay={'✓' if ovl_ok else '✗'} "
-              f"seg_elev={'✓' if elv_ok else '✗'}", flush=True)
-        if not img_ok:
-            print(f"    image_path={e.image_path!r}", flush=True)
-        if not ovl_ok and not elv_ok:
-            print(f"    overlay_image={e.overlay_image!r} elevation_image={e.elevation_image!r}", flush=True)
-    print(f"[DEBUG] gallery counts: radar={len(radar_imgs)} vlm={len(vlm_imgs)} seg={len(seg_imgs)}", flush=True)
-    print("=" * 60 + "\n", flush=True)
+    print(f"[DEBUG] gallery counts: radar={len(radar_imgs)} vlm={len(vlm_imgs)}")
 
-    return (res, summary, vlm_imgs, seg_imgs, radar_imgs, res.report,
+    return (res, summary, vlm_imgs, radar_imgs, res.report,
             gr.update(choices=choices, value=defaults),
             gr.update(choices=choices))
 
@@ -312,12 +287,11 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
                            falcon: bool, skip_vlm: bool):
     """生成器：实时流式输出管线子进程日志，完成后自动加载结果。
 
-    yield 10 个值: (console, out_dir, results, summary, radar_gallery,
-                    vlm_gallery, seg_gallery, report, vlm_cb, elem_dd)
+    yield 9 个值: (console, out_dir, results, summary, radar_gallery,
+                    vlm_gallery, report, vlm_cb, elem_dd)
     """
     if not scene:
-        yield ("❌ 错误：未选择场景", "", None, "", None, [], [], None,
-               gr.update(), gr.update())
+        yield ("❌ 错误：未选择场景", "", None, "", None, [], None, gr.update(), gr.update())
         return
     elems = []
     if doors:
@@ -325,19 +299,16 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
     if windows:
         elems.append("window")
     if not elems:
-        yield ("❌ 错误：至少选择一种构件类型", "", None, "", None, [], [], None,
-               gr.update(), gr.update())
+        yield ("❌ 错误：至少选择一种构件类型", "", None, "", None, [], None, gr.update(), gr.update())
         return
 
     args = [sys.executable, str(ROOT / "scripts" / "run_pipeline.py"),
             "--name", scene, "--elements", *elems]
     if skip_vlm:
         args.append("--skip-vlm")
-    if not falcon:
-        args.append("--no-falcon")
 
     yield (f"启动管线...\n{' '.join(args)}\n", "", None, "运行中...",
-           None, [], [], None, gr.update(), gr.update())
+           None, [], None, gr.update(), gr.update())
 
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -348,13 +319,13 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
     for line in iter(proc.stdout.readline, ""):
         lines.append(line.rstrip())
         yield ("\n".join(lines[-MAX_CONSOLE_LINES:]), "", None, "运行中...",
-               None, [], [], None, gr.update(), gr.update())
+               None, [], None, gr.update(), gr.update())
 
     proc.wait()
     if proc.returncode != 0:
         console = "\n".join(lines[-MAX_CONSOLE_LINES:])
         yield (f"{console}\n\n❌ 管线失败 (退出码 {proc.returncode})",
-               "", None, "❌ 失败", None, [], [], None, gr.update(), gr.update())
+               "", None, "❌ 失败", None, [], None, gr.update(), gr.update())
         return
 
     out = find_latest_output(scene)
@@ -371,29 +342,29 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
         logger.error(f"加载结果失败: {e}", exc_info=True)
         print(f"[DEBUG] load_results 失败: {e}", flush=True)
         yield (f"{console}\n❌ 加载结果失败: {e}", out, None, "❌ 加载失败",
-               None, [], [], None, gr.update(), gr.update())
+               None, [], None, gr.update(), gr.update())
         return
 
     logger.info("开始准备结果展示")
     r = _prepare_results(res)
     logger.info(f"结果准备完成，准备 yield 到 UI")
-    # r = (res, summary, vlm_imgs, seg_imgs, radar_imgs, report, vlm_cb, elem_dd)
-    yield (console, out, r[0], r[1], r[4], r[2], r[3], r[5], r[6], r[7])
+    # r = (res, summary, vlm_imgs, radar_imgs, report, vlm_cb, elem_dd)
+    yield (console, out, r[0], r[1], r[3], r[2], r[4], r[5], r[6])
 
 
 def load_results_cb(out_dir: str):
-    """从输出目录加载已有结果。返回 8 个值。"""
+    """从输出目录加载已有结果。返回 7 个值。"""
     logger.info(f"加载结果回调: out_dir={out_dir}")
     if not out_dir or not Path(out_dir).exists():
         logger.warning(f"输出目录不存在: {out_dir}")
-        return None, "无结果", [], [], None, None, gr.update(choices=[]), gr.update(choices=[])
+        return None, "无结果", [], [], None, gr.update(choices=[]), gr.update(choices=[])
     try:
         logger.info(f"开始加载结果: {out_dir}")
         res = load_results(Path(out_dir))
         logger.info(f"结果加载成功: {len(res.doors)} 扇门, {len(res.windows)} 扇窗, {len(res.walls)} 面墙")
     except Exception as e:
         logger.error(f"加载结果失败: {e}", exc_info=True)
-        return None, f"❌ 加载失败: {e}", [], [], None, None, gr.update(choices=[]), gr.update(choices=[])
+        return None, f"❌ 加载失败: {e}", [], [], None, gr.update(choices=[]), gr.update(choices=[])
     logger.info("开始准备结果展示")
     result = _prepare_results(res)
     logger.info(f"结果准备完成，返回给 UI")
@@ -788,13 +759,6 @@ def resegment_from_viewpoint(
         "方法": "falcon_resegment",
     }
 
-    # 7. Prepare refreshed Seg gallery + mask editor image
-    seg_imgs = []
-    for e in (results.doors + results.windows):
-        if e.overlay_image and Path(e.overlay_image).exists():
-            seg_imgs.append((e.overlay_image, f"{e.element_class} #{e.result_index} (Falcon)"))
-        elif e.elevation_image and Path(e.elevation_image).exists():
-            seg_imgs.append((e.elevation_image, f"{e.element_class} #{e.result_index} (elevation)"))
 
     status = f"✅ Falcon 检测到 {elem.element_class}，已从新视角重算尺寸并更新"
 
@@ -803,7 +767,6 @@ def resegment_from_viewpoint(
         dims,              # reseg_out
         status,            # cam_status
         results,           # results_state (updated in-place)
-        seg_imgs,          # seg_gallery
         new_elev_path,     # mask_editor (new elevation image)
     )
 
@@ -1248,24 +1211,22 @@ def build_app() -> gr.Blocks:
             refresh_results_btn = gr.Button("🔄", scale=1)
             load_btn = gr.Button("📥 加载结果", variant="secondary", scale=1)
 
-        # ====== ③ 检测结果 ======
+        # ====== ③ 检测结果（按管线流程顺序展示） ======
         gr.Markdown("---\n## ③ 检测结果")
         summary_md = gr.Markdown("运行管线后，结果将在此显示。")
-        gr.Markdown("#### 雷达探测图（墙体 + 门窗等构件扫描）")
+
+        gr.Markdown("### 墙线提取 + 构件雷达图")
         radar_gallery = gr.Gallery(
-            columns=3, height=400, label="", show_label=False,
+            columns=3, height=None, label="", show_label=False,
             object_fit="contain", preview=True,
         )
-        gr.Markdown("#### VLM 验证图库")
+
+        gr.Markdown("### VLM 确认图")
         vlm_gallery = gr.Gallery(
-            columns=4, height=400, label="", show_label=False,
+            columns=6, height=None, label="", show_label=False,
             object_fit="contain", preview=True,
         )
-        gr.Markdown("#### Seg 叠加图库（Falcon 分割 / 立面渲染）")
-        seg_gallery = gr.Gallery(
-            columns=4, height=400, label="", show_label=False,
-            object_fit="contain", preview=True,
-        )
+
         with gr.Row():
             with gr.Column(scale=3):
                 vlm_review_cbs = gr.CheckboxGroup(
@@ -1275,6 +1236,7 @@ def build_app() -> gr.Blocks:
                 review_btn = gr.Button("应用审核")
                 review_status = gr.Markdown("")
         report_json = gr.JSON(label="完整管线报告")
+
 
         # ====== ④ 微调（Mask 绘制 + 视角重分割） ======
         gr.Markdown("---\n## ④ 微调")
@@ -1503,7 +1465,7 @@ def build_app() -> gr.Blocks:
             fn=run_pipeline_streaming,
             inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
-                      radar_gallery, vlm_gallery, seg_gallery, report_json,
+                      radar_gallery, vlm_gallery, report_json,
                      vlm_review_cbs, elem_sel],
         )
         # 管线运行完成后，刷新结果下拉列表并选中最新结果
@@ -1522,7 +1484,7 @@ def build_app() -> gr.Blocks:
         load_btn.click(
             fn=_on_load,
             inputs=[scene_state, results_dropdown],
-            outputs=[results_state, summary_md, vlm_gallery, seg_gallery,
+            outputs=[results_state, summary_md, vlm_gallery,
                       radar_gallery, report_json, vlm_review_cbs, elem_sel],
         )
         review_btn.click(fn=apply_vlm_review,
@@ -1548,7 +1510,7 @@ def build_app() -> gr.Blocks:
             fn=resegment_from_viewpoint,
             inputs=[camera_data, elem_sel, results_state, scene_state],
             outputs=[reseg_preview, reseg_out, cam_status,
-                     results_state, seg_gallery, mask_editor],
+                     results_state, mask_editor],
         )
 
         # --- AI Agent ---

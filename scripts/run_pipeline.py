@@ -593,7 +593,8 @@ def main() -> int:
         for d in view_dets
     ]
     merged_elements = merge_detections(
-        merge_input, center, up_axis=up_axis, merge_threshold=0.5)
+        merge_input, center, up_axis=up_axis,
+        merge_threshold=1.5, height_tolerance=0.5)
     print(f"  Merged: {len(view_dets)} raw -> {len(merged_elements)} unique")
     for me in merged_elements:
         print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
@@ -631,15 +632,24 @@ def main() -> int:
             from bim_recon.vlm_verifier import query_vlm
             try:
                 cfg = get_element_config(me.element_class)
-                prompt = cfg.vlm_hint
+                hint = cfg.vlm_hint
             except KeyError:
-                prompt = f"Is there a {me.element_class} in this image?"
+                hint = me.element_class
+            prompt = (f"Look at this image carefully. "
+                      f"Is there {hint} in this image? "
+                      f"Answer with YES or NO only.")
             vlm_resp = query_vlm(
                 str(verify_dir / img_name), prompt,
                 vlm_api_base, vlm_model, vlm_api_key,
             )
-            vlm_ok = any(kw in vlm_resp.lower() for kw in
-                         ("yes", "confir", "correct", "true", "is a"))
+            resp_lower = vlm_resp.lower().strip()
+            # Check for affirmative in English and Chinese
+            vlm_ok = any(kw in resp_lower for kw in
+                         ("yes", "是", "有", "确认", "confir", "correct",
+                          "true", "indeed", "确实", "存在"))
+            # Also check if the element type name appears (model describing it)
+            if not vlm_ok and me.element_class in resp_lower:
+                vlm_ok = True
 
         tag = "CONFIRMED" if vlm_ok else "REJECTED"
         print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
@@ -747,8 +757,11 @@ def main() -> int:
                 ax.scatter(dx, dy, c=color, s=30, zorder=7)
         ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
         ax.set_aspect("equal")
-        max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
-                    abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
+        max_r = max(
+            max(abs(wl["x1"] - cx) for wl in walls_snapped) if walls_snapped else 5,
+            max(abs(wl["x2"] - cx) for wl in walls_snapped) if walls_snapped else 5,
+            5,
+        )
         ax.set_xlim(-max_r-1, max_r+1)
         ax.set_ylim(-max_r-1, max_r+1)
         ax.set_title(f"Ring Raw Detections ({len(view_dets)} masks, pre-merge)", fontsize=14)
@@ -784,11 +797,12 @@ def main() -> int:
                                label=f"{me.element_class} ({me.num_sources} masks)")
             else:
                 dx, dy = me.world_x - cx, me.world_y - cy
-                ax.scatter(dx, dy, c=[color], s=100, marker="*", zorder=8)
-        ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
+        max_r = max(
+            max(abs(wl["x1"] - cx) for wl in walls_snapped) if walls_snapped else 5,
+            max(abs(wl["x2"] - cx) for wl in walls_snapped) if walls_snapped else 5,
+            5,
+        )
         ax.set_aspect("equal")
-        max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
-                    abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
         ax.set_xlim(-max_r-1, max_r+1)
         ax.set_ylim(-max_r-1, max_r+1)
         ax.set_title(f"Merged Elements ({len(merged_elements)} unique, post-clustering)", fontsize=14)
