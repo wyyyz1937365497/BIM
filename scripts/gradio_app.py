@@ -273,7 +273,7 @@ def _prepare_results(res: PipelineResults):
     choices = [f"{e.element_class} #{e.result_index}" for e in all_elems]
     defaults = [f"{e.element_class} #{e.result_index}" for e in all_elems if e.confirmed]
     
-    logger.info(f"最终统计: radar_imgs={len(radar_imgs)}, vlm_imgs={len(vlm_imgs)}, seg_imgs={len(seg_imgs)}")
+    logger.info(f"最终统计: radar_imgs={len(radar_imgs)}, vlm_imgs={len(vlm_imgs)}")
     logger.info("=" * 60)
 
     print(f"[DEBUG] gallery counts: radar={len(radar_imgs)} vlm={len(vlm_imgs)}")
@@ -388,6 +388,99 @@ def _find_element(results: PipelineResults, elem_label: str):
         if e.result_index == target_idx and e.element_class == elem_class:
             return e
     return None
+
+# ---------------------------------------------------------------------------
+# Interactive radar: checkbox → live radar update
+# ---------------------------------------------------------------------------
+
+def update_interactive_radar(checked_items, results):
+    """Regenerate radar plot showing only checked elements.
+
+    Triggered when the CheckboxGroup selection changes.  Draws walls +
+    camera + markers for each checked element, hides unchecked ones.
+    """
+    if not results or not results.walls:
+        return None
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import math as _m
+
+    # Get center from report
+    report = results.report or {}
+    coord_sys = report.get("coordinate_system", {})
+    center = coord_sys.get("center", [0, 0])
+    cx, cy = float(center[0]), float(center[1])
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # Draw walls
+    for wl in results.walls:
+        x1, y1 = wl["x1"] - cx, wl["y1"] - cy
+        x2, y2 = wl["x2"] - cx, wl["y2"] - cy
+        ax.plot([x1, x2], [y1, y2], "k-", linewidth=3, zorder=5, alpha=0.7)
+
+    # Camera position
+    ax.plot(0, 0, "k^", markersize=14, zorder=10, label="Camera")
+
+    # Draw checked elements
+    label_colors = {"door": "#e74c3c", "window": "#3498db", "column": "#95a5a6"}
+    for e in results.elements:
+        label = f"{e.element_class} #{e.result_index}"
+        if label not in checked_items:
+            continue
+        dx = e.world_x - cx
+        dy = e.world_y - cy
+        color = label_colors.get(e.element_class, "#2ecc71")
+        marker = "*" if e.element_class == "door" else "D"
+        ax.scatter(dx, dy, c=color, s=250, marker=marker, zorder=8,
+                   edgecolors="black", linewidths=1.5)
+        # Draw a circle to show approximate extent
+        hd = e.height_detection or {}
+        width = hd.get("width_m", 0.5)
+        circle = plt.Circle((dx, dy), width / 2, fill=False,
+                             color=color, linewidth=2, linestyle="--", zorder=7)
+        ax.add_patch(circle)
+        ax.annotate(f"{e.element_class}#{e.result_index}\n"
+                    f"r={_m.hypot(dx, dy):.1f}m w={width:.2f}m",
+                    (dx, dy), fontsize=7, ha="center", va="bottom",
+                    xytext=(0, 12), textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                              alpha=0.8, edgecolor=color))
+
+    # Draw unchecked elements as faint outlines
+    for e in results.elements:
+        label = f"{e.element_class} #{e.result_index}"
+        if label in checked_items:
+            continue
+        dx = e.world_x - cx
+        dy = e.world_y - cy
+        ax.scatter(dx, dy, c="lightgray", s=80, marker="x", zorder=6, alpha=0.4)
+
+    ax.set_aspect("equal")
+    max_r = max(
+        max(abs(wl["x1"] - cx) for wl in results.walls) if results.walls else 5,
+        max(abs(wl["x2"] - cx) for wl in results.walls) if results.walls else 5,
+        5,
+    )
+    ax.set_xlim(-max_r - 1, max_r + 1)
+    ax.set_ylim(-max_r - 1, max_r + 1)
+    ax.set_xlabel("World X (m)")
+    ax.set_ylabel("World Y (m)")
+    checked_count = len(checked_items)
+    total_count = len(results.elements)
+    ax.set_title(f"交互式雷达图 — {checked_count}/{total_count} 构件可见",
+                 fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc="upper right")
+
+    fig.canvas.draw()
+    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close(fig)
+    return img_array
+
 
 
 def draw_bbox_on_image(image_path: str, cx: float, cy: float,
@@ -1237,6 +1330,12 @@ def build_app() -> gr.Blocks:
                 review_status = gr.Markdown("")
         report_json = gr.JSON(label="完整管线报告")
 
+        gr.Markdown("### 交互式雷达图（勾选/取消构件实时更新）")
+        interactive_radar = gr.Image(
+            label="交互式雷达图", height=600, show_label=False,
+        )
+
+
 
         # ====== ④ 微调（Mask 绘制 + 视角重分割） ======
         gr.Markdown("---\n## ④ 微调")
@@ -1490,6 +1589,11 @@ def build_app() -> gr.Blocks:
         review_btn.click(fn=apply_vlm_review,
                          inputs=[results_state, vlm_review_cbs],
                          outputs=review_status)
+        vlm_review_cbs.change(
+            fn=update_interactive_radar,
+            inputs=[vlm_review_cbs, results_state],
+            outputs=interactive_radar,
+        )
 
         # --- 微调 ---
         elem_sel.change(
