@@ -92,8 +92,8 @@ def render_ring_views(
     center_2d: Tuple[float, float],
     mid_z: float,
     up_axis: int = 2,
-    n_views: int = 12,
-    fov: float = 45.0,
+    n_views: int = 8,
+    fov: float = 60.0,
     img_size: int = 768,
 ) -> List[RingView]:
     """Render *n_views* overlapping cameras covering 360°.

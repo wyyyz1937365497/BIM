@@ -544,8 +544,8 @@ def main() -> int:
 
     # Stage 3a: Render overlapping ring views
     mid_z = (floor_z + ceiling_z) / 2.0
-    n_ring = 12
-    ring_fov = 45.0
+    n_ring = 8
+    ring_fov = 60.0
     print(f"\n--- Stage 3a: Ring Scan ({n_ring} views x {ring_fov}deg) ---")
     ring_views = render_ring_views(
         scene, center, mid_z, up_axis=up_axis,
