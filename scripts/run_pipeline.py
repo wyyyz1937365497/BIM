@@ -38,18 +38,11 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from bim_recon.candidate_extractor import (
-    extract_candidates,
-    prefilter_candidates,
-    resolve_class_index,
-    CLASSIC_BIM_VOCAB,
-)
+from bim_recon.candidate_extractor import resolve_class_index, CLASSIC_BIM_VOCAB
 from bim_recon.config import load_config
 from bim_recon.element_config import ElementConfig, get_element_config, list_element_types
 from bim_recon.falcon_client import FalconClient
 from bim_recon.gs_scene import GSScene
-from bim_recon.height_detector import detect_element_heights
-from bim_recon.spatial_extractor import extract_spatial
 from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 from bim_recon.mesh_registrar import (
     MeshPlacement,
@@ -59,8 +52,8 @@ from bim_recon.mesh_registrar import (
 )
 from bim_recon.mesh_readiness import render_and_check_mesh_readiness
 from bim_recon.virtual_scanner import VirtualScanner
-from bim_recon.element_merger import merge_detections, merge_falcon_ring_detections
-from bim_recon.vlm_verifier import verify_candidates
+from bim_recon.element_merger import merge_detections
+from bim_recon.vlm_verifier import query_vlm
 from bim_recon.wall_line_extractor import (
     extract_wall_lines,
     multi_height_scan,
@@ -201,436 +194,6 @@ def snap_wall_endpoints(walls: list[dict], threshold: float = 0.5) -> list[dict]
         for ep in eps
     ]
 
-
-# ---------------------------------------------------------------------------
-# Falcon ring scan: direct 2D detection + depth backprojection
-# ---------------------------------------------------------------------------
-
-
-def falcon_wall_scan(
-    scene: GSScene,
-    walls: list[dict],
-    center: tuple[float, float],
-    floor_z: float,
-    ceiling_z: float,
-    falcon: "FalconClient",
-    out_dir: Path,
-    query: str = "door, window",
-    up_axis: int = 2,
-    img_size: int = 768,
-) -> list[dict]:
-    """Per-wall Falcon detection: one panoramic view per wall.
-
-    For each wall, renders from room center toward the wall midpoint with
-    FOV wide enough to cover the entire wall.  Eliminates duplicate
-    detections (same object seen from multiple 360° views).  Each
-    detection carries its wall_idx and a cropped+annotated image.
-    """
-    import math
-    import base64 as _b64
-    from PIL import Image as _PIL, ImageDraw as _ID
-    from pycocotools import mask as mask_utils
-    from bim_recon.gs_scene import GSScene as _GS, look_at_pose
-
-    mid_z = (floor_z + ceiling_z) / 2.0
-    h_axes = [i for i in range(3) if i != up_axis]
-    cx, cy = float(center[0]), float(center[1])
-    labels = [l.strip() for l in query.split(",") if l.strip()]
-    found: list[dict] = []
-
-    for wi, wall in enumerate(walls):
-        ws = np.array([wall["x1"], wall["y1"]], dtype=np.float64)
-        we = np.array([wall["x2"], wall["y2"]], dtype=np.float64)
-        wlen = float(np.linalg.norm(we - ws))
-        wmid = (ws + we) / 2.0
-        wall_dist = float(np.linalg.norm(np.array([cx, cy]) - wmid))
-
-        # FOV to cover the entire wall + 0.3m margin
-        fov_deg = min(
-            math.degrees(2 * math.atan((wlen / 2 + 0.3) / max(wall_dist, 0.5))),
-            110.0,
-        )
-        fx = 0.5 * img_size / math.tan(0.5 * math.radians(fov_deg))
-
-        eye = [0.0, 0.0, 0.0]
-        eye[h_axes[0]] = cx
-        eye[h_axes[1]] = cy
-        eye[up_axis] = mid_z
-        tgt = [0.0, 0.0, 0.0]
-        tgt[h_axes[0]] = float(wmid[0])
-        tgt[h_axes[1]] = float(wmid[1])
-        tgt[up_axis] = mid_z
-        up = [0.0, 0.0, 0.0]
-        up[up_axis] = 1.0
-        pose = look_at_pose(tuple(eye), tuple(tgt), tuple(up))
-
-        result, reason, _ = _GS.render_validated(
-            scene, pose, img_size, img_size, fov_deg)
-        if result is None:
-            print(f"    [wall_scan] wall {wi}: invalid ({reason}), skip")
-            continue
-
-        img = _PIL.fromarray((result.colors * 255).clip(0, 255).astype(np.uint8))
-        img.save(str(out_dir / f"falcon_wall_{wi}.png"))
-
-        viewmat = pose.to_viewmat()
-        R_c2w = viewmat[:3, :3].T
-        eye_np = np.array(eye, dtype=np.float64)
-        annotated = img.convert("RGBA")
-        wall_dets: list[dict] = []
-
-        for label in labels:
-            try:
-                dets = falcon.segment(img, label, task="segmentation")
-            except Exception as ex:
-                print(f"    [wall_scan] wall {wi} '{label}': {ex}")
-                continue
-            for det in dets:
-                mb = det.mask_bbox or det.bbox
-                # Decode mask
-                mask_arr = None
-                if det.mask_rle and det.mask_size:
-                    try:
-                        counts = _b64.b64decode(det.mask_rle)
-                        mask_arr = mask_utils.decode(
-                            {"counts": counts, "size": det.mask_size})
-                        mh, mw = det.mask_size
-                        if mh != img_size or mw != img_size:
-                            mask_arr = np.array(_PIL.fromarray(mask_arr).resize(
-                                (img_size, img_size), _PIL.NEAREST))
-                    except Exception:
-                        mask_arr = None
-
-                # Sampling pixels
-                if mask_arr is not None:
-                    ys, xs = np.where(mask_arr)
-                    cu, cv = int(np.median(xs)), int(np.median(ys))
-                else:
-                    cu = max(0, min(img_size - 1, int(mb["x"] * img_size)))
-                    cv = max(0, min(img_size - 1, int(mb["y"] * img_size)))
-
-                d_center = float(result.depth[cv, cu])
-                if d_center < 0.1:
-                    continue
-
-                # Full-mask backprojection
-                if mask_arr is not None:
-                    mys, mxs = np.where(mask_arr)
-                    mds = result.depth[mys, mxs].astype(np.float64)
-                    ok = mds > 0.1
-                    if ok.sum() < 10:
-                        continue
-                    mxs, mys, mds = mxs[ok], mys[ok], mds[ok]
-                    x_cam = (mxs - img_size / 2.0) / fx * mds
-                    y_cam = (mys - img_size / 2.0) / fx * mds
-                    P_w = R_c2w @ np.stack([x_cam, y_cam, mds], 0) + eye_np.reshape(3, 1)
-                    wz = P_w[up_axis, :]
-                    sill_h = float(np.percentile(wz, 5)) - floor_z
-                    header_h = float(np.percentile(wz, 95)) - floor_z
-                    wh0 = P_w[h_axes[0], :]
-                    width_m = float(np.percentile(wh0, 95) - np.percentile(wh0, 5))
-                    P_world = np.median(P_w, axis=1).tolist()
-                    method = "mask_full_backproject"
-                else:
-                    x_c = (cu - img_size / 2.0) / fx * d_center
-                    y_c = (cv - img_size / 2.0) / fx * d_center
-                    P_world = (R_c2w @ np.array([x_c, y_c, d_center]) + eye_np).tolist()
-                    sill_h = header_h = 0.0
-                    width_m = float(mb["w"] * 2.0)
-                    method = "bbox_center_depth"
-
-                wall_dets.append({
-                    "label": label, "bbox": det.bbox, "mask_bbox": mb,
-                    "mask_rle": det.mask_rle, "mask_size": det.mask_size,
-                    "world_pos": [round(c, 3) for c in P_world],
-                    "wall_idx": wi, "depth": round(d_center, 3),
-                    "sill_height": round(sill_h, 3),
-                    "header_height": round(header_h, 3),
-                    "element_height": round(max(0, header_h - sill_h), 3),
-                    "width_m": round(width_m, 3), "method": method,
-                })
-
-        # Per-detection cropped+annotated images
-        for di, vd in enumerate(wall_dets):
-            ov = _PIL.new("RGBA", (img_size, img_size), (0, 0, 0, 0))
-            dr = _ID.Draw(ov)
-            mb = vd["mask_bbox"]
-            if vd.get("mask_rle"):
-                try:
-                    counts = _b64.b64decode(vd["mask_rle"])
-                    marr = mask_utils.decode({"counts": counts, "size": vd["mask_size"]})
-                    mh, mw = vd["mask_size"]
-                    if mh != img_size or mw != img_size:
-                        marr = np.array(_PIL.fromarray(marr).resize((img_size, img_size), _PIL.NEAREST))
-                    colored = np.zeros((img_size, img_size, 4), dtype=np.uint8)
-                    colored[marr > 0] = [255, 0, 0, 100]
-                    ov = _PIL.fromarray(colored, "RGBA")
-                    dr = _ID.Draw(ov)
-                except Exception:
-                    pass
-            else:
-                dr.rectangle([int((mb["x"]-mb["w"]/2)*img_size), int((mb["y"]-mb["h"]/2)*img_size),
-                              int((mb["x"]+mb["w"]/2)*img_size), int((mb["y"]+mb["h"]/2)*img_size)],
-                             outline=(255, 0, 0, 255), width=3)
-            dr.text((int((mb["x"]-mb["w"]/2)*img_size)+4, int((mb["y"]-mb["h"]/2)*img_size)+4),
-                    vd["label"], fill=(255, 0, 0, 255))
-            cx_px, cy_px = int(mb["x"]*img_size), int(mb["y"]*img_size)
-            hw, hh = int(mb["w"]*img_size*0.75), int(mb["h"]*img_size*0.75)
-            crop = _PIL.alpha_composite(annotated, ov).crop(
-                (max(0, cx_px-hw), max(0, cy_px-hh),
-                 min(img_size, cx_px+hw), min(img_size, cy_px+hh))).convert("RGB")
-            fname = f"falcon_det_w{wi}_{vd['label']}_{di}.png"
-            crop.save(str(out_dir / fname))
-            vd["image_path"] = fname
-
-        found.extend(wall_dets)
-        print(f"    [wall_scan] wall {wi} ({wlen:.1f}m, fov={fov_deg:.0f}°): "
-              f"{len(wall_dets)} detections")
-
-    return found
-
-
-def _detect_from_falcon(
-    falcon_dets: list[dict],
-    walls: list[dict],
-    cfg: ElementConfig,
-    out_dir: Path,
-    up_axis: int,
-) -> dict:
-    """Convert Falcon wall-scan detections to pipeline result format.
-
-    Spatial measurements and per-detection images are already computed in
-    falcon_wall_scan. This function just assigns each detection to its
-    wall position (t-parameter) and builds the result dict.
-    """
-    from bim_recon.candidate_extractor import Candidate, project_point_to_wall
-
-    h_axes = [j for j in range(3) if j != up_axis]
-    result_dicts = []
-
-    for i, det in enumerate(falcon_dets):
-        wi = det["wall_idx"]
-        wall = walls[wi]
-        ws = np.array([wall["x1"], wall["y1"]])
-        we = np.array([wall["x2"], wall["y2"]])
-        world_h = np.array([det["world_pos"][h_axes[0]], det["world_pos"][h_axes[1]]])
-        t_along, _ = project_point_to_wall(world_h, ws, we)
-
-        sill = det.get("sill_height", 0.0)
-        header = det.get("header_height", sill + 1.0)
-        width_m = det.get("width_m", 0.8)
-
-        cand = Candidate(
-            element_class=cfg.name, class_idx=0, wall_idx=wi,
-            t_min=max(0, t_along - 0.05), t_max=min(1, t_along + 0.05),
-            theta_center=0.0, theta_span=10.0,
-            r_mean=det["depth"], h_min=sill, h_max=header,
-            width_m=width_m, num_points=100,
-            world_x=float(world_h[0]), world_y=float(world_h[1]),
-        )
-
-        d = {
-            "candidate": cand.to_dict(),
-            "confirmed": True,
-            "image_path": det.get("image_path", ""),
-            "vlm_response": "falcon_wall_scan",
-            "height_detection": {
-                "sill_height": sill,
-                "header_height": header,
-                "element_height": det.get("element_height", max(0, header - sill)),
-                "width_m": width_m,
-                "t_min": t_along, "t_max": t_along,
-                "confidence": 0.85,
-                "method": det.get("method", "falcon_wall_scan"),
-            },
-        }
-        print(f"    [{cfg.name}] #{i} (wall {wi}): sill={sill:.3f}m "
-              f"header={header:.3f}m w={width_m:.3f}m")
-        result_dicts.append(d)
-
-    return {
-        "element": cfg.name,
-        "total_candidates": len(falcon_dets),
-        "after_prefilter": len(falcon_dets),
-        "confirmed": len(falcon_dets),
-        "rejected": 0,
-        "results": result_dicts,
-    }
-
-# ---------------------------------------------------------------------------
-# Element detection (doors, windows, ...)
-# ---------------------------------------------------------------------------
-
-def detect_elements(
-    cfg: ElementConfig,
-    scans: list,
-    walls: list[dict],
-    coords: dict,
-    scene: GSScene,
-    out_dir: Path,
-    vlm_api_base: str,
-    vlm_model: str,
-    vlm_api_key: str,
-    skip_vlm: bool = False,
-    falcon: FalconClient | None = None,
-    labels: list[str] | None = None,
-) -> dict:
-    """Detect elements of one type from scan data + VLM verification.
-
-    If ``falcon`` is provided and reachable, uses Falcon-Perception
-    segmentation for precise spatial extraction (sill/header/width).
-    Falls back to depth-probing (:mod:`bim_recon.height_detector`)
-    when Falcon is unavailable or returns no result.
-    """
-    center = coords["center"]
-    floor_z = coords["floor_z"]
-    up_axis = coords["up_axis"]
-
-    # Resolve the element's open-vocabulary semantic label to an index in the
-    # active label set (falls back to the classic 9-class vocab).
-    active_labels = labels if labels is not None else list(CLASSIC_BIM_VOCAB)
-    class_idx = resolve_class_index(cfg.semantic_label, active_labels)
-
-    # Extract candidates
-    candidates = extract_candidates(
-        scans, walls, floor_z, center,
-        element_class=cfg.name,
-        class_idx=class_idx,
-        project_to_walls=cfg.structural,
-    )
-
-    # Pre-filter
-    filtered = prefilter_candidates(candidates, cfg.min_width, cfg.min_points)
-    print(f"  [{cfg.name}] {len(candidates)} candidates -> "
-          f"{len(filtered)} after pre-filter")
-
-    if not filtered:
-        print(f"  [{cfg.name}] no candidates passed pre-filter")
-        return {
-            "element": cfg.name,
-            "total_candidates": len(candidates),
-            "after_prefilter": 0,
-            "confirmed": 0,
-            "rejected": 0,
-            "results": [],
-        }
-
-    # VLM verification
-    verify_dir = out_dir / cfg.verify_dir_name
-    results = verify_candidates(
-        filtered, scene, center, floor_z, verify_dir,
-        element_class=cfg.name,
-        vlm_api_base=vlm_api_base,
-        vlm_model=vlm_model,
-        vlm_api_key=vlm_api_key,
-        up_axis=up_axis,
-        vlm_hint=cfg.vlm_hint,
-        skip_vlm=skip_vlm,
-    )
-
-    confirmed = [r for r in results if r.confirmed is True]
-    rejected = [r for r in results if r.confirmed is False]
-    print(f"  [{cfg.name}] {len(confirmed)} confirmed, {len(rejected)} rejected")
-
-    # Spatial extraction for confirmed wall-mounted elements.
-    # When Falcon is online: Falcon's verdict is authoritative — if it finds
-    # nothing, the element is rejected (no depth-probe fallback).
-    # Depth-probe fallback is used ONLY when the Falcon server is offline.
-    height_results: list[dict | None] = [None] * len(results)
-    falcon_rejected: set[int] = set()
-    if cfg.height_detection and confirmed:
-        ceiling_z = coords["ceiling_z"]
-        falcon_tag = "Falcon" if falcon is not None else "depth-probe"
-        print(f"  [{cfg.name}] spatial extraction ({falcon_tag})")
-        for i, r in enumerate(results):
-            if not r.confirmed:
-                continue
-            wi = r.candidate.wall_idx
-            if wi is None or wi >= len(walls):
-                continue
-
-            spatial_dict: dict | None = None
-
-            if falcon is not None:
-                # --- Falcon online: authoritative segmentation ---
-                elev_path = str(out_dir / f"{cfg.name}_{i}_elevation.png")
-                try:
-                    spatial = extract_spatial(
-                        falcon, scene, r.candidate, walls[wi],
-                        floor_z, ceiling_z, center,
-                        element_name=cfg.name,
-                        up_axis=up_axis,
-                        save_image_path=elev_path,
-                    )
-                except (TimeoutError, OSError, Exception) as ex:
-                    print(f"    [{cfg.name}] #{i}: Falcon 超时/错误 ({ex})，跳过")
-                    continue
-                if spatial is not None:
-                    spatial_dict = {
-                        "sill_height": spatial.sill_height,
-                        "header_height": spatial.header_height,
-                        "element_height": spatial.element_height,
-                        "width_m": spatial.width_m,
-                        "t_min": spatial.t_min,
-                        "t_max": spatial.t_max,
-                        "confidence": spatial.confidence,
-                        "method": spatial.method,
-                        "elevation_params": spatial.elevation_params,
-                    }
-                else:
-                    # Falcon online but found nothing → element doesn't exist
-                    falcon_rejected.add(i)
-                    print(f"    [{cfg.name}] #{i}: Falcon 未检测到，拒绝该构件")
-                    continue
-            else:
-                # --- Falcon offline: depth-probe fallback ---
-                hr = detect_element_heights(
-                    scene, r.candidate, walls[wi],
-                    floor_z, ceiling_z, center,
-                    class_idx=class_idx,
-                    labels=labels,
-                    up_axis=up_axis,
-                )
-                spatial_dict = {
-                    "sill_height": hr.sill_height,
-                    "header_height": hr.header_height,
-                    "element_height": hr.element_height,
-                    "confidence": hr.confidence,
-                    "method": hr.method,
-                }
-
-            height_results[i] = spatial_dict
-            sd = spatial_dict
-            print(f"    [{cfg.name}] #{i}: sill={sd['sill_height']:.3f}m "
-                  f"header={sd['header_height']:.3f}m "
-                  f"h={sd['element_height']:.3f}m ({sd['method']})")
-
-    result_dicts = []
-    final_confirmed = 0
-    for i, r in enumerate(results):
-        d = r.to_dict()
-        if i in falcon_rejected:
-            d["confirmed"] = False
-            d["reject_reason"] = "falcon_not_detected"
-        elif height_results[i] is not None:
-            d["height_detection"] = height_results[i]
-            final_confirmed += 1
-        elif r.confirmed:
-            final_confirmed += 1
-        result_dicts.append(d)
-
-    if falcon_rejected:
-        print(f"  [{cfg.name}] {len(falcon_rejected)} rejected by Falcon "
-              f"(false positives removed)")
-
-    return {
-        "element": cfg.name,
-        "total_candidates": len(candidates),
-        "after_prefilter": len(filtered),
-        "confirmed": final_confirmed,
-        "rejected": len(rejected) + len(falcon_rejected),
-        "results": result_dicts,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -830,8 +393,6 @@ def main() -> int:
                         help="Falcon inference server host")
     parser.add_argument("--falcon-port", type=int, default=8390,
                         help="Falcon inference server port")
-    parser.add_argument("--no-falcon", action="store_true",
-                        help="Disable Falcon spatial extraction (use depth-probing only)")
     parser.add_argument("--trellis-host", default=None,
                         help="Override TRELLIS server host from config.json")
     parser.add_argument("--trellis-port", type=int, default=None,
@@ -849,15 +410,14 @@ def main() -> int:
     if not args.skip_vlm:
         print(f"  VLM: {vlm_model} @ {vlm_api_base}")
 
-    # === Falcon client (optional) ===
-    falcon: FalconClient | None = None
-    if not args.no_falcon:
-        falcon = FalconClient(host=args.falcon_host, port=args.falcon_port)
-        if falcon.health():
-            print(f"  Falcon server: connected ({args.falcon_host}:{args.falcon_port})")
-        else:
-            print(f"  Falcon server: unreachable, using depth-probing fallback")
-            falcon = None
+    # === Falcon client (mandatory) ===
+    falcon = FalconClient(host=args.falcon_host, port=args.falcon_port)
+    if falcon.health():
+        print(f"  Falcon server: connected ({args.falcon_host}:{args.falcon_port})")
+    else:
+        print(f"  Falcon server: unreachable at {args.falcon_host}:{args.falcon_port}")
+        falcon = None
+
 
     # === TRELLIS client (optional, for B-class mesh generation) ===
     trellis: TrellisClient | None = None
@@ -970,290 +530,276 @@ def main() -> int:
         except KeyError:
             pass
 
-    if falcon is not None and elem_labels:
-        from bim_recon.ring_scanner import (
-            render_ring_views, segment_ring_views, render_element_view,
+    if falcon is None:
+        print("ERROR: Falcon server is required. Start it first:\n"
+              "  conda activate transformerv && cd Falcon-Perception && "
+              "python falcon_inference_server.py --port 8390")
+        return 1
+    if not elem_labels:
+        print("No valid element types specified")
+        return 1
+    from bim_recon.ring_scanner import (
+        render_ring_views, segment_ring_views, render_element_view,
+    )
+
+    # Stage 3a: Render overlapping ring views
+    mid_z = (floor_z + ceiling_z) / 2.0
+    n_ring = 12
+    ring_fov = 45.0
+    print(f"\n--- Stage 3a: Ring Scan ({n_ring} views x {ring_fov}deg) ---")
+    ring_views = render_ring_views(
+        scene, center, mid_z, up_axis=up_axis,
+        n_views=n_ring, fov=ring_fov, img_size=768,
+    )
+    print(f"  Rendered {len(ring_views)} views")
+
+    # Save ring views for debugging
+    ring_dir = out_dir / "ring_views"
+    ring_dir.mkdir(exist_ok=True)
+    for v in ring_views:
+        from PIL import Image as _PIL
+        _PIL.fromarray(v.image).save(
+            str(ring_dir / f"view_{v.idx:02d}_{v.azimuth_deg:.0f}.png"))
+
+    # Stage 3b: Falcon segmentation per view
+    print(f"\n--- Stage 3b: Per-View Falcon Segmentation ---")
+    view_dets = segment_ring_views(
+        ring_views, falcon, elem_labels,
+        center_2d=center, floor_z=floor_z, ceiling_z=ceiling_z,
+        up_axis=up_axis,
+    )
+    print(f"  Raw detections across all views: {len(view_dets)}")
+    from collections import Counter
+    for label, count in Counter(d.label for d in view_dets).most_common():
+        print(f"    {label}: {count}")
+
+    # Save raw detections
+    raw_json = [
+        {"label": d.label, "view": d.view_idx, "azimuth": d.azimuth_deg,
+         "world_x": round(d.world_x, 3), "world_y": round(d.world_y, 3),
+         "sill_h": round(d.sill_height, 3), "header_h": round(d.header_height, 3),
+         "width_m": round(d.width_m, 3), "centrality": round(d.centrality, 3)}
+        for d in view_dets
+    ]
+    (out_dir / "ring_raw_detections.json").write_text(
+        json.dumps(raw_json, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Stage 3c: Merge in polar space
+    print(f"\n--- Stage 3c: Polar Merge ---")
+    merge_input = [
+        {"element_class": d.label, "world_x": d.world_x, "world_y": d.world_y,
+         "sill_height": d.sill_height, "header_height": d.header_height,
+         "width_m": d.width_m, "confidence": d.centrality}
+        for d in view_dets
+    ]
+    merged_elements = merge_detections(
+        merge_input, center, up_axis=up_axis, merge_threshold=0.5)
+    print(f"  Merged: {len(view_dets)} raw -> {len(merged_elements)} unique")
+    for me in merged_elements:
+        print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
+              f"r={me.r_mean:.2f}m w={me.width_m:.2f}m "
+              f"(from {me.num_sources} views)")
+
+    # Stage 3d: Targeted VLM verification per merged element
+    print(f"\n--- Stage 3d: Targeted VLM Verification ---")
+    verify_dir = out_dir / "verify_merged"
+    verify_dir.mkdir(exist_ok=True)
+
+    confirmed: list[dict] = []
+    for mi, me in enumerate(merged_elements):
+        # Render a fresh targeted view with auto-FOV
+        ev = render_element_view(
+            scene, me.world_x, me.world_y,
+            width_m=me.width_m, height_m=max(me.element_height, 0.5),
+            mid_z=mid_z, center_2d=center, up_axis=up_axis,
+            img_size=768, margin=0.5,
         )
+        if ev is None:
+            print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg: "
+                  f"render failed, skipping")
+            continue
 
-        # Stage 3a: Render overlapping ring views
-        mid_z = (floor_z + ceiling_z) / 2.0
-        n_ring = 12
-        ring_fov = 45.0
-        print(f"\n--- Stage 3a: Ring Scan ({n_ring} views x {ring_fov}deg) ---")
-        ring_views = render_ring_views(
-            scene, center, mid_z, up_axis=up_axis,
-            n_views=n_ring, fov=ring_fov, img_size=768,
-        )
-        print(f"  Rendered {len(ring_views)} views")
+        img_name = f"merged_{mi}_{me.element_class}.png"
+        from PIL import Image as _PIL
+        _PIL.fromarray(ev.image).save(str(verify_dir / img_name))
 
-        # Save ring views for debugging
-        ring_dir = out_dir / "ring_views"
-        ring_dir.mkdir(exist_ok=True)
-        for v in ring_views:
-            from PIL import Image as _PIL
-            _PIL.fromarray(v.image).save(
-                str(ring_dir / f"view_{v.idx:02d}_{v.azimuth_deg:.0f}.png"))
-
-        # Stage 3b: Falcon segmentation per view
-        print(f"\n--- Stage 3b: Per-View Falcon Segmentation ---")
-        view_dets = segment_ring_views(
-            ring_views, falcon, elem_labels,
-            center_2d=center, floor_z=floor_z, ceiling_z=ceiling_z,
-            up_axis=up_axis,
-        )
-        print(f"  Raw detections across all views: {len(view_dets)}")
-        from collections import Counter
-        for label, count in Counter(d.label for d in view_dets).most_common():
-            print(f"    {label}: {count}")
-
-        # Save raw detections
-        raw_json = [
-            {"label": d.label, "view": d.view_idx, "azimuth": d.azimuth_deg,
-             "world_x": round(d.world_x, 3), "world_y": round(d.world_y, 3),
-             "sill_h": round(d.sill_height, 3), "header_h": round(d.header_height, 3),
-             "width_m": round(d.width_m, 3), "centrality": round(d.centrality, 3)}
-            for d in view_dets
-        ]
-        (out_dir / "ring_raw_detections.json").write_text(
-            json.dumps(raw_json, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        # Stage 3c: Merge in polar space
-        print(f"\n--- Stage 3c: Polar Merge ---")
-        merge_input = [
-            {"element_class": d.label, "world_x": d.world_x, "world_y": d.world_y,
-             "sill_height": d.sill_height, "header_height": d.header_height,
-             "width_m": d.width_m, "confidence": d.centrality}
-            for d in view_dets
-        ]
-        merged_elements = merge_detections(
-            merge_input, center, up_axis=up_axis, merge_threshold=0.5)
-        print(f"  Merged: {len(view_dets)} raw -> {len(merged_elements)} unique")
-        for me in merged_elements:
-            print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
-                  f"r={me.r_mean:.2f}m w={me.width_m:.2f}m "
-                  f"(from {me.num_sources} views)")
-
-        # Stage 3d: Targeted VLM verification per merged element
-        print(f"\n--- Stage 3d: Targeted VLM Verification ---")
-        verify_dir = out_dir / "verify_merged"
-        verify_dir.mkdir(exist_ok=True)
-
-        confirmed: list[dict] = []
-        for mi, me in enumerate(merged_elements):
-            # Render a fresh targeted view with auto-FOV
-            ev = render_element_view(
-                scene, me.world_x, me.world_y,
-                width_m=me.width_m, height_m=max(me.element_height, 0.5),
-                mid_z=mid_z, center_2d=center, up_axis=up_axis,
-                img_size=768, margin=0.5,
-            )
-            if ev is None:
-                print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg: "
-                      f"render failed, skipping")
-                continue
-
-            img_name = f"merged_{mi}_{me.element_class}.png"
-            from PIL import Image as _PIL
-            _PIL.fromarray(ev.image).save(str(verify_dir / img_name))
-
-            # VLM judgment
-            if args.skip_vlm:
-                vlm_ok = True
-                vlm_resp = "skipped"
-            else:
-                from bim_recon.vlm_verifier import query_vlm
-                try:
-                    cfg = get_element_config(me.element_class)
-                    prompt = cfg.vlm_hint
-                except KeyError:
-                    prompt = f"Is there a {me.element_class} in this image?"
-                vlm_resp = query_vlm(
-                    str(verify_dir / img_name), prompt,
-                    vlm_api_base, vlm_model, vlm_api_key,
-                )
-                vlm_ok = any(kw in vlm_resp.lower() for kw in
-                             ("yes", "confir", "correct", "true", "is a"))
-
-            tag = "CONFIRMED" if vlm_ok else "REJECTED"
-            print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
-                  f"r={me.r_mean:.2f}m: {tag}")
-
-            if vlm_ok:
-                confirmed.append({
-                    **me.to_dict(), "image_path": img_name,
-                    "vlm_response": vlm_resp, "fov_deg": ev.fov_deg,
-                })
-
-        # Build per-element-type results (downstream-compatible format)
-        for elem_type in args.elements:
+        # VLM judgment
+        if args.skip_vlm:
+            vlm_ok = True
+            vlm_resp = "skipped"
+        else:
+            from bim_recon.vlm_verifier import query_vlm
             try:
-                cfg = get_element_config(elem_type)
+                cfg = get_element_config(me.element_class)
+                prompt = cfg.vlm_hint
             except KeyError:
-                continue
-            type_conf = [c for c in confirmed if c["element_class"] == cfg.semantic_label]
-            all_results[elem_type] = {
-                "total_candidates": len(view_dets),
-                "after_prefilter": len(merged_elements),
-                "confirmed": len(type_conf),
-                "results": [{
-                    "confirmed": True,
-                    "candidate": {
-                        "world_x": c["world_x"], "world_y": c["world_y"],
-                        "theta_center": c["theta_center"], "r_mean": c["r_mean"],
-                        "width_m": c["width_m"],
-                    },
-                    "height_detection": {
-                        "sill_height": c["sill_height"],
-                        "header_height": c["header_height"],
-                        "element_height": c["element_height"],
-                        "width_m": c["width_m"],
-                    },
-                    "image_path": c["image_path"],
-                } for c in type_conf],
-            }
-            elem_json = {"scene": args.name, "element": elem_type,
-                         "ply_used": ply_path.name,
-                         "vlm_model": vlm_model if not args.skip_vlm else None,
-                         **all_results[elem_type]}
-            (out_dir / cfg.output_json_name).write_text(
-                json.dumps(elem_json, indent=2), encoding="utf-8")
+                prompt = f"Is there a {me.element_class} in this image?"
+            vlm_resp = query_vlm(
+                str(verify_dir / img_name), prompt,
+                vlm_api_base, vlm_model, vlm_api_key,
+            )
+            vlm_ok = any(kw in vlm_resp.lower() for kw in
+                         ("yes", "confir", "correct", "true", "is a"))
 
-        # Save merged results
-        merged_json = {
-            "raw_count": len(view_dets),
-            "merged_count": len(merged_elements),
-            "confirmed_count": len(confirmed),
-            "merged": [me.to_dict() for me in merged_elements],
-            "confirmed": confirmed,
+        tag = "CONFIRMED" if vlm_ok else "REJECTED"
+        print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
+              f"r={me.r_mean:.2f}m: {tag}")
+
+        if vlm_ok:
+            confirmed.append({
+                **me.to_dict(), "image_path": img_name,
+                "vlm_response": vlm_resp, "fov_deg": ev.fov_deg,
+            })
+
+    # Build per-element-type results (downstream-compatible format)
+    for elem_type in args.elements:
+        try:
+            cfg = get_element_config(elem_type)
+        except KeyError:
+            continue
+        type_conf = [c for c in confirmed if c["element_class"] == cfg.semantic_label]
+        all_results[elem_type] = {
+            "total_candidates": len(view_dets),
+            "after_prefilter": len(merged_elements),
+            "confirmed": len(type_conf),
+            "results": [{
+                "confirmed": True,
+                "candidate": {
+                    "world_x": c["world_x"], "world_y": c["world_y"],
+                    "theta_center": c["theta_center"], "r_mean": c["r_mean"],
+                    "width_m": c["width_m"],
+                },
+                "height_detection": {
+                    "sill_height": c["sill_height"],
+                    "header_height": c["header_height"],
+                    "element_height": c["element_height"],
+                    "width_m": c["width_m"],
+                },
+                "image_path": c["image_path"],
+            } for c in type_conf],
         }
-        (out_dir / "merged_elements.json").write_text(
-            json.dumps(merged_json, indent=2, ensure_ascii=False), encoding="utf-8")
+        elem_json = {"scene": args.name, "element": elem_type,
+                     "ply_used": ply_path.name,
+                     "vlm_model": vlm_model if not args.skip_vlm else None,
+                     **all_results[elem_type]}
+        (out_dir / cfg.output_json_name).write_text(
+            json.dumps(elem_json, indent=2), encoding="utf-8")
 
-        # === Generate ring-scan radar plots (Cartesian top-down) ===
-        print(f"\n--- Generating Ring Radar Plots ---")
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Wedge
+    # Save merged results
+    merged_json = {
+        "raw_count": len(view_dets),
+        "merged_count": len(merged_elements),
+        "confirmed_count": len(confirmed),
+        "merged": [me.to_dict() for me in merged_elements],
+        "confirmed": confirmed,
+    }
+    (out_dir / "merged_elements.json").write_text(
+        json.dumps(merged_json, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        cx, cy = float(center[0]), float(center[1])
-        h_axes = [i for i in range(3) if i != up_axis]
+    # === Generate ring-scan radar plots (Cartesian top-down) ===
+    print(f"\n--- Generating Ring Radar Plots ---")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Wedge
 
-        def _draw_walls(ax):
-            for wl in walls_snapped:
-                x1, y1 = wl["x1"] - cx, wl["y1"] - cy
-                x2, y2 = wl["x2"] - cx, wl["y2"] - cy
-                ax.plot([x1, x2], [y1, y2], "k-", linewidth=3, zorder=5, alpha=0.7)
+    cx, cy = float(center[0]), float(center[1])
+    h_axes = [i for i in range(3) if i != up_axis]
 
-        def _draw_pca_line(ax, pts, color, label=None, lw=2.5):
-            """Draw PCA main-axis line segment through point cloud."""
-            if len(pts) < 3:
-                ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=3, alpha=0.5, zorder=7)
-                return
-            ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=3, alpha=0.4, zorder=7)
-            centered = pts - pts.mean(axis=0)
-            U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-            main_dir = Vt[0]
-            proj = centered @ main_dir
-            c = pts.mean(axis=0)
-            p1 = c + main_dir * proj.min()
-            p2 = c + main_dir * proj.max()
-            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "-", color=color,
-                    linewidth=lw, zorder=8, label=label)
-            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "o", color=color,
-                    markersize=5, zorder=9)
+    def _draw_walls(ax):
+        for wl in walls_snapped:
+            x1, y1 = wl["x1"] - cx, wl["y1"] - cy
+            x2, y2 = wl["x2"] - cx, wl["y2"] - cy
+            ax.plot([x1, x2], [y1, y2], "k-", linewidth=3, zorder=5, alpha=0.7)
 
-        # Radar 1: Raw detections (Cartesian, mask point clouds)
-        if view_dets:
-            fig, ax = plt.subplots(1, 1, figsize=(14, 14))
-            _draw_walls(ax)
-            label_colors = {"door": "red", "window": "blue", "column": "gray"}
-            palette = plt.cm.Set1(np.linspace(0, 1, max(len(view_dets), 1)))
-            for di, d in enumerate(view_dets):
-                color = label_colors.get(d.label, "green")
-                if d.mask_points_xy is not None:
-                    pts = d.mask_points_xy - np.array([cx, cy])
-                    _draw_pca_line(ax, pts, color,
-                                   label=f"{d.label} v{d.view_idx}" if di < 12 else None)
-                else:
-                    dx, dy = d.world_x - cx, d.world_y - cy
-                    ax.scatter(dx, dy, c=color, s=30, zorder=7)
-            ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
-            ax.set_aspect("equal")
-            max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
-                        abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
-            ax.set_xlim(-max_r-1, max_r+1)
-            ax.set_ylim(-max_r-1, max_r+1)
-            ax.set_title(f"Ring Raw Detections ({len(view_dets)} masks, pre-merge)", fontsize=14)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=7)
-            fig.savefig(str(out_dir / "radar_ring_raw.png"), dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            print("  radar_ring_raw.png saved")
+    def _draw_pca_line(ax, pts, color, label=None, lw=2.5):
+        """Draw PCA main-axis line segment through point cloud."""
+        if len(pts) < 3:
+            ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=3, alpha=0.5, zorder=7)
+            return
+        ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=3, alpha=0.4, zorder=7)
+        centered = pts - pts.mean(axis=0)
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        main_dir = Vt[0]
+        proj = centered @ main_dir
+        c = pts.mean(axis=0)
+        p1 = c + main_dir * proj.min()
+        p2 = c + main_dir * proj.max()
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "-", color=color,
+                linewidth=lw, zorder=8, label=label)
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "o", color=color,
+                markersize=5, zorder=9)
 
-        # Radar 2: Merged elements (Cartesian, combined point clouds)
-        if merged_elements:
-            fig, ax = plt.subplots(1, 1, figsize=(14, 14))
-            _draw_walls(ax)
-            # View fans (light)
-            for v in ring_views:
-                az = math.radians(v.azimuth_deg)
-                hfov = math.radians(v.fov_deg / 2)
-                max_d = float(np.percentile(v.depth[v.depth > 0.1], 90)) if (v.depth > 0.1).any() else 5.0
-                ax.add_patch(Wedge((0, 0), max_d,
-                                    math.degrees(az - hfov), math.degrees(az + hfov),
-                                    alpha=0.04, color="lightblue", zorder=1))
-            palette = plt.cm.Set1(np.linspace(0, 1, max(len(merged_elements), 1)))
-            for mi, me in enumerate(merged_elements):
-                color = palette[mi % len(palette)]
-                # Combine all source mask points
-                src_pts = []
-                for si in me.source_indices:
-                    if si < len(view_dets) and view_dets[si].mask_points_xy is not None:
-                        src_pts.append(view_dets[si].mask_points_xy - np.array([cx, cy]))
-                if src_pts:
-                    all_pts = np.vstack(src_pts)
-                    _draw_pca_line(ax, all_pts, color,
-                                   label=f"{me.element_class} ({me.num_sources} masks)")
-                else:
-                    dx, dy = me.world_x - cx, me.world_y - cy
-                    ax.scatter(dx, dy, c=[color], s=100, marker="*", zorder=8)
-            ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
-            ax.set_aspect("equal")
-            max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
-                        abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
-            ax.set_xlim(-max_r-1, max_r+1)
-            ax.set_ylim(-max_r-1, max_r+1)
-            ax.set_title(f"Merged Elements ({len(merged_elements)} unique, post-clustering)", fontsize=14)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8)
-            fig.savefig(str(out_dir / "radar_merged.png"), dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            print("  radar_merged.png saved")
+    # Radar 1: Raw detections (Cartesian, mask point clouds)
+    if view_dets:
+        fig, ax = plt.subplots(1, 1, figsize=(14, 14))
+        _draw_walls(ax)
+        label_colors = {"door": "red", "window": "blue", "column": "gray"}
+        palette = plt.cm.Set1(np.linspace(0, 1, max(len(view_dets), 1)))
+        for di, d in enumerate(view_dets):
+            color = label_colors.get(d.label, "green")
+            if d.mask_points_xy is not None:
+                pts = d.mask_points_xy - np.array([cx, cy])
+                _draw_pca_line(ax, pts, color,
+                               label=f"{d.label} v{d.view_idx}" if di < 12 else None)
+            else:
+                dx, dy = d.world_x - cx, d.world_y - cy
+                ax.scatter(dx, dy, c=color, s=30, zorder=7)
+        ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
+        ax.set_aspect("equal")
+        max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
+                    abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
+        ax.set_xlim(-max_r-1, max_r+1)
+        ax.set_ylim(-max_r-1, max_r+1)
+        ax.set_title(f"Ring Raw Detections ({len(view_dets)} masks, pre-merge)", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7)
+        fig.savefig(str(out_dir / "radar_ring_raw.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("  radar_ring_raw.png saved")
+
+    # Radar 2: Merged elements (Cartesian, combined point clouds)
+    if merged_elements:
+        fig, ax = plt.subplots(1, 1, figsize=(14, 14))
+        _draw_walls(ax)
+        # View fans (light)
+        for v in ring_views:
+            az = math.radians(v.azimuth_deg)
+            hfov = math.radians(v.fov_deg / 2)
+            max_d = float(np.percentile(v.depth[v.depth > 0.1], 90)) if (v.depth > 0.1).any() else 5.0
+            ax.add_patch(Wedge((0, 0), max_d,
+                                math.degrees(az - hfov), math.degrees(az + hfov),
+                                alpha=0.04, color="lightblue", zorder=1))
+        palette = plt.cm.Set1(np.linspace(0, 1, max(len(merged_elements), 1)))
+        for mi, me in enumerate(merged_elements):
+            color = palette[mi % len(palette)]
+            # Combine all source mask points
+            src_pts = []
+            for si in me.source_indices:
+                if si < len(view_dets) and view_dets[si].mask_points_xy is not None:
+                    src_pts.append(view_dets[si].mask_points_xy - np.array([cx, cy]))
+            if src_pts:
+                all_pts = np.vstack(src_pts)
+                _draw_pca_line(ax, all_pts, color,
+                               label=f"{me.element_class} ({me.num_sources} masks)")
+            else:
+                dx, dy = me.world_x - cx, me.world_y - cy
+                ax.scatter(dx, dy, c=[color], s=100, marker="*", zorder=8)
+        ax.plot(0, 0, "k^", markersize=12, zorder=10, label="Camera")
+        ax.set_aspect("equal")
+        max_r = max(abs(wl["x1"]-cx).max() if walls_snapped else 5,
+                    abs(wl["x2"]-cx).max() if walls_snapped else 5, 5)
+        ax.set_xlim(-max_r-1, max_r+1)
+        ax.set_ylim(-max_r-1, max_r+1)
+        ax.set_title(f"Merged Elements ({len(merged_elements)} unique, post-clustering)", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        fig.savefig(str(out_dir / "radar_merged.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("  radar_merged.png saved")
 
 
 
-    else:
-        # --- FALLBACK: old SceneSplat + VLM flow (no Falcon) ---
-        print(f"\n--- Stage 3b: Element Detection (SceneSplat fallback) ---")
-        for elem_type in args.elements:
-            try:
-                cfg = get_element_config(elem_type)
-            except KeyError:
-                continue
-            result = detect_elements(
-                cfg, scans, walls_snapped, coords, scene,
-                out_dir, vlm_api_base, vlm_model, vlm_api_key, args.skip_vlm,
-                falcon=None, labels=labels,
-            )
-            all_results[elem_type] = result
-            elem_json = {"scene": args.name, "element": elem_type,
-                         "ply_used": ply_path.name,
-                         "vlm_model": vlm_model if not args.skip_vlm else None,
-                         **result}
-            (out_dir / cfg.output_json_name).write_text(
-                json.dumps(elem_json, indent=2), encoding="utf-8")
-        merged_elements = []
 
     # === Generate radar plots (SceneSplat semantic points as annotation) ===
     _generate_element_radars(scans, walls_snapped, all_results,
