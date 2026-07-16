@@ -242,7 +242,14 @@ def _prepare_results(res: PipelineResults):
         logger.info(f"扫描雷达图库目录: {out_dir}, 找到 {len(radar_files)} 个文件")
         for r in radar_files:
             elem_name = r.stem.replace("radar_", "")
-            radar_imgs.append((str(r), f"{elem_name} 雷达图"))
+            label_map = {
+                "ring_raw": "环形检测 (合并前)",
+                "merged": "合并构件 (合并后)",
+                "door": "门 雷达图",
+                "window": "窗 雷达图",
+            }
+            label = label_map.get(elem_name, f"{elem_name} 雷达图")
+            radar_imgs.append((str(r), label))
             logger.info(f"添加雷达图: {r.name}")
 
     # VLM gallery

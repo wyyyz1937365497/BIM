@@ -51,6 +51,8 @@ class PipelineResults:
     elements: list[ElementResult]
     coords: dict[str, Any]
     wall_topdown_image: str | None = None
+    radar_ring_raw: str | None = None
+    radar_merged: str | None = None
     report: dict[str, Any] | None = None
 
     @property
@@ -115,6 +117,14 @@ def load_results(out_dir: Path) -> PipelineResults:
 
     topdown = str(out_dir / "wall_lines_topdown.png")
 
+    # Ring-scan radar images (may not exist in older runs)
+    radar_ring = str(out_dir / "radar_ring_raw.png")
+    radar_merged = str(out_dir / "radar_merged.png")
+    if not Path(radar_ring).exists():
+        radar_ring = None
+    if not Path(radar_merged).exists():
+        radar_merged = None
+
     elements: list[ElementResult] = []
     for vf in sorted(out_dir.glob("*_verified.json")):
         elements.extend(_load_elements(out_dir, vf.name))
@@ -122,6 +132,7 @@ def load_results(out_dir: Path) -> PipelineResults:
     return PipelineResults(
         out_dir=out_dir, walls=walls, elements=elements,
         coords=coords, wall_topdown_image=topdown, report=report,
+        radar_ring_raw=radar_ring, radar_merged=radar_merged,
     )
 
 
@@ -141,19 +152,38 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
     for result_index, r in enumerate(data.get("results", [])):
         c = r.get("candidate", {})
         hd = r.get("height_detection")
-        elem_class = c.get("element_class", "")
+        elem_class = c.get("element_class") or data.get("element", "") or ""
         # Resolve view image (falcon_scan_view or verify_* pattern)
         view_name = r.get("image_path", "")
         view_path = None
         if view_name:
             for candidate in [
                 out_dir / f"verify_{elem_class}" / view_name,
+                out_dir / "verify_merged" / view_name,
                 out_dir / view_name,
             ]:
                 if candidate.is_file():
                     view_path = candidate
                     break
         view_str = str(view_path) if view_path else ""
+        # Find ring view image closest to this element's azimuth
+        ring_img = None
+        theta = c.get("theta_center", 0)
+        ring_dir = out_dir / "ring_views"
+        if ring_dir.is_dir():
+            ring_files = sorted(ring_dir.glob("view_*.png"))
+            if ring_files:
+                # Pick ring view with azimuth closest to theta
+                best_ring = min(
+                    ring_files,
+                    key=lambda p: abs(
+                        float(p.stem.split("_")[-1]) - theta) % 360,
+                )
+                # Use the smaller of (diff, 360-diff)
+                diff = abs(float(best_ring.stem.split("_")[-1]) - theta) % 360
+                if min(diff, 360 - diff) < 30:
+                    ring_img = str(best_ring)
+
         results.append(ElementResult(
             element_class=elem_class,
             confirmed=r.get("confirmed", False),
@@ -165,7 +195,7 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
             result_index=result_index,
             height_detection=hd,
             elevation_image=view_str if view_str else None,
-            overlay_image=None,
+            overlay_image=ring_img or view_str or None,
         ))
     return results
 
