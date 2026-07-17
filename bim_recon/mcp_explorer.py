@@ -284,8 +284,8 @@ def build_server(state: ExplorerState) -> FastMCP:
 
         png, _result, _pose = _render_current(s)
         saved = _save_view(s, png)
-        print(f"[explorer] init at ({cx:.2f}, {cy:.2f}, {cz:.2f}) yaw={initial_yaw:.0f}° "
-              f"→ {saved}", file=sys.stderr)
+        print(f"[explorer] init at ({cam_eye[0]:.2f}, {cam_eye[1]:.2f}, {cam_eye[2]:.2f}) "
+              f"yaw={initial_yaw:.0f}deg up_axis={s.up_axis} -> {saved}", file=sys.stderr)
         return MCPImage(data=png, format="png")
 
     @mcp.tool()
