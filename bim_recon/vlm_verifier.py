@@ -186,8 +186,15 @@ def query_vlm(
     """
     from openai import OpenAI
 
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
+    # Resize large images to avoid API limits (max ~4MB base64)
+    from PIL import Image as _PIL
+    import io as _io
+    img = _PIL.open(image_path)
+    if max(img.size) > 768:
+        img = img.resize((768, 768), _PIL.LANCZOS)
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
 
     client = OpenAI(base_url=api_base, api_key=api_key or "empty", timeout=timeout)
     resp = client.chat.completions.create(
@@ -200,7 +207,7 @@ def query_vlm(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
+                            "url": f"data:image/jpeg;base64,{img_b64}",
                         },
                     },
                 ],

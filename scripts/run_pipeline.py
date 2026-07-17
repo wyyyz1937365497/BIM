@@ -671,16 +671,18 @@ def main() -> int:
             prompt = (f"Look at this image carefully. "
                       f"Is there {hint} in this image? "
                       f"Answer with YES or NO only.")
-            vlm_resp = query_vlm(
-                str(verify_dir / img_name), prompt,
-                vlm_api_base, vlm_model, vlm_api_key,
-            )
+            try:
+                vlm_resp = query_vlm(
+                    str(verify_dir / img_name), prompt,
+                    vlm_api_base, vlm_model, vlm_api_key,
+                )
+            except Exception as vlm_ex:
+                print(f"    VLM API error: {vlm_ex}")
+                vlm_resp = ""
             resp_lower = vlm_resp.lower().strip()
-            # Check for affirmative in English and Chinese
             vlm_ok = any(kw in resp_lower for kw in
                          ("yes", "是", "有", "确认", "confir", "correct",
                           "true", "indeed", "确实", "存在"))
-            # Also check if the element type name appears (model describing it)
             if not vlm_ok and me.element_class in resp_lower:
                 vlm_ok = True
 
