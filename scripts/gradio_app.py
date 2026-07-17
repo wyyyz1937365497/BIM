@@ -313,6 +313,7 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, cwd=str(ROOT), bufsize=1,
+        env={**__import__('os').environ, 'PYTHONUNBUFFERED': '1'},
     )
     assert proc.stdout is not None
     lines: list[str] = []
@@ -470,14 +471,17 @@ def update_interactive_radar(checked_items, results):
     ax.set_ylabel("World Y (m)")
     checked_count = len(checked_items)
     total_count = len(results.elements)
-    ax.set_title(f"交互式雷达图 — {checked_count}/{total_count} 构件可见",
+    ax.set_title(f"Interactive Radar - {checked_count}/{total_count} visible",
                  fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9, loc="upper right")
 
     fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    # Modern matplotlib: use buffer_rgba instead of deprecated tostring_rgb
+    buf = fig.canvas.buffer_rgba()
+    img_array = np.frombuffer(buf, dtype=np.uint8)
+    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    img_array = img_array[:, :, :3]  # drop alpha
     plt.close(fig)
     return img_array
 

@@ -635,13 +635,14 @@ def main() -> int:
 
 
     # Stage 3d: Targeted VLM verification per merged element
-    print(f"\n--- Stage 3d: Targeted VLM Verification ---")
+    print(f"\n--- Stage 3d: Targeted VLM Verification ---", flush=True)
     verify_dir = out_dir / "verify_merged"
     verify_dir.mkdir(exist_ok=True)
 
     confirmed: list[dict] = []
     for mi, me in enumerate(merged_elements):
-        # Render a fresh targeted view with auto-FOV
+        print(f"  [{mi+1}/{len(merged_elements)}] {me.element_class} "
+              f"theta={me.theta_center:.1f}deg rendering...", flush=True)
         ev = render_element_view(
             scene, me.world_x, me.world_y,
             width_m=me.width_m, height_m=max(me.element_height, 0.5),
@@ -649,8 +650,7 @@ def main() -> int:
             img_size=768, margin=0.5,
         )
         if ev is None:
-            print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg: "
-                  f"render failed, skipping")
+            print(f"    render failed, skipping", flush=True)
             continue
 
         img_name = f"merged_{mi}_{me.element_class}.png"
@@ -671,13 +671,15 @@ def main() -> int:
             prompt = (f"Look at this image carefully. "
                       f"Is there {hint} in this image? "
                       f"Answer with YES or NO only.")
+            print(f"    querying VLM (timeout=30s)...", flush=True)
             try:
                 vlm_resp = query_vlm(
                     str(verify_dir / img_name), prompt,
                     vlm_api_base, vlm_model, vlm_api_key,
+                    timeout=30,
                 )
             except Exception as vlm_ex:
-                print(f"    VLM API error: {vlm_ex}")
+                print(f"    VLM error: {vlm_ex}", flush=True)
                 vlm_resp = ""
             resp_lower = vlm_resp.lower().strip()
             vlm_ok = any(kw in resp_lower for kw in
@@ -687,8 +689,7 @@ def main() -> int:
                 vlm_ok = True
 
         tag = "CONFIRMED" if vlm_ok else "REJECTED"
-        print(f"    [{me.element_class}] theta={me.theta_center:.1f}deg "
-              f"r={me.r_mean:.2f}m: {tag}")
+        print(f"    -> {tag} ({vlm_resp[:60]})", flush=True)
 
         if vlm_ok:
             confirmed.append({
