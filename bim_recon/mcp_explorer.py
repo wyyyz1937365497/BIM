@@ -360,6 +360,8 @@ def build_server(state: ExplorerState) -> FastMCP:
         s = _req()
         client = _check_falcon(s)
         png, _result, _pose = _render_current(s)
+        saved_path = _save_view(s, png, suffix=f"_detect_{query.replace(',', '_').strip()}")
+        print(f"[explorer] detect '{query}' → {saved_path}", file=sys.stderr)
         img = PILImage.open(io.BytesIO(png))
         dets = client.segment(img, query, task="detection")
         out = []
