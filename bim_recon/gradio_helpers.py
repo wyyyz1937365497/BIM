@@ -1200,13 +1200,19 @@ def _get_explorer_agent(scene_name: str):
     from smolagents import ToolCollection, ToolCallingAgent
     from mcp import StdioServerParameters
 
-    ply_path = ROOT / "data" / f"{scene_name}.ply"
-    if not ply_path.exists():
-        raise FileNotFoundError(f"PLY 不存在: {ply_path}")
-    feat_path = ROOT / "output" / scene_name / f"{scene_name}_feat.pt"
+    data_dir = ROOT / "data" / scene_name
+    ply_candidates = sorted(data_dir.glob("point_cloud_*.ply")) or sorted(data_dir.glob("*.ply"))
+    if not ply_candidates:
+        raise FileNotFoundError(f"PLY not found in {data_dir}")
+    ply_path = ply_candidates[0]
+    feat_candidates = sorted(data_dir.glob("*_feat.pt"))
+    if not feat_candidates:
+        out_dir = ROOT / "output" / scene_name
+        feat_candidates = sorted(out_dir.glob("*_feat.pt"))
+    feat_path = feat_candidates[0] if feat_candidates else None
 
     mcp_args = ["-m", "bim_recon.mcp_explorer", "--ply", str(ply_path)]
-    if feat_path.exists():
+    if feat_path and Path(feat_path).exists():
         mcp_args.extend(["--feat", str(feat_path)])
     mcp_args.extend(["--explore-dir", str(ROOT / "output" / scene_name / "explore")])
 
