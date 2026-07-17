@@ -83,7 +83,7 @@ class ExplorerState:
     falcon_port: int = 8390
     # Cached scene bounds.
     bounds_min: Tuple[float, ...] = (0.0, 0.0, 0.0)
-    bounds_max: Tuple[float, ...] = (10.0, 3.0, 10.0)
+    up_axis: int = 2               # 0=x, 1=y, 2=z (auto-detected)
     initialized: bool = False
 
 
@@ -97,29 +97,56 @@ def _req() -> ExplorerState:
 
 
 # ---------------------------------------------------------------------------
-# Camera math (Y-up: horizontal plane = XZ)
+# Camera math (adaptive up-axis; horizontal plane = the two non-up axes)
 # ---------------------------------------------------------------------------
 
+# Axis indices for horizontal movement given up_axis
+# up_axis=2 (Z-up): h_axes = [0, 1] (XY plane)
+# up_axis=1 (Y-up): h_axes = [0, 2] (XZ plane)
+# up_axis=0 (X-up): h_axes = [1, 2] (YZ plane)
+def _h_axes(up_axis: int) -> Tuple[int, int]:
+    if up_axis == 2:
+        return 0, 1
+    elif up_axis == 1:
+        return 0, 2
+    else:
+        return 1, 2
 
-def _target_from_eye_yaw(eye: List[float], yaw: float) -> List[float]:
+def _up_vec(up_axis: int) -> Tuple[float, float, float]:
+    v = [0.0, 0.0, 0.0]
+    v[up_axis] = 1.0
+    return tuple(v)
+
+def _target_from_eye_yaw(eye: List[float], yaw: float, up_axis: int) -> List[float]:
     """Compute a look-at target from eye position + yaw (horizontal only)."""
-    return [eye[0] + math.cos(yaw), eye[1], eye[2] + math.sin(yaw)]
+    h0, h1 = _h_axes(up_axis)
+    target = list(eye)
+    target[h0] = eye[h0] + math.cos(yaw)
+    target[h1] = eye[h1] + math.sin(yaw)
+    return target
 
+def _yaw_from_eye_target(eye: List[float], target: List[float], up_axis: int) -> float:
+    """Compute yaw from eye → target direction (projected to horizontal plane)."""
+    h0, h1 = _h_axes(up_axis)
+    dh0 = target[h0] - eye[h0]
+    dh1 = target[h1] - eye[h1]
+    return math.atan2(dh1, dh0)
 
-def _yaw_from_eye_target(eye: List[float], target: List[float]) -> float:
-    """Compute yaw from eye → target direction (projected to XZ plane)."""
-    dx, dz = target[0] - eye[0], target[2] - eye[2]
-    return math.atan2(dz, dx)
+def _forward(yaw: float, up_axis: int) -> Tuple[float, ...]:
+    """Horizontal forward direction for *yaw* as a full 3D vector."""
+    h0, h1 = _h_axes(up_axis)
+    v = [0.0, 0.0, 0.0]
+    v[h0] = math.cos(yaw)
+    v[h1] = math.sin(yaw)
+    return tuple(v)
 
-
-def _forward(yaw: float) -> Tuple[float, float]:
-    """Horizontal forward direction (xz) for *yaw*."""
-    return math.cos(yaw), math.sin(yaw)
-
-
-def _right(yaw: float) -> Tuple[float, float]:
-    """Horizontal right direction (xz) for *yaw*."""
-    return -math.sin(yaw), math.cos(yaw)
+def _right(yaw: float, up_axis: int) -> Tuple[float, ...]:
+    """Horizontal right direction for *yaw* as a full 3D vector."""
+    h0, h1 = _h_axes(up_axis)
+    v = [0.0, 0.0, 0.0]
+    v[h0] = -math.sin(yaw)
+    v[h1] = math.cos(yaw)
+    return tuple(v)
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +156,11 @@ def _right(yaw: float) -> Tuple[float, float]:
 
 def _render_current(s: ExplorerState) -> Tuple[bytes, "RenderResult", CameraPose]:
     """Render from the current camera pose. Returns (png_bytes, result, pose)."""
-    target = _target_from_eye_yaw(s.cam_eye, s.cam_yaw)
+    target = _target_from_eye_yaw(s.cam_eye, s.cam_yaw, s.up_axis)
     pose = look_at_pose(
         eye=tuple(s.cam_eye),
         target=tuple(target),
-        up=(0.0, 1.0, 0.0),
+        up=_up_vec(s.up_axis),
     )
     result = s.scene.render(pose, s.width, s.height, s.cam_fov)
     arr = np.clip(result.colors * 255, 0, 255).astype(np.uint8)
@@ -228,10 +255,15 @@ def build_server(state: ExplorerState) -> FastMCP:
         """
         s = _req()
         mn, mx = s.bounds_min, s.bounds_max
-        cx = float(center_x) if center_x is not None else (mn[0] + mx[0]) / 2
-        cz = float(center_z) if center_z is not None else (mn[2] + mx[2]) / 2
-        cy = float(eye_height) if eye_height is not None else float(mn[1]) + 1.5
-        s.cam_eye = [cx, cy, cz]
+        h0, h1 = _h_axes(s.up_axis)
+        up = s.up_axis
+        cam_eye = [(mn[i] + mx[i]) / 2 for i in range(3)]
+        cam_eye[up] = float(mn[up]) + float(eye_height if eye_height is not None else 1.5)
+        if center_x is not None:
+            cam_eye[h0] = float(center_x)
+        if center_z is not None:
+            cam_eye[h1] = float(center_z)
+        s.cam_eye = cam_eye
         s.cam_yaw = math.radians(initial_yaw)
         s.initialized = True
         s.explore_dir.mkdir(parents=True, exist_ok=True)
@@ -275,20 +307,20 @@ def build_server(state: ExplorerState) -> FastMCP:
         s = _req()
         yaw = s.cam_yaw
         if direction == "forward":
-            dx, dz = _forward(yaw)
+            move = _forward(yaw, s.up_axis)
         elif direction == "back":
-            fx, fz = _forward(yaw)
-            dx, dz = -fx, -fz
+            fwd = _forward(yaw, s.up_axis)
+            move = tuple(-f for f in fwd)
         elif direction == "right":
-            dx, dz = _right(yaw)
+            move = _right(yaw, s.up_axis)
         elif direction == "left":
-            rx, rz = _right(yaw)
-            dx, dz = -rx, -rz
+            rt = _right(yaw, s.up_axis)
+            move = tuple(-r for r in rt)
         else:
             return json.dumps({"error": f"Unknown direction '{direction}'. "
                                          "Use forward/back/left/right."})
-        s.cam_eye[0] += dx * distance
-        s.cam_eye[2] += dz * distance
+        for i in range(3):
+            s.cam_eye[i] += move[i] * distance
         png, _r, _p = _render_current(s)
         _save_view(s, png)
         return MCPImage(data=png, format="png")
@@ -307,6 +339,7 @@ def build_server(state: ExplorerState) -> FastMCP:
         s.cam_eye = [eye_x, eye_y, eye_z]
         s.cam_yaw = _yaw_from_eye_target(
             [eye_x, eye_y, eye_z], [target_x, target_y, target_z],
+            s.up_axis,
         )
         s.cam_fov = fov
         png, _r, _p = _render_current(s)
@@ -319,8 +352,7 @@ def build_server(state: ExplorerState) -> FastMCP:
 
         Call this anytime to orient yourself in the scene.
         """
-        s = _req()
-        target = _target_from_eye_yaw(s.cam_eye, s.cam_yaw)
+        target = _target_from_eye_yaw(s.cam_eye, s.cam_yaw, s.up_axis)
         yaw_deg = math.degrees(s.cam_yaw) % 360
         summary = {
             "camera": {
@@ -641,6 +673,11 @@ def main(argv=None) -> int:
     # Scene bounds.
     mn = scene.means.min(dim=0).values.cpu().numpy()
     mx = scene.means.max(dim=0).values.cpu().numpy()
+    # Auto-detect up axis: the axis with smallest extent is the vertical
+    extents = mx - mn
+    up_axis = int(np.argmin(extents))
+    print(f"  Up axis: {up_axis} (extents: {extents[0]:.1f} x {extents[1]:.1f} x {extents[2]:.1f})", file=sys.stderr)
+
 
     # Falcon health check.
     print(f"Falcon: {args.falcon_host}:{args.falcon_port} ... ", end="", file=sys.stderr)
@@ -661,6 +698,7 @@ def main(argv=None) -> int:
         falcon_port=args.falcon_port,
         bounds_min=tuple(mn.tolist()),
         bounds_max=tuple(mx.tolist()),
+        up_axis=up_axis,
     )
     print(f"Scene bounds: ({mn[0]:.1f},{mn[1]:.1f},{mn[2]:.1f}) → "
           f"({mx[0]:.1f},{mx[1]:.1f},{mx[2]:.1f})", file=sys.stderr)
