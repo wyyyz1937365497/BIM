@@ -353,9 +353,10 @@ def run_pipeline(config: PipelineConfig) -> Generator[tuple[str, dict], None, No
         tag = "CONFIRMED" if vlm_ok else "REJECTED"
         yield (f"  → {tag}", {})
 
-        if vlm_ok:
-            confirmed.append({**me.to_dict(), "image_path": img_name,
-                              "vlm_response": vlm_resp, "fov_deg": ev.fov_deg})
+        # Always record (confirmed + rejected) so images show in gallery
+        confirmed.append({**me.to_dict(), "image_path": img_name,
+                          "vlm_response": vlm_resp, "fov_deg": ev.fov_deg,
+                          "vlm_confirmed": vlm_ok})
 
     # --- Build per-element results ---
     all_results: dict[str, dict] = {}
@@ -364,13 +365,14 @@ def run_pipeline(config: PipelineConfig) -> Generator[tuple[str, dict], None, No
             cfg = get_element_config(elem_type)
         except KeyError:
             continue
-        type_conf = [c for c in confirmed if c["element_class"] == cfg.semantic_label]
+        type_entries = [c for c in confirmed if c["element_class"] == cfg.semantic_label]
+        type_confirmed = [c for c in type_entries if c.get("vlm_confirmed")]
         all_results[elem_type] = {
             "total_candidates": len(view_dets),
             "after_prefilter": len(merged_elements),
-            "confirmed": len(type_conf),
+            "confirmed": len(type_confirmed),
             "results": [{
-                "confirmed": True,
+                "confirmed": c.get("vlm_confirmed", False),
                 "candidate": {"world_x": c["world_x"], "world_y": c["world_y"],
                               "theta_center": c["theta_center"], "r_mean": c["r_mean"],
                               "width_m": c["width_m"]},
@@ -379,7 +381,8 @@ def run_pipeline(config: PipelineConfig) -> Generator[tuple[str, dict], None, No
                                      "element_height": c["element_height"],
                                      "width_m": c["width_m"]},
                 "image_path": c["image_path"],
-            } for c in type_conf],
+                "vlm_response": c.get("vlm_response", ""),
+            } for c in type_entries],
         }
         elem_json = {"scene": config.name, "element": elem_type,
                      "ply_used": ply_path.name,
@@ -390,7 +393,8 @@ def run_pipeline(config: PipelineConfig) -> Generator[tuple[str, dict], None, No
 
     # --- Save merged elements ---
     merged_json = {"raw_count": len(view_dets), "merged_count": len(merged_elements),
-                   "confirmed_count": len(confirmed),
+                   "confirmed_count": sum(1 for c in confirmed if c.get("vlm_confirmed")),
+                   "total_vlm_results": len(confirmed),
                    "merged": [me.to_dict() for me in merged_elements],
                    "confirmed": confirmed}
     (out_dir / "merged_elements.json").write_text(
