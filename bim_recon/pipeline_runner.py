@@ -391,6 +391,59 @@ def run_pipeline(config: PipelineConfig) -> Generator[tuple[str, dict], None, No
         (out_dir / cfg.output_json_name).write_text(
             json.dumps(elem_json, indent=2), encoding="utf-8")
 
+    # --- Translate all coordinates to center room at origin (floor at z=0) ---
+    yield ("Centering room at origin...", {})
+    cx, cy = float(center[0]), float(center[1])
+    for wl in walls_snapped:
+        wl["x1"] -= cx; wl["y1"] -= cy
+        wl["x2"] -= cx; wl["y2"] -= cy
+    for c in confirmed:
+        c["world_x"] -= cx; c["world_y"] -= cy
+    for me in merged_elements:
+        me.world_x -= cx; me.world_y -= cy
+    # Shift Z so floor = 0
+    _floor_offset = floor_z
+    ceiling_z -= _floor_offset
+    floor_z = 0.0
+    for c in confirmed:
+        if "sill_height" in c:
+            pass  # sill/header are already relative to floor
+    # Re-save wall lines and per-element JSON with centered coordinates
+    (out_dir / "wall_lines_snapped.json").write_text(
+        json.dumps(walls_snapped, indent=2), encoding="utf-8")
+    for elem_type in config.elements:
+        try:
+            cfg = get_element_config(elem_type)
+        except KeyError:
+            continue
+        type_entries = [c for c in confirmed if c["element_class"] == cfg.semantic_label]
+        type_confirmed = [c for c in type_entries if c.get("vlm_confirmed")]
+        all_results[elem_type] = {
+            "total_candidates": len(view_dets),
+            "after_prefilter": len(merged_elements),
+            "confirmed": len(type_confirmed),
+            "results": [{
+                "confirmed": c.get("vlm_confirmed", False),
+                "candidate": {"world_x": c["world_x"], "world_y": c["world_y"],
+                              "theta_center": c["theta_center"], "r_mean": c["r_mean"],
+                              "width_m": c["width_m"]},
+                "height_detection": {"sill_height": c["sill_height"],
+                                     "header_height": c["header_height"],
+                                     "element_height": c["element_height"],
+                                     "width_m": c["width_m"]},
+                "image_path": c["image_path"],
+                "vlm_response": c.get("vlm_response", ""),
+            } for c in type_entries],
+        }
+        elem_json = {"scene": config.name, "element": elem_type,
+                     "ply_used": ply_path.name,
+                     "vlm_model": config.vlm_model if not config.skip_vlm else None,
+                     **all_results[elem_type]}
+        (out_dir / cfg.output_json_name).write_text(
+            json.dumps(elem_json, indent=2), encoding="utf-8")
+    center = (0.0, 0.0)
+
+
     # --- Save merged elements ---
     merged_json = {"raw_count": len(view_dets), "merged_count": len(merged_elements),
                    "confirmed_count": sum(1 for c in confirmed if c.get("vlm_confirmed")),
