@@ -283,15 +283,16 @@ def _prepare_results(res: PipelineResults):
             gr.update(choices=choices))
 
 
-def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
-                           falcon: bool, skip_vlm: bool):
-    """生成器：实时流式输出管线子进程日志，完成后自动加载结果。
+def run_pipeline_direct(scene: str, doors: bool, windows: bool,
+                        falcon: bool, skip_vlm: bool):
+    """Run pipeline directly (no subprocess). Yields 9 values for Gradio.
 
-    yield 9 个值: (console, out_dir, results, summary, radar_gallery,
-                    vlm_gallery, report, vlm_cb, elem_dd)
+    yield: (console, out_dir, results, summary, radar_gallery,
+            vlm_gallery, report, vlm_cb, elem_dd)
     """
     if not scene:
-        yield ("❌ 错误：未选择场景", "", None, "", None, [], None, gr.update(), gr.update())
+        yield ("Error: no scene selected", "", None, "", None, [], None,
+               gr.update(), gr.update())
         return
     elems = []
     if doors:
@@ -299,58 +300,60 @@ def run_pipeline_streaming(scene: str, doors: bool, windows: bool,
     if windows:
         elems.append("window")
     if not elems:
-        yield ("❌ 错误：至少选择一种构件类型", "", None, "", None, [], None, gr.update(), gr.update())
-        return
-
-    args = [sys.executable, str(ROOT / "scripts" / "run_pipeline.py"),
-            "--name", scene, "--elements", *elems]
-    if skip_vlm:
-        args.append("--skip-vlm")
-
-    yield (f"启动管线...\n{' '.join(args)}\n", "", None, "运行中...",
-           None, [], None, gr.update(), gr.update())
-
-    proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, cwd=str(ROOT), bufsize=1,
-        env={**__import__('os').environ, 'PYTHONUNBUFFERED': '1'},
-    )
-    assert proc.stdout is not None
-    lines: list[str] = []
-    for line in iter(proc.stdout.readline, ""):
-        lines.append(line.rstrip())
-        yield ("\n".join(lines[-MAX_CONSOLE_LINES:]), "", None, "运行中...",
+        yield ("Error: select at least one element type", "", None, "",
                None, [], None, gr.update(), gr.update())
-
-    proc.wait()
-    if proc.returncode != 0:
-        console = "\n".join(lines[-MAX_CONSOLE_LINES:])
-        yield (f"{console}\n\n❌ 管线失败 (退出码 {proc.returncode})",
-               "", None, "❌ 失败", None, [], None, gr.update(), gr.update())
         return
 
-    out = find_latest_output(scene)
-    console = "\n".join(lines[-MAX_CONSOLE_LINES:]) + f"\n✅ 完成: {out}"
-    logger.info(f"管线完成，输出目录: {out}")
-    print(f"\n[DEBUG run_pipeline_streaming] 输出目录: {out}", flush=True)
+    from bim_recon.pipeline_runner import PipelineConfig, run_pipeline
+    app_config = load_config()
+    vlm = app_config.vlm
+
+    pipe_config = PipelineConfig(
+        name=scene,
+        elements=elems,
+        skip_vlm=skip_vlm,
+        vlm_api_base=vlm.api_base,
+        vlm_model=vlm.model,
+        vlm_api_key=vlm.api_key,
+    )
+
+    console_lines: list[str] = []
+    final_data = {}
+
+    for msg, data in run_pipeline(pipe_config):
+        console_lines.append(msg)
+        console = "\n".join(console_lines[-MAX_CONSOLE_LINES:])
+        if msg.startswith("ERROR"):
+            yield (f"{console}\n\nPipeline failed.", "", None, "Failed",
+                   None, [], None, gr.update(), gr.update())
+            return
+        yield (console, "", None, "Running...", None, [], None,
+               gr.update(), gr.update())
+        final_data = data
+
+    # Pipeline complete — load results
+    out_dir = final_data.get("out_dir", "")
+    if not out_dir:
+        yield (f"Pipeline finished but no output directory.\n" +
+               "\n".join(console_lines[-10:]), "", None, "Failed",
+               None, [], None, gr.update(), gr.update())
+        return
+
+    console = "\n".join(console_lines[-MAX_CONSOLE_LINES:]) + f"\nDone: {out_dir}"
+    logger.info(f"Pipeline complete: {out_dir}")
 
     try:
-        logger.info(f"开始加载结果: {out}")
-        res = load_results(Path(out))
-        logger.info(f"结果加载成功: {len(res.doors)} 扇门, {len(res.windows)} 扇窗, {len(res.walls)} 面墙")
-        print(f"[DEBUG] load_results: 门={len(res.doors)} 窗={len(res.windows)} 墙={len(res.walls)}", flush=True)
+        res = load_results(Path(out_dir))
+        logger.info(f"Results loaded: {len(res.doors)} doors, {len(res.windows)} windows")
     except Exception as e:
-        logger.error(f"加载结果失败: {e}", exc_info=True)
-        print(f"[DEBUG] load_results 失败: {e}", flush=True)
-        yield (f"{console}\n❌ 加载结果失败: {e}", out, None, "❌ 加载失败",
-               None, [], None, gr.update(), gr.update())
+        logger.error(f"Failed to load results: {e}", exc_info=True)
+        yield (f"{console}\nError loading results: {e}", out_dir, None,
+               "Error", None, [], None, gr.update(), gr.update())
         return
 
-    logger.info("开始准备结果展示")
     r = _prepare_results(res)
-    logger.info(f"结果准备完成，准备 yield 到 UI")
     # r = (res, summary, vlm_imgs, radar_imgs, report, vlm_cb, elem_dd)
-    yield (console, out, r[0], r[1], r[3], r[2], r[4], r[5], r[6])
+    yield (console, out_dir, r[0], r[1], r[3], r[2], r[4], r[5], r[6])
 
 
 def load_results_cb(out_dir: str):
@@ -1565,7 +1568,7 @@ def build_app() -> gr.Blocks:
             inputs=scene_state, outputs=results_dropdown,
         )
         run_btn.click(
-            fn=run_pipeline_streaming,
+            fn=run_pipeline_direct,
             inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
                       radar_gallery, vlm_gallery, report_json,
