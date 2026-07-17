@@ -83,6 +83,7 @@ class ExplorerState:
     falcon_port: int = 8390
     # Cached scene bounds.
     bounds_min: Tuple[float, ...] = (0.0, 0.0, 0.0)
+    bounds_max: Tuple[float, ...] = (10.0, 3.0, 10.0)
     up_axis: int = 2               # 0=x, 1=y, 2=z (auto-detected)
     initialized: bool = False
 
@@ -254,6 +255,19 @@ def build_server(state: ExplorerState) -> FastMCP:
             A rendered PNG of the initial viewpoint.
         """
         s = _req()
+        # Lazy-load scene on first call
+        if s.scene is None:
+            print(f"[explorer] Loading scene: {s._ply_path}", file=sys.stderr)
+            s.scene = GSScene.from_ply(s._ply_path, feat_path=s._feat_path)
+            mn = s.scene.means.min(dim=0).values.cpu().numpy()
+            mx = s.scene.means.max(dim=0).values.cpu().numpy()
+            s.bounds_min = tuple(mn.tolist())
+            s.bounds_max = tuple(mx.tolist())
+            means_np = s.scene.means.cpu().numpy()
+            extents = np.percentile(means_np, 95, axis=0) - np.percentile(means_np, 5, axis=0)
+            s.up_axis = int(np.argmin(extents))
+            print(f"[explorer] {s.scene.num_gaussians:,} Gaussians, up_axis={s.up_axis}", file=sys.stderr)
+
         mn, mx = s.bounds_min, s.bounds_max
         h0, h1 = _h_axes(s.up_axis)
         up = s.up_axis
@@ -665,43 +679,20 @@ def main(argv=None) -> int:
         print(f"ERROR: PLY not found: {ply_path}", file=sys.stderr)
         return 2
 
-    feat_path = args.feat or None
-    print(f"Loading scene: {ply_path}", file=sys.stderr)
-    scene = GSScene.from_ply(ply_path, feat_path=feat_path)
-    print(f"  {scene.num_gaussians:,} Gaussians", file=sys.stderr)
-
-    # Scene bounds.
-    mn = scene.means.min(dim=0).values.cpu().numpy()
-    mx = scene.means.max(dim=0).values.cpu().numpy()
-    # Auto-detect up axis: the axis with smallest extent is the vertical
-    extents = mx - mn
-    up_axis = int(np.argmin(extents))
-    print(f"  Up axis: {up_axis} (extents: {extents[0]:.1f} x {extents[1]:.1f} x {extents[2]:.1f})", file=sys.stderr)
-
-
-    # Falcon health check.
-    print(f"Falcon: {args.falcon_host}:{args.falcon_port} ... ", end="", file=sys.stderr)
-    try:
-        client = _get_falcon_client(args.falcon_host, args.falcon_port)
-        ok = client.health()
-        print("OK" if ok else "UNREACHABLE (detect_objects will fail)", file=sys.stderr)
-    except Exception as e:
-        print(f"ERROR ({e})", file=sys.stderr)
-
+    # Don't load scene here — start MCP server immediately so the client
+    # can connect. Scene loads lazily on first explore_init call.
     state = ExplorerState(
-        scene=scene,
+        scene=None,
         explore_dir=Path(args.explore_dir),
         width=args.width,
         height=args.height,
         cam_fov=args.fov,
         falcon_host=args.falcon_host,
         falcon_port=args.falcon_port,
-        bounds_min=tuple(mn.tolist()),
-        bounds_max=tuple(mx.tolist()),
-        up_axis=up_axis,
     )
-    print(f"Scene bounds: ({mn[0]:.1f},{mn[1]:.1f},{mn[2]:.1f}) → "
-          f"({mx[0]:.1f},{mx[1]:.1f},{mx[2]:.1f})", file=sys.stderr)
+    state._ply_path = ply_path
+    state._feat_path = args.feat or None
+    print(f"MCP server ready. Scene loads on explore_init: {ply_path.name}", file=sys.stderr)
 
     mcp = build_server(state)
     mcp.run()
