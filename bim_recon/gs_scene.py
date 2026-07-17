@@ -10,6 +10,9 @@ used by gsplat (``viewmats`` is world-to-camera).
 from __future__ import annotations
 
 import math
+import os
+import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -23,6 +26,67 @@ if TYPE_CHECKING:
 
 # SH C0 constant — converts DC coefficient to linear RGB.
 SH_C0 = 0.28209479177387814
+
+_MSVC_ENV_LOCK = threading.Lock()
+_MSVC_ENV_READY = False
+
+
+def ensure_windows_msvc_environment() -> None:
+    """Load the Visual Studio compiler environment before gsplat JIT builds.
+
+    PyTorch's Windows extension builder expects ``VSCMD_ARG_TGT_ARCH`` and
+    the accompanying INCLUDE/LIB/PATH variables. MCP stdio intentionally
+    filters most inherited variables, so relying on the parent shell having
+    run ``vcvars64.bat`` is not sufficient.
+    """
+    global _MSVC_ENV_READY
+    if os.name != "nt" or _MSVC_ENV_READY:
+        return
+
+    with _MSVC_ENV_LOCK:
+        if _MSVC_ENV_READY:
+            return
+        if os.environ.get("VSCMD_ARG_TGT_ARCH"):
+            _MSVC_ENV_READY = True
+            return
+
+        candidates = []
+        vs_install = os.environ.get("VSINSTALLDIR")
+        if vs_install:
+            candidates.append(Path(vs_install) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+        vs_root = Path(r"C:\Program Files\Microsoft Visual Studio\2022")
+        candidates.extend(
+            vs_root / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+            for edition in ("Enterprise", "Professional", "Community", "BuildTools")
+        )
+        vcvars = next((path for path in candidates if path.is_file()), None)
+        if vcvars is None:
+            raise RuntimeError(
+                "gsplat rendering requires Visual Studio 2022 C++ Build Tools; "
+                "vcvars64.bat was not found."
+            )
+
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "call", str(vcvars), ">nul", "&&", "set"],
+            capture_output=True,
+            text=True,
+            encoding="mbcs",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Failed to initialize the MSVC environment via {vcvars}: "
+                f"{completed.stderr.strip()}"
+            )
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key:
+                os.environ[key] = value
+        if not os.environ.get("VSCMD_ARG_TGT_ARCH"):
+            raise RuntimeError(f"vcvars64.bat completed but did not initialize MSVC: {vcvars}")
+        _MSVC_ENV_READY = True
 
 
 @dataclass(frozen=True)
@@ -434,6 +498,7 @@ class GSScene:
         alpha (HxW in [0,1]). Uses ``render_mode='RGB+ED'`` so the depth is
         the expected (alpha-normalized) metric depth, not raw accumulation.
         """
+        ensure_windows_msvc_environment()
         viewmat = torch.from_numpy(pose.to_viewmat()).to(self.device).unsqueeze(0)
         K = torch.from_numpy(fov_to_intrinsics(fov_degrees, width, height)).to(self.device).unsqueeze(0)
 

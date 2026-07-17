@@ -5,7 +5,7 @@ synthetic scene. This verifies the MCP wiring without needing a real PLY.
 
 Run with:
     python scripts/test_mcp_gs.py
-Must be run with MSVC in PATH (gsplat JIT-compiles CUDA on first run).
+The renderer initializes the Visual Studio compiler environment on demand.
 """
 from __future__ import annotations
 

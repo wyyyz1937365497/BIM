@@ -1,9 +1,9 @@
 {
   "vlm": {
-    "comment": "VLM 用于管线中的构件验证 (OpenAI 兼容接口, 支持 GPT-4o/GLM-4V/Qwen-VL/Ollama 等)",
-    "provider": "ollama",
-    "api_base": "http://127.0.0.1:11434/v1",
-    "model": "gemma4:12b",
+    "comment": "VLM 用于图像验证和 B 类场景探索 Agent（智谱 GLM-5V-Turbo OpenAI 兼容接口）",
+    "provider": "openai",
+    "api_base": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-5v-turbo",
     "api_key": ""
   },
   "llm": {

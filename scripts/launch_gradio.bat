@@ -7,7 +7,7 @@ call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Buil
 echo.
 echo ==========================================
 echo   3DGS to BIM Pipeline - Web UI
-echo   URL: http://127.0.0.1:7860
+echo   URL: http://127.0.0.1:19255
 echo ==========================================
 echo.
 

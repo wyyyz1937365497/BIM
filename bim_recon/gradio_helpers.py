@@ -7,6 +7,7 @@ All business logic for the Gradio UI lives here. The UI layout
 from __future__ import annotations
 
 import json
+import os
 import atexit
 import logging
 import shutil
@@ -39,7 +40,13 @@ sys.path.insert(0, str(ROOT))
 from bim_recon.pipeline_api import (
     PipelineResults, load_results, remap_from_json, mask_to_bbox,
 )
-from bim_recon.config import load_config, get_llm_model, save_config, test_llm_connection
+from bim_recon.config import (
+    get_llm_model,
+    get_vlm_model,
+    load_config,
+    save_config,
+    test_llm_connection,
+)
 from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 
 VIEWER_PORT = 8081
@@ -975,7 +982,11 @@ def _get_agent(results: PipelineResults | None, scene_name: str):
         command=cfg.revit_mcp.command,
         args=cfg.revit_mcp.args,
     )
-    _MCP_CM_CACHE = ToolCollection.from_mcp(server_params, trust_remote_code=True)
+    _MCP_CM_CACHE = ToolCollection.from_mcp(
+        server_params,
+        trust_remote_code=True,
+        structured_output=False,
+    )
     tool_collection = _MCP_CM_CACHE.__enter__()  # type: ignore[attr-defined]
     tool_list = tool_collection.tools  # type: ignore[attr-defined]
 
@@ -1219,13 +1230,19 @@ def _get_explorer_agent(scene_name: str):
     server_params = StdioServerParameters(
         command=sys.executable,
         args=mcp_args,
+        env=dict(os.environ),
+        cwd=str(ROOT),
     )
-    _EXP_MCP_CM = ToolCollection.from_mcp(server_params, trust_remote_code=True)
+    _EXP_MCP_CM = ToolCollection.from_mcp(
+        server_params,
+        trust_remote_code=True,
+        structured_output=False,
+    )
     tool_collection = _EXP_MCP_CM.__enter__()
     tool_list = tool_collection.tools
 
     cfg = load_config()
-    model = get_llm_model(cfg)
+    model = get_vlm_model(cfg)
 
     instructions = (
         "你是一个室内场景探索者。你在 3D Gaussian Splatting 渲染的房间中，"

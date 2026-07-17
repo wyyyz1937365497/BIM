@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from bim_recon.config import load_config
+from bim_recon.config import get_llm_model, get_vlm_model, load_config
 
 
 class TestTrellisConfig:
@@ -36,6 +36,32 @@ class TestTrellisConfig:
         assert cfg.trellis.port == 9000
         assert cfg.trellis.model == "G:/TJ/BIM/TRELLIS/TRELLIS-image-large"
         assert cfg.trellis.timeout == 1200
+
+
+class TestModelFactories:
+    def test_vlm_factory_uses_vision_config_not_agent_llm(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps({
+                "vlm": {
+                    "provider": "openai",
+                    "api_base": "https://example.invalid/v1",
+                    "model": "glm-5v-turbo",
+                    "api_key": "test-key",
+                },
+                "llm": {
+                    "provider": "openai",
+                    "api_base": "https://example.invalid/v1",
+                    "model": "glm-5.1",
+                    "api_key": "test-key",
+                },
+            }),
+            encoding="utf-8",
+        )
+        cfg = load_config(path)
+
+        assert get_vlm_model(cfg).model_id == "glm-5v-turbo"
+        assert get_llm_model(cfg).model_id == "glm-5.1"
 
 
 class TestElementRouting:

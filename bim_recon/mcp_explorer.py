@@ -179,6 +179,14 @@ def _save_view(s: ExplorerState, png: bytes, suffix: str = "") -> str:
     path.write_bytes(png)
     return str(path)
 
+def _persist_found(s: ExplorerState) -> None:
+    """Persist explorer objects after any state-changing tool call."""
+    s.explore_dir.mkdir(parents=True, exist_ok=True)
+    (s.explore_dir / "found_objects.json").write_text(
+        json.dumps(s.found, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
 
 def _bbox_to_mask(bbox: Dict[str, float], w: int, h: int) -> np.ndarray:
     """Convert normalised bbox {x, y, w, h} to a boolean HxW mask."""
@@ -234,22 +242,22 @@ def build_server(state: ExplorerState) -> FastMCP:
 
     @mcp.tool()
     def explore_init(
-        center_x: float = 0.0,
-        center_z: float = 0.0,
-        eye_height: float = 1.5,
+        eye_x: float,
+        eye_y: float,
+        eye_z: float,
         initial_yaw: float = 0.0,
     ) -> Any:
         """Initialise the explorer at the room centre (or a custom position).
 
-        Call this **once** before any other tool.  By default the camera is
-        placed at the scene's horizontal centre at ``eye_height`` metres above
-        the floor, looking along +x.
+        Call this **once** before any other tool. Coordinates use the scene's
+        absolute XYZ frame and are required so the camera starts exactly at
+        the viewpoint selected in the 3D viewer.
 
         Args:
-            center_x: Override X coordinate.  Default: scene centre X.
-            center_z: Override Z coordinate.  Default: scene centre Z.
-            eye_height: Camera height above floor (default 1.5 m).
-            initial_yaw: Initial look direction in degrees (0 = +x, 90 = +z).
+            eye_x: Absolute world X coordinate.
+            eye_y: Absolute world Y coordinate.
+            eye_z: Absolute world Z coordinate.
+            initial_yaw: Initial look direction in degrees.
 
         Returns:
             A rendered PNG of the initial viewpoint.
@@ -268,15 +276,7 @@ def build_server(state: ExplorerState) -> FastMCP:
             s.up_axis = int(np.argmin(extents))
             print(f"[explorer] {s.scene.num_gaussians:,} Gaussians, up_axis={s.up_axis}", file=sys.stderr)
 
-        mn, mx = s.bounds_min, s.bounds_max
-        h0, h1 = _h_axes(s.up_axis)
-        up = s.up_axis
-        cam_eye = [(mn[i] + mx[i]) / 2 for i in range(3)]
-        cam_eye[up] = float(mn[up]) + float(eye_height if eye_height is not None else 1.5)
-        if center_x is not None:
-            cam_eye[h0] = float(center_x)
-        if center_z is not None:
-            cam_eye[h1] = float(center_z)
+        cam_eye = [float(eye_x), float(eye_y), float(eye_z)]
         s.cam_eye = cam_eye
         s.cam_yaw = math.radians(initial_yaw)
         s.initialized = True
@@ -366,6 +366,7 @@ def build_server(state: ExplorerState) -> FastMCP:
 
         Call this anytime to orient yourself in the scene.
         """
+        s = _req()
         target = _target_from_eye_yaw(s.cam_eye, s.cam_yaw, s.up_axis)
         yaw_deg = math.degrees(s.cam_yaw) % 360
         summary = {
@@ -454,15 +455,19 @@ def build_server(state: ExplorerState) -> FastMCP:
 
         if pos3d is None:
             # Fallback: depth at bbox centre.
-            cx_px = int((bbox_x + bbox_w / 2) * s.width)
-            cy_px = int((bbox_y + bbox_h / 2) * s.height)
+            cx_px = min(s.width - 1, max(0, int((bbox_x + bbox_w / 2) * s.width)))
+            cy_px = min(s.height - 1, max(0, int((bbox_y + bbox_h / 2) * s.height)))
             d = float(result.depth[cy_px, cx_px])
             if d > 0:
                 fx = 0.5 * s.width / math.tan(0.5 * math.radians(s.cam_fov))
                 x_cam = (cx_px - s.width / 2) / fx * d
                 y_cam = (cy_px - s.height / 2) / fx * d
-                # Approximate world position (ignores rotation — good enough for dedup).
-                pos3d = [s.cam_eye[0] + x_cam, s.cam_eye[1] - y_cam, s.cam_eye[2] + d]
+                point_camera = np.array([x_cam, y_cam, d], dtype=np.float64)
+                rotation_camera_to_world = pose.to_viewmat()[:3, :3].T
+                pos3d = (
+                    rotation_camera_to_world @ point_camera
+                    + np.asarray(s.cam_eye, dtype=np.float64)
+                ).tolist()
             else:
                 pos3d = list(s.cam_eye)
 
@@ -499,10 +504,7 @@ def build_server(state: ExplorerState) -> FastMCP:
             "trellis_status": "pending",
         }
         s.found.append(obj)
-        # Persist to disk so external UIs (Gradio) can sync the gallery.
-        (s.explore_dir / "found_objects.json").write_text(
-            json.dumps(s.found, indent=2, ensure_ascii=False), encoding="utf-8",
-        )
+        _persist_found(s)
         print(f"[explorer] tagged {obj_id} '{label}' at "
               f"({pos3d[0]:.2f}, {pos3d[1]:.2f}, {pos3d[2]:.2f})", file=sys.stderr)
         return json.dumps({"status": "tagged", **obj}, indent=2, ensure_ascii=False)
@@ -533,9 +535,10 @@ def build_server(state: ExplorerState) -> FastMCP:
             return json.dumps({"error": f"Object '{object_id}' not found."})
 
         client = _check_falcon(s)
-        ox, oy, oz = obj["position_3d"]
+        object_position = np.asarray(obj["position_3d"], dtype=np.float64)
         label = obj["label"]
-        eye_y = s.cam_eye[1]  # keep current eye height
+        h0, h1 = _h_axes(s.up_axis)
+        eye_height = s.cam_eye[s.up_axis]
 
         results = []
         best_angle = None
@@ -543,10 +546,15 @@ def build_server(state: ExplorerState) -> FastMCP:
 
         for i in range(num_angles):
             angle = 2 * math.pi * i / num_angles
-            eye = [ox + radius * math.cos(angle), eye_y, oz + radius * math.sin(angle)]
-            target = [ox, oy, oz]
+            eye = object_position.copy()
+            eye[h0] += radius * math.cos(angle)
+            eye[h1] += radius * math.sin(angle)
+            eye[s.up_axis] = eye_height
+            target = object_position.tolist()
             pose = look_at_pose(
-                eye=tuple(eye), target=tuple(target), up=(0.0, 1.0, 0.0),
+                eye=tuple(eye.tolist()),
+                target=tuple(target),
+                up=_up_vec(s.up_axis),
             )
             result = s.scene.render(pose, s.width, s.height, s.cam_fov)
             arr = np.clip(result.colors * 255, 0, 255).astype(np.uint8)
@@ -558,7 +566,7 @@ def build_server(state: ExplorerState) -> FastMCP:
             ratio = max((d.mask_area_ratio or 0) for d in dets) if dets else 0.0
             results.append({
                 "angle_degrees": round(math.degrees(angle), 1),
-                "eye": [round(v, 2) for v in eye],
+                "eye": [round(float(v), 2) for v in eye],
                 "mask_area_ratio": round(ratio, 4),
                 "view": png_path,
             })
@@ -569,7 +577,8 @@ def build_server(state: ExplorerState) -> FastMCP:
         # Update object's best view.
         if best_angle and best_ratio > 0:
             obj["best_view"] = best_angle["view"]
-            obj["best_pose"] = {"eye": best_angle["eye"], "target": [ox, oy, oz]}
+            obj["best_pose"] = {"eye": best_angle["eye"], "target": object_position.tolist()}
+            _persist_found(s)
 
         return json.dumps({
             "object_id": object_id,
@@ -609,7 +618,7 @@ def build_server(state: ExplorerState) -> FastMCP:
             return json.dumps({"error": f"Object '{object_id}' not found."})
         obj["trellis_status"] = "queued"
         # Write a queue entry for the pipeline to pick up.
-        queue_dir = s.explore_dir / "trellis_queue"
+        queue_dir = s.explore_dir.parent / "trellis_queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
         entry = {
             "object_id": obj["id"],
@@ -620,6 +629,7 @@ def build_server(state: ExplorerState) -> FastMCP:
         (queue_dir / f"{obj['id']}.json").write_text(
             json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8",
         )
+        _persist_found(s)
         n_queued = sum(1 for o in s.found if o["trellis_status"] == "queued")
         print(f"[explorer] queued {object_id} for TRELLIS "
               f"({n_queued} total queued)", file=sys.stderr)

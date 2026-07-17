@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "bim-explorer": {
+      "type": "stdio",
+      "command": "G:\\Miniconda3\\envs\\bim-recon\\python.exe",
+      "args": [
+        "-m",
+        "bim_recon.mcp_explorer",
+        "--ply",
+        "G:\\TJ\\BIM\\data\\splat\\splat.ply",
+        "--falcon-host",
+        "127.0.0.1",
+        "--falcon-port",
+        "8390",
+        "--explore-dir",
+        "G:\\TJ\\BIM\\output\\splat\\explore",
+        "--width",
+        "1024",
+        "--height",
+        "768",
+        "--fov",
+        "60"
+      ],
+      "cwd": "G:\\TJ\\BIM",
+      "timeout": 0
+    }
+  }
+}

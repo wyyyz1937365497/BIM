@@ -12,6 +12,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = ROOT / "config.json"
+LLM_REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -131,9 +132,9 @@ def load_config(path: Path | str | None = None) -> AppConfig:
 def get_llm_model(config: AppConfig | None = None):
     """Create a smolagents model instance from config (OpenAI-compatible API).
 
-    Sets ``max_retries=1`` on the underlying OpenAI client so that rate-limit
-    (429) and auth errors fail fast instead of blocking the UI for minutes
-    during exponential backoff.
+    Uses an explicit request timeout because remote reasoning models can take
+    longer than the OpenAI transport's short connection timeout. Retries stay
+    bounded so authentication and rate-limit failures still return promptly.
     """
     from smolagents import OpenAIServerModel
 
@@ -144,7 +145,22 @@ def get_llm_model(config: AppConfig | None = None):
         model_id=m.model,
         api_base=m.api_base,
         api_key=m.api_key or "empty",
-        client_kwargs={"max_retries": 1},
+        client_kwargs={"max_retries": 1, "timeout": LLM_REQUEST_TIMEOUT_SECONDS},
+    )
+
+
+def get_vlm_model(config: AppConfig | None = None):
+    """Create a vision-capable smolagents model from the VLM endpoint."""
+    from smolagents import OpenAIServerModel
+
+    cfg = config or load_config()
+    m = cfg.vlm
+
+    return OpenAIServerModel(
+        model_id=m.model,
+        api_base=m.api_base,
+        api_key=m.api_key or "empty",
+        client_kwargs={"max_retries": 1, "timeout": LLM_REQUEST_TIMEOUT_SECONDS},
     )
 
 
@@ -182,7 +198,12 @@ def test_llm_connection(api_base: str, api_key: str, model: str) -> str:
     """Test LLM connectivity. Returns status string."""
     try:
         from openai import OpenAI
-        client = OpenAI(base_url=api_base, api_key=api_key or "empty")
+        client = OpenAI(
+            base_url=api_base,
+            api_key=api_key or "empty",
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Say OK"}],

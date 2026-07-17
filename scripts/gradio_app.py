@@ -4,7 +4,8 @@ UI layout + event wiring only. All callback logic lives in
 ``bim_recon.gradio_helpers``.
 
 Launch:
-    cmd /c "call \"...\\vcvars64.bat\" && python scripts/gradio_app.py"
+    python scripts/gradio_app.py
+The gsplat renderer initializes the Visual Studio compiler environment on demand.
 """
 from __future__ import annotations
 
@@ -622,8 +623,8 @@ def build_app() -> gr.Blocks:
                 msg = (
                     f"请在位置 ({eye_x:.2f}, {eye_y:.2f}, {eye_z:.2f}) "
                     f"以朝向 {yaw}° 初始化探索。"
-                    f"调用 explore_init(center_x={eye_x:.2f}, center_z={eye_z:.2f}, "
-                    f"eye_height={eye_y:.2f}, initial_yaw={yaw})，"
+                    f"调用 explore_init(eye_x={eye_x:.2f}, eye_y={eye_y:.2f}, "
+                    f"eye_z={eye_z:.2f}, initial_yaw={yaw})，"
                     f"然后简要描述你看到的场景（2-3 句话）。"
                 )
                 response = agent.run(msg)
@@ -878,4 +879,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().launch(server_port=7860, server_name="127.0.0.1")
+    build_app().launch(server_port=19255, server_name="127.0.0.1")
