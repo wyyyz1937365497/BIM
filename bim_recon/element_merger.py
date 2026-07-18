@@ -68,6 +68,68 @@ class MergedElement:
         }
 
 
+def clip_opening_to_wall(
+    world_x: float,
+    world_y: float,
+    width_m: float,
+    wall: Dict[str, Any],
+) -> Tuple[float, float, float, float, float]:
+    """Project an opening onto its host wall and clip its along-wall span.
+
+    Returns ``(center_x, center_y, clipped_width, start_t, end_t)`` where
+    ``start_t`` and ``end_t`` are distances in metres from the wall start.
+    """
+    wall_start = np.array([wall["x1"], wall["y1"]], dtype=np.float64)
+    wall_end = np.array([wall["x2"], wall["y2"]], dtype=np.float64)
+    wall_vector = wall_end - wall_start
+    wall_length = float(np.linalg.norm(wall_vector))
+    if wall_length <= 1e-9:
+        return float(wall_start[0]), float(wall_start[1]), 0.0, 0.0, 0.0
+
+    wall_direction = wall_vector / wall_length
+    opening_point = np.array([world_x, world_y], dtype=np.float64)
+    center_t = float(np.dot(opening_point - wall_start, wall_direction))
+    center_t = float(np.clip(center_t, 0.0, wall_length))
+    half_width = max(float(width_m), 0.0) / 2.0
+    start_t = max(0.0, center_t - half_width)
+    end_t = min(wall_length, center_t + half_width)
+    clipped_width = max(0.0, end_t - start_t)
+    clipped_center = wall_start + ((start_t + end_t) / 2.0) * wall_direction
+    return (
+        float(clipped_center[0]),
+        float(clipped_center[1]),
+        clipped_width,
+        start_t,
+        end_t,
+    )
+
+
+def clip_points_to_wall_span(
+    points: np.ndarray,
+    wall: Dict[str, Any],
+    start_t: float,
+    end_t: float,
+) -> np.ndarray:
+    """Project 2D mask points onto a bounded span of their host wall."""
+    values = np.asarray(points, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError("points must have shape (N, 2)")
+
+    wall_start = np.array([wall["x1"], wall["y1"]], dtype=np.float64)
+    wall_end = np.array([wall["x2"], wall["y2"]], dtype=np.float64)
+    wall_vector = wall_end - wall_start
+    wall_length = float(np.linalg.norm(wall_vector))
+    if wall_length <= 1e-9:
+        return np.repeat(wall_start[np.newaxis, :], len(values), axis=0)
+
+    wall_direction = wall_vector / wall_length
+    lower = float(np.clip(min(start_t, end_t), 0.0, wall_length))
+    upper = float(np.clip(max(start_t, end_t), lower, wall_length))
+    projections = (values - wall_start) @ wall_direction
+    projections = np.clip(projections, lower, upper)
+    return wall_start + projections[:, np.newaxis] * wall_direction
+
+
 def _world_to_polar(
     wx: float, wy: float, cx: float, cy: float,
 ) -> Tuple[float, float]:

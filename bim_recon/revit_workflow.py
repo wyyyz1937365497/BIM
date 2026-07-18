@@ -8,6 +8,7 @@ from typing import Any
 from workflows import Context, Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
+from bim_recon.element_merger import clip_opening_to_wall
 from bim_recon.mcp_gateway import ToolGateway, response_items
 from bim_recon.pipeline_api import PipelineResults
 from bim_recon.workflow_events import (
@@ -19,6 +20,9 @@ from bim_recon.workflow_events import (
 
 
 MIN_REVIT_CURVE_M = 0.001
+MIN_WALL_LENGTH_M = 0.01
+MIN_FLOOR_EDGE_M = 0.01
+MIN_OPENING_WIDTH_M = 0.1
 
 
 class _CreateLevel(Event):
@@ -103,7 +107,7 @@ class RevitBuildWorkflow(Workflow):
         rt.valid_walls = [
             (index, wall)
             for index, wall in enumerate(rt.results.walls)
-            if _wall_length_m(wall) >= MIN_REVIT_CURVE_M
+            if _wall_length_m(wall) >= MIN_WALL_LENGTH_M
         ]
         if not rt.valid_walls:
             message = "No non-degenerate reconstructed walls are available for Revit creation"
@@ -118,11 +122,9 @@ class RevitBuildWorkflow(Workflow):
             ctx.write_event_to_stream(WorkflowWarning(
                 workflow=self.workflow_name,
                 stage="prepare",
-                message=f"Skipped {skipped} zero-length wall segments",
+                message=f"Skipped {skipped} short wall segments",
             ))
-        rt.floor_boundary = _ordered_boundary(
-            [wall for _index, wall in rt.valid_walls]
-        )
+        rt.floor_boundary = _ordered_boundary(rt.results.walls)
         confirmed = [element for element in rt.results.elements if element.confirmed]
         self._emit(
             ctx,
@@ -291,15 +293,38 @@ class RevitBuildWorkflow(Workflow):
                     dimensions.get("header_height", sill_height) - sill_height,
                 )
             )
-            width = max(detected_width * 1000.0, width_default)
+            desired_width_m = max(detected_width, width_default / 1000.0)
+            (
+                opening_x,
+                opening_y,
+                clipped_width_m,
+                _opening_start,
+                _opening_end,
+            ) = clip_opening_to_wall(
+                element.world_x,
+                element.world_y,
+                desired_width_m,
+                rt.results.walls[element.wall_idx],
+            )
+            if clipped_width_m < MIN_OPENING_WIDTH_M:
+                ctx.write_event_to_stream(WorkflowWarning(
+                    workflow=self.workflow_name,
+                    stage="openings",
+                    message=(
+                        f"{element.element_class} #{index + 1} has less than "
+                        f"{MIN_OPENING_WIDTH_M:.2f} m on its host wall; skipped"
+                    ),
+                ))
+                continue
+            width = clipped_width_m * 1000.0
             height = max(detected_height * 1000.0, height_default)
             base_offset = 0.0 if is_door else max(sill_height * 1000.0, 0.0)
             by_category[key].append({
                 "name": f"Reconstructed {element.element_class} {index + 1}",
                 "typeId": options.door_type_id if is_door else options.window_type_id,
                 "locationPoint": {
-                    "x": element.world_x * 1000.0 + options.offset_x,
-                    "y": element.world_y * 1000.0 + options.offset_y,
+                    "x": opening_x * 1000.0 + options.offset_x,
+                    "y": opening_y * 1000.0 + options.offset_y,
                     "z": options.level_elevation,
                 },
                 "width": width,
@@ -403,9 +428,9 @@ def _wall_length_m(wall: dict[str, Any]) -> float:
 
 def _sanitize_boundary(
     points: list[tuple[float, float]],
-    min_edge_length: float = MIN_REVIT_CURVE_M,
+    min_edge_length: float = MIN_FLOOR_EDGE_M,
 ) -> list[tuple[float, float]]:
-    """Remove consecutive short edges before converting the loop to Revit curves."""
+    """Remove near-duplicate vertices before converting the loop to Revit curves."""
     clean: list[tuple[float, float]] = []
     for point in points:
         if not clean or math.dist(clean[-1], point) >= min_edge_length:
@@ -466,7 +491,7 @@ def _ordered_boundary(walls: list[dict[str, Any]]) -> list[tuple[float, float]]:
                     loop = _sanitize_boundary(
                         [canonical[node] for node in path[:-1]]
                     )
-                    if loop:
+                    if loop and not _boundary_self_intersects(loop):
                         loops.append(loop)
                     visited_edges.update(local_edges)
                     break
@@ -481,7 +506,86 @@ def _ordered_boundary(walls: list[dict[str, Any]]) -> list[tuple[float, float]]:
                 previous, current = current, unvisited[0]
     if loops:
         return max(loops, key=lambda loop: abs(_polygon_area(loop)))
-    return _sanitize_boundary(_convex_hull(list(canonical.values())))
+    hull = _sanitize_boundary(_convex_hull(list(canonical.values())))
+    return [] if _boundary_self_intersects(hull) else hull
+
+
+def _boundary_self_intersects(points: list[tuple[float, float]]) -> bool:
+    """Return whether non-adjacent edges touch or cross."""
+    if len(points) < 3:
+        return True
+
+    def orientation(
+        first: tuple[float, float],
+        second: tuple[float, float],
+        third: tuple[float, float],
+    ) -> float:
+        return (
+            (second[0] - first[0]) * (third[1] - first[1])
+            - (second[1] - first[1]) * (third[0] - first[0])
+        )
+
+    def on_segment(
+        point: tuple[float, float],
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> bool:
+        tolerance = 1e-9
+        return (
+            min(start[0], end[0]) - tolerance
+            <= point[0]
+            <= max(start[0], end[0]) + tolerance
+            and min(start[1], end[1]) - tolerance
+            <= point[1]
+            <= max(start[1], end[1]) + tolerance
+        )
+
+    def intersects(
+        first_start: tuple[float, float],
+        first_end: tuple[float, float],
+        second_start: tuple[float, float],
+        second_end: tuple[float, float],
+    ) -> bool:
+        tolerance = 1e-9
+        orientations = (
+            orientation(first_start, first_end, second_start),
+            orientation(first_start, first_end, second_end),
+            orientation(second_start, second_end, first_start),
+            orientation(second_start, second_end, first_end),
+        )
+        if (
+            orientations[0] * orientations[1] < -tolerance
+            and orientations[2] * orientations[3] < -tolerance
+        ):
+            return True
+        return any((
+            abs(orientations[0]) <= tolerance
+            and on_segment(second_start, first_start, first_end),
+            abs(orientations[1]) <= tolerance
+            and on_segment(second_end, first_start, first_end),
+            abs(orientations[2]) <= tolerance
+            and on_segment(first_start, second_start, second_end),
+            abs(orientations[3]) <= tolerance
+            and on_segment(first_end, second_start, second_end),
+        ))
+
+    edges = list(zip(points, points[1:] + points[:1]))
+    edge_count = len(edges)
+    for first_index, (first_start, first_end) in enumerate(edges):
+        for second_index in range(first_index + 1, edge_count):
+            if second_index in {
+                (first_index - 1) % edge_count,
+                (first_index + 1) % edge_count,
+            }:
+                continue
+            if intersects(
+                first_start,
+                first_end,
+                edges[second_index][0],
+                edges[second_index][1],
+            ):
+                return True
+    return False
 
 
 def _polygon_area(points: list[tuple[float, float]]) -> float:

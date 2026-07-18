@@ -173,6 +173,27 @@ def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path)
     assert completed.result["created"]["doors"] == [201]
 
 
+def test_revit_workflow_clips_opening_to_host_wall_endpoint(tmp_path):
+    results = _sample_results(tmp_path)
+    door = results.elements[0]
+    door.world_x = 3.8
+    door.height_detection["width_m"] = 0.9
+    gateway = _FakeGateway()
+
+    list(stream_workflow_sync(RevitBuildWorkflow(results, gateway)))
+
+    door_call = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_point_based_element"
+        and arguments["data"][0]["name"].startswith("Reconstructed door")
+    )
+    payload = door_call["data"][0]
+    assert payload["locationPoint"]["x"] == pytest.approx(3675.0)
+    assert payload["locationPoint"]["y"] == pytest.approx(0.0)
+    assert payload["width"] == pytest.approx(650.0)
+
+
 def test_wall_snapping_never_collapses_endpoints_of_the_same_wall():
     snapped = snap_wall_endpoints([{
         "x1": 0.0,
@@ -247,6 +268,90 @@ def test_revit_workflow_removes_short_curves_from_floor_and_walls(tmp_path):
     assert min(lengths_mm) >= 1.0
     assert len(wall_args["data"]) == 5
     assert completed.result["created"]["walls"] == [101, 102, 103, 104, 105]
+
+
+def test_revit_floor_profile_removes_near_duplicate_crossing_vertices(tmp_path):
+    walls = [
+        {
+            "x1": 0.4857241228747955,
+            "y1": -1.47395480709757,
+            "x2": -1.583869192213017,
+            "y2": 0.4399838356799301,
+        },
+        {
+            "x1": -1.5842704518394495,
+            "y1": 0.4375548773454621,
+            "x2": -1.583869192213017,
+            "y2": 0.4399838356799301,
+        },
+        {
+            "x1": -1.5842704518394495,
+            "y1": 0.4375548773454621,
+            "x2": -1.0764082449331873,
+            "y2": 1.2438549540794162,
+        },
+        {
+            "x1": -1.0764082449331873,
+            "y1": 1.2438549540794162,
+            "x2": -0.6035275494976078,
+            "y2": 1.8745399604270179,
+        },
+        {
+            "x1": -0.6035275494976078,
+            "y1": 1.8745399604270179,
+            "x2": 1.692579322744133,
+            "y2": -0.35206587366710557,
+        },
+        {
+            "x1": 1.6931479183931366,
+            "y1": -0.3506829748057044,
+            "x2": 1.692579322744133,
+            "y2": -0.35206587366710557,
+        },
+        {
+            "x1": 1.6931479183931366,
+            "y1": -0.3506829748057044,
+            "x2": 0.4857241228747955,
+            "y2": -1.47395480709757,
+        },
+    ]
+    for wall in walls:
+        wall["length"] = (
+            (wall["x2"] - wall["x1"]) ** 2
+            + (wall["y2"] - wall["y1"]) ** 2
+        ) ** 0.5
+    results = PipelineResults(
+        out_dir=tmp_path,
+        walls=walls,
+        elements=[],
+        coords={"floor_z": 0.0, "ceiling_z": 3.0},
+    )
+    gateway = _FakeGateway()
+
+    list(stream_workflow_sync(RevitBuildWorkflow(results, gateway)))
+
+    floor_args = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_surface_based_element"
+    )
+    segments = floor_args["data"][0]["boundary"]["outerLoop"]
+    wall_args = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_line_based_element"
+    )
+    lengths_mm = [
+        (
+            (segment["p1"]["x"] - segment["p0"]["x"]) ** 2
+            + (segment["p1"]["y"] - segment["p0"]["y"]) ** 2
+        ) ** 0.5
+        for segment in segments
+    ]
+
+    assert len(segments) == 5
+    assert min(lengths_mm) >= 10.0
+    assert len(wall_args["data"]) == 5
 
 
 class _FakeExplorerController:

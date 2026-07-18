@@ -27,7 +27,11 @@ from typing import Any, Generator
 import numpy as np
 
 from bim_recon.element_config import get_element_config
-from bim_recon.element_merger import merge_detections
+from bim_recon.element_merger import (
+    clip_opening_to_wall,
+    clip_points_to_wall_span,
+    merge_detections,
+)
 from bim_recon.falcon_client import FalconClient
 from bim_recon.gs_scene import GSScene
 from bim_recon.ring_scanner import render_ring_views, segment_ring_views, render_element_view
@@ -551,13 +555,78 @@ class ReconstructionWorkflow(Workflow):
                     and rt.view_dets[index].mask_points_xy is not None
                 )
             ]
-            if len(point_sets) < 2:
-                continue
-            combined = np.vstack(point_sets)
-            if (
+            combined = np.vstack(point_sets) if point_sets else None
+            has_host_wall = (
                 element.wall_idx is not None
-                and element.wall_idx < len(rt.walls_snapped)
-            ):
+                and 0 <= element.wall_idx < len(rt.walls_snapped)
+            )
+            is_hosted_opening = element.element_class.casefold() in {
+                "door", "window",
+            }
+            if is_hosted_opening and has_host_wall:
+                wall = rt.walls_snapped[element.wall_idx]
+                wall_start = np.array(
+                    [wall["x1"], wall["y1"]], dtype=np.float64,
+                )
+                wall_end = np.array(
+                    [wall["x2"], wall["y2"]], dtype=np.float64,
+                )
+                wall_vector = wall_end - wall_start
+                wall_length = float(np.linalg.norm(wall_vector))
+                if wall_length > 1e-9 and combined is not None:
+                    wall_direction = wall_vector / wall_length
+                    projections = (combined - wall_start) @ wall_direction
+                    observed_start = float(np.percentile(projections, 3))
+                    observed_end = float(np.percentile(projections, 97))
+                    element.width_m = max(
+                        element.width_m,
+                        observed_end - observed_start,
+                    )
+                    observed_center = wall_start + (
+                        (observed_start + observed_end) / 2.0
+                    ) * wall_direction
+                    element.world_x = float(observed_center[0])
+                    element.world_y = float(observed_center[1])
+
+                (
+                    element.world_x,
+                    element.world_y,
+                    element.width_m,
+                    opening_start,
+                    opening_end,
+                ) = clip_opening_to_wall(
+                    element.world_x,
+                    element.world_y,
+                    element.width_m,
+                    wall,
+                )
+                offset_x = element.world_x - float(rt.center[0])
+                offset_y = element.world_y - float(rt.center[1])
+                element.theta_center = (
+                    math.degrees(math.atan2(offset_y, offset_x)) % 360.0
+                )
+                element.r_mean = math.hypot(offset_x, offset_y)
+
+                if wall_length > 1e-9:
+                    for source_index in element.source_indices:
+                        if source_index >= len(rt.view_dets):
+                            continue
+                        points = rt.view_dets[source_index].mask_points_xy
+                        if points is None:
+                            continue
+                        rt.view_dets[source_index].mask_points_xy = (
+                            clip_points_to_wall_span(
+                                points,
+                                wall,
+                                opening_start,
+                                opening_end,
+                            )
+                        )
+                continue
+
+            if combined is None or len(point_sets) < 2:
+                continue
+            if has_host_wall:
                 wall = rt.walls_snapped[element.wall_idx]
                 wall_start = np.array([wall["x1"], wall["y1"]])
                 wall_end = np.array([wall["x2"], wall["y2"]])
