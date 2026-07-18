@@ -11,6 +11,7 @@ from workflows.events import Event, StartEvent, StopEvent
 from bim_recon.element_merger import clip_opening_to_wall
 from bim_recon.mcp_gateway import ToolGateway, response_items
 from bim_recon.pipeline_api import PipelineResults
+from bim_recon.wall_geometry import fit_short_corner_walls
 from bim_recon.workflow_events import (
     WorkflowCompleted,
     WorkflowFailed,
@@ -72,6 +73,7 @@ class _RevitRuntime:
     wall_id_by_index: dict[int, int] = field(default_factory=dict)
     floor_boundary: list[tuple[float, float]] = field(default_factory=list)
     valid_walls: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
+    wall_by_source_index: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 class RevitBuildWorkflow(Workflow):
@@ -104,11 +106,13 @@ class RevitBuildWorkflow(Workflow):
         self, ctx: Context, ev: StartEvent,
     ) -> _CreateLevel | StopEvent:
         rt = self.state
+        fitted_walls, source_indices = fit_short_corner_walls(rt.results.walls)
         rt.valid_walls = [
-            (index, wall)
-            for index, wall in enumerate(rt.results.walls)
+            (source_index, wall)
+            for source_index, wall in zip(source_indices, fitted_walls)
             if _wall_length_m(wall) >= MIN_WALL_LENGTH_M
         ]
+        rt.wall_by_source_index = dict(rt.valid_walls)
         if not rt.valid_walls:
             message = "No non-degenerate reconstructed walls are available for Revit creation"
             ctx.write_event_to_stream(WorkflowFailed(
@@ -117,14 +121,21 @@ class RevitBuildWorkflow(Workflow):
                 message=message,
             ))
             return StopEvent(result={"error": message})
-        skipped = len(rt.results.walls) - len(rt.valid_walls)
+        fitted_count = len(rt.results.walls) - len(fitted_walls)
+        if fitted_count:
+            self._emit(
+                ctx,
+                "prepare",
+                f"Fitted {fitted_count} short corner chamfers into adjacent walls",
+            )
+        skipped = len(fitted_walls) - len(rt.valid_walls)
         if skipped:
             ctx.write_event_to_stream(WorkflowWarning(
                 workflow=self.workflow_name,
                 stage="prepare",
-                message=f"Skipped {skipped} short wall segments",
+                message=f"Skipped {skipped} unresolved short wall segments",
             ))
-        rt.floor_boundary = _ordered_boundary(rt.results.walls)
+        rt.floor_boundary = _ordered_boundary(fitted_walls)
         confirmed = [element for element in rt.results.elements if element.confirmed]
         self._emit(
             ctx,
@@ -304,7 +315,7 @@ class RevitBuildWorkflow(Workflow):
                 element.world_x,
                 element.world_y,
                 desired_width_m,
-                rt.results.walls[element.wall_idx],
+                rt.wall_by_source_index[element.wall_idx],
             )
             if clipped_width_m < MIN_OPENING_WIDTH_M:
                 ctx.write_event_to_stream(WorkflowWarning(

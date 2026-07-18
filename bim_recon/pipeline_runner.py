@@ -40,6 +40,7 @@ from bim_recon.vlm_verifier import query_vlm
 from bim_recon.wall_line_extractor import (
     extract_wall_lines, multi_height_scan, save_wall_lines_plot, wall_lines_to_json,
 )
+from bim_recon.wall_geometry import fit_short_corner_walls
 from workflows import Context, Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
@@ -128,7 +129,7 @@ def extract_walls(scans, center, out_dir, labels=None):
 
 
 def snap_wall_endpoints(walls, threshold=0.5, min_length=0.001):
-    """Snap nearby endpoints without ever collapsing a wall onto itself."""
+    """Snap endpoints, then replace short corner chamfers with ray intersections."""
     eps = [[w["x1"], w["y1"], w["x2"], w["y2"]] for w in walls]
     changed = True
     for _ in range(10):
@@ -172,7 +173,8 @@ def snap_wall_endpoints(walls, threshold=0.5, min_length=0.001):
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "length": length,
             })
-    return result
+    fitted, _source_indices = fit_short_corner_walls(result)
+    return fitted
 
 
 # ---------------------------------------------------------------------------
