@@ -34,8 +34,8 @@
 ## Gradio Web UI
 
 - 启动：`scripts\launch_gradio.bat`（自动设置 vcvars64）
-- URL: `http://127.0.0.1:7860`
-- 4 个 Tab：3DGS Viewer (nerfview iframe, port 8081) / Pipeline / Results / Seg Editor
+- URL: `http://127.0.0.1:19255`
+- 4 个 Tab：3DGS Viewer (nerfview iframe, port 18081) / Pipeline / Results / Seg Editor
 - nerfview 依赖已安装：`nerfview`, `run_viewer` (Mini Viewer), `gsplat` 在 bim-recon 环境
 - Pipeline 通过 subprocess 调用 `run_pipeline.py`（需要 vcvars64 for gsplat JIT）
 - Seg Editor 支持手动 bbox 调整（归一化坐标 0-1 滑块）
@@ -53,14 +53,15 @@
 - 永远不要在意字符/字体警告
 - VLM 固定使用 Ollama gemma4:12b
 - 三环境不可合并：bim-recon (gsplat) vs transformerv (falcon_perception) vs trellis (TRELLIS mesh生成)
+- 项目自有服务一律使用 5 位端口：Revit MCP `18080`、nerfview `18081`、相机状态 `18082`、Falcon `18390`、TRELLIS `18391`、Gradio `19255`
 
 ## TRELLIS Mesh 生成服务
 
 - **用途**：B类复杂构件（管道、楼梯、异形件）的 mesh 生成（image → GLB + PLY）
 - **conda 环境**：`trellis`（torch 2.4 + xformers，flash-attn 不可用于 Windows）
-- **服务端**：`trellis_server/server.py`（FastAPI，端口 8391）
+- **服务端**：`trellis_server/server.py`（FastAPI，端口 18391）
   - 启动：`scripts\launch_trellis_server.bat`（自动 apply xformers patch）
-  - 手动启动：`conda activate trellis && python trellis_server/server.py --port 8391`
+  - 手动启动：`conda activate trellis && python trellis_server/server.py --port 18391`
   - 首次启动前需安装额外依赖：`pip install -r trellis_server/requirements.txt`
 - **客户端**：`bim_recon/trellis_client.py`（HTTP client，在 bim-recon 环境中调用）
 - **CLI**：`scripts/generate_trellis_mesh.py --image <path> --output-dir <dir>`

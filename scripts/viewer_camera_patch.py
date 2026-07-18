@@ -1,12 +1,12 @@
-"""Launch Mini Viewer with camera state HTTP endpoint on port 8082.
+"""Launch Mini Viewer with camera state HTTP endpoint on port 18082.
 
 Monkey-patches ``viser.ViserServer.__init__`` to also start a tiny HTTP
 server that exposes the current camera state as JSON at
-``GET http://127.0.0.1:8082/camera-state``.
+``GET http://127.0.0.1:18082/camera-state``.
 
 Usage (same args as ``run_viewer``)::
 
-    python scripts/viewer_camera_patch.py --folder-npy ... --feature-file ... --port 8081
+    python scripts/viewer_camera_patch.py --folder-npy ... --feature-file ... --port 18081
 
 Response format::
 
@@ -32,7 +32,7 @@ import numpy as np
 import viser
 import viser.transforms as vt
 
-CAMERA_PORT = 8082
+CAMERA_PORT = 18082
 
 _original_viserserver_init = viser.ViserServer.__init__
 

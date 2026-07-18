@@ -42,7 +42,7 @@ class TrellisMeshResult:
 class TrellisClient:
     """Thin HTTP client wrapping the TRELLIS inference server."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8391, timeout: int = 1800):
+    def __init__(self, host: str = "127.0.0.1", port: int = 18391, timeout: int = 1800):
         self._base = f"http://{host}:{port}"
         self._timeout = timeout
 

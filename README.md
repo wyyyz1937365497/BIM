@@ -68,7 +68,7 @@
 - **HTTP 桥接**（`Falcon-Perception/falcon_inference_server.py` + `bim_recon/falcon_client.py`）：Falcon-Perception 需要 torch 2.11（transformerv 环境），gsplat 需要 torch 2.7（bim-recon 环境），两环境不可合并 → FastAPI HTTP 桥接。
 - **Seg 遮罩叠加图**：Falcon 分割后，在立面渲染图上绘制检测结果（检测 bbox 绿框 + mask bbox 红框），保存为 `*_overlay.png` 供调试。
 - **深度探测保留为 fallback**：Falcon server 不可达或无结果时自动回退到深度探测，pipeline 始终可用。
-- **CLI 参数**：`--falcon-host`（默认 127.0.0.1）、`--falcon-port`（默认 8390）、`--no-falcon`（禁用 Falcon，仅用深度探测）。
+- **CLI 参数**：`--falcon-host`（默认 127.0.0.1）、`--falcon-port`（默认 18390）、`--no-falcon`（禁用 Falcon，仅用深度探测）。
 - **时间戳输出**：每次运行创建 `output/<name>/YYYYMMDD_HHMMSS/` 目录，保存所有中间数据（雷达图、渲染图、叠加图、JSON）。
 
 ### P3.6：Revit MCP 工具扩展（自定义尺寸门窗）
@@ -78,12 +78,12 @@
 - **构建自动化**（`scripts/build_deploy_revit.ps1`）：一键构建 C# + TypeScript + 部署（5 步：Kill Revit → Build C# → Build TS → Deploy → Verify）。Debug 构建自动部署到 Addins。
 - **本地开发**：opencode MCP 配置指向本地 `server/build/index.js`（非 npm 发布版），修改 TS server 后重启 opencode 即时生效。
 
-### P3.7：Falcon 权威判定 + Gradio Web UI + AI Agent
+### P3.7：Falcon 权威判定 + Gradio Web UI + 确定性 Workflows
 
 ### P4：TRELLIS B类构件 Mesh 生成 + Revit DirectShape
 
 - **TRELLIS**（`TRELLIS/` 子模块，Microsoft image-to-3D 1.2B 模型）：从 VLM 验证图像生成高质量 GLB mesh（家具/管道/楼梯等异形件）。
-- **跨环境 HTTP 桥接**（`trellis_server/server.py`）：trellis conda 环境（torch 2.4 + xformers）常驻 FastAPI 服务（端口 8391），bim-recon 环境通过 `bim_recon/trellis_client.py` HTTP 调用。三环境不可合并。
+- **跨环境 HTTP 桥接**（`trellis_server/server.py`）：trellis conda 环境（torch 2.4 + xformers）常驻 FastAPI 服务（端口 18391），bim-recon 环境通过 `bim_recon/trellis_client.py` HTTP 调用。三环境不可合并。
 - **坐标变换**（`bim_recon/mesh_registrar.py`）：TRELLIS 输出的归一化 Y-up 包围盒 → 3DGS 场景坐标（轴重映射 + 物理尺寸缩放 + 候选位置平移）。GLB 解析支持 trimesh 和最小二进制 glTF 回退。
 - **Revit DirectShape**（`revit_scripts/create_directshape_from_mesh.cs`）：TessellatedShapeBuilder 从顶点+三角面构建 mesh → DirectShape 原生图元（可见但不可参数化编辑）。
 - **管线集成**：`run_pipeline.py` Stage 5c 自动将 VLM 验证的候选图像发送给 TRELLIS → 生成 GLB → 坐标变换 → DirectShape 插入。
@@ -94,35 +94,34 @@
 - **修复**：Falcon 在线 + 返回空 → **直接拒绝**（`falcon_rejected`），不再回退 depth-probe。Falcon 离线时仍保留 depth-probe fallback。
 
 #### Gradio 单页 Web UI（`scripts/gradio_app.py`）
-- **Gradio Web UI**：单页界面（场景准备 → 管线 → 检测结果 → 微调 → AI Agent → TRELLIS mesh → 3D 查看器）
+- **Gradio Web UI**：单页界面（场景准备 → 管线 → 检测结果 → 微调 → Revit 工作流 → B 类构件工作流 → 3D 查看器）
   - ① 场景与数据准备：PLY 上传 → 验证 → SceneSplat 预处理
-  - ② 运行管线：实时流式控制台输出 → 结果下拉列表
+  - ② 运行管线：确定性步骤事件实时输出 → 结果下拉列表
   - ③ 检测结果：三行图库（雷达图 + VLM验证 + Seg叠加）+ JSON 报告
   - ④ 微调：Mask 绘制（`gr.ImageMask`）+ 视角重分割
-  - ⑤ AI Agent：Revit MCP 流式聊天界面
-  - ⑤b B类构件 Mesh：图像上传 → TRELLIS GLB 生成
-  - ⑥ 3D 查看器：nerfview iframe（端口 8081）
+  - ⑤ Revit 确定性工作流：按顺序创建标高、楼板、墙和门窗并核验 ElementId
+  - ⑤b B类构件受控工作流：固定视角扫描 → 人工勾选 → TRELLIS → Revit DirectShape
+  - ⑥ 3D 查看器：nerfview iframe（端口 18081）
 - **Mask 绘制**（`gr.ImageMask`）：用户直接在立面渲染图上用红色画笔涂出门窗区域 → alpha 通道提取紧致 bbox → `mask_to_bbox()` → 墙局部坐标。
-- **相机捕获**（`scripts/viewer_camera_patch.py`）：monkey-patch `viser.ViserServer` → 端口 8082 暴露 `GET /camera-state`（position/look_at/fov/c2w）。用户在 nerfview 中漫游到合适视角后一键捕获。
+- **相机捕获**（`scripts/viewer_camera_patch.py`）：monkey-patch `viser.ViserServer` → 端口 18082 暴露 `GET /camera-state`（position/look_at/fov/c2w）。用户在 nerfview 中漫游到合适视角后一键捕获。
 - **视角重分割**：捕获视角 → GSScene 渲染 → Falcon 分割 → 射线-平面交点（mask_bbox 8 点采样）→ 墙坐标。渲染图 + overlay 自动保存并更新 Seg 图库 + Mask 编辑器。
 - **结果下拉列表**：扫描 `output/<scene>/` 中所有时间戳结果目录，用户可选择加载历史结果。
 
 #### 配置系统（`bim_recon/config.py` + `config.json`）
-- **统一配置**：VLM + LLM + Revit MCP 设置集中在一个 JSON 文件中。
-- **OpenAI 兼容接口**：支持 Ollama（`/v1`）、智谱 ZAI（`/api/paas/v4`）、OpenAI、DeepSeek 等。
-- **Gradio API 面板**：内嵌在 ⑤ AI Agent 区域，可测试连接 + 保存配置。
+- **统一配置**：VLM、Revit MCP、TRELLIS 与构件路由设置集中在一个 JSON 文件中。
+- **VLM 接口**：OpenAI 兼容视觉端点仅用于管线图像验证；工作流编排不依赖 LLM。
+- **MCP 生命周期**：`StdioMCPGateway` 在一次 Revit 工作流内持有单一 MCP 会话，所有工具调用按固定步骤执行。
 - `config.json` 加入 `.gitignore`（防止密钥泄露），`config.example.json` 作为模板。
 
-#### AI Agent（smolagents + Revit MCP）
-- **框架**：[smolagents](https://github.com/huggingface/smolagents)（HuggingFace）`ToolCallingAgent`。
-- **26 个 Revit MCP 工具**自动加载（`ToolCollection.from_mcp`，stdio 传输）。
-- **管线上下文注入**：墙/门/窗检测结果（坐标、尺寸）自动写入 Agent `instructions`。
-- **轻量级 Revit 检测**：TCP 端口 8080 探测（3s 超时，不调用 Revit API）。
-- **测试脚本**（`scripts/test_agent.py`）：独立验证 MCP 连通性 + 工具调用。
-- **关键修复**：`ToolCollection.from_mcp` 的 context manager 必须存模块级全局变量（否则 GC 回收关闭 event loop）。
+#### 确定性 Workflows（LlamaIndex Workflows + Revit MCP）
+- **A 类重建**：加载场景、坐标系、扫描、墙线、构件检测、VLM 验证和结果保存均为显式步骤。
+- **Revit 创建**：固定执行标高 → 楼板 → 墙 → 门窗 → ElementId 核验；失败事件包含稳定的阶段名。
+- **B 类扫描**：固定视角序列每个视角只渲染一次，Falcon 检测、三维定位、去重和候选持久化由状态机控制。
+- **B 类生成**：只处理人工确认的候选，按对象执行 TRELLIS，随后可选注册为 Revit DirectShape。
+- **流式 UI**：共享的类型化进度、警告、失败和完成事件直接流入 Gradio；无 `smolagents`、自主循环或模型决定的工具顺序。
 
 #### nerfview 相机捕获（`scripts/viewer_camera_patch.py`）
-- **monkey-patch** `viser.ViserServer.__init__` → 启动时自动在端口 8082 开 HTTP 微服务。
+- **monkey-patch** `viser.ViserServer.__init__` → 启动时自动在端口 18082 开 HTTP 微服务。
 - **API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}` + CORS。
 - **修复**：`import run_viewer` 名称冲突 — 在 import 前从 `sys.path` 移除 `scripts/` 目录。
 
@@ -236,7 +235,7 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\
 # 终端 1：启动 Falcon server（transformerv 环境）
 conda activate transformerv
 cd G:\TJ\BIM\Falcon-Perception
-python falcon_inference_server.py --port 8390
+python falcon_inference_server.py --port 18390
 
 # 终端 2：运行 pipeline（bim-recon 环境，自动检测 server）
 cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0"
@@ -260,36 +259,44 @@ python scripts/run_pipeline.py --name room0 --elements door window column
 scripts\launch_gradio.bat
 ```
 
-打开浏览器访问 `http://127.0.0.1:7860`。单页界面包含：
+打开浏览器访问 `http://127.0.0.1:19255`。单页界面包含：
 
 1. **场景与数据准备** — 上传 PLY → SceneSplat 预处理 → 启动 3DGS 查看器
-2. **运行管线** — 实时流式控制台 → 结果下拉列表加载历史结果
+2. **运行管线** — 确定性步骤实时流式输出 → 结果下拉列表加载历史结果
 3. **检测结果** — 墙线俯视图 + VLM 验证图库 + Seg 叠加图库
 4. **微调** — 两种方式：
    - **手动 Mask**：`gr.ImageMask` 画笔涂门窗区域 → 重算尺寸
    - **视角重分割**：在 3D 查看器中漫游 → 捕获视角 → Falcon 重新分割 → 射线-平面交点回墙坐标
-5. **AI Agent** — 自然语言对话控制 Revit（需要 Revit + MCP 插件运行）
-6. **3D 查看器** — nerfview（端口 8081）+ 相机捕获（端口 8082）
+5. **Revit 确定性工作流** — 按固定顺序创建并核验标高、楼板、墙和门窗
+6. **B 类构件受控工作流** — 固定视角扫描 → 人工确认 → TRELLIS → 可选注册到 Revit
+7. **3D 查看器** — nerfview（端口 18081）+ 相机捕获（端口 18082）
 
 **配置文件**（`config.json`）：
 ```json
 {
-  "vlm": { "provider": "ollama", "api_base": "http://127.0.0.1:11434", "model": "gemma4:12b" },
-  "llm": { "provider": "openai", "api_base": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-5.1", "api_key": "your-key" },
-  "revit_mcp": { "command": "node", "args": ["mcp-servers-for-revit/server/build/index.js"] }
+  "vlm": {
+    "provider": "openai",
+    "api_base": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-5v-turbo",
+    "api_key": "your-key"
+  },
+  "revit_mcp": {
+    "command": "node",
+    "args": ["mcp-servers-for-revit/server/build/index.js"],
+    "timeout": 120
+  }
 }
 ```
 
-LLM 配置也可在 Gradio 界面的「⚙️ LLM API 配置」面板中修改并测试连接。
+工作流实现不读取 LLM 配置。VLM 只在管线图像验证步骤中调用。
 
-### 3. AI Agent 测试
+### 3. Workflow 回归测试
 
 ```powershell
-# 确保 Revit 已启动 + MCP 插件已加载
-python scripts/test_agent.py
+python -m pytest tests/test_workflows.py -q
 ```
 
-测试 say_hello + get_current_view_info 两个工具调用，验证 MCP 连通性。
+测试覆盖类型化事件流、A 类重建失败路径、Revit 主体与洞口创建顺序、B 类扫描去重，以及 TRELLIS/Revit 扇出。
 
 ### 4. B类构件 Mesh 生成（TRELLIS + DirectShape）
 
@@ -304,7 +311,7 @@ scripts\launch_trellis_server.bat
 conda activate trellis
 cd G:\TJ\BIM
 pip install -r trellis_server/requirements.txt   # 首次运行
-python trellis_server/server.py --port 8391 --model G:/TJ/BIM/TRELLIS/TRELLIS-image-large
+python trellis_server/server.py --port 18391 --model G:/TJ/BIM/TRELLIS/TRELLIS-image-large
 # 等待 "TRELLIS model ready" 日志出现（首次加载需数分钟）
 
 # ── 步骤 2: 启动 Revit + MCP 插件 ──
@@ -348,7 +355,7 @@ Gradio 界面 ⑤b 区域可直接上传图像 → 一键生成 mesh：
 {
   "trellis": {
     "host": "127.0.0.1",
-    "port": 8391,
+    "port": 18391,
     "model": "microsoft/TRELLIS-image-large",
     "timeout": 1800
   }

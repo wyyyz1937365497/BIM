@@ -44,14 +44,14 @@ class FalconClient:
 
     Args:
         host: Server hostname (default ``127.0.0.1``).
-        port: Server port (default ``8390``).
+        port: Server port (default ``18390``).
         timeout: Request timeout in seconds.
     """
 
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 8390,
+        port: int = 18390,
         timeout: int = 300,
     ):
         self._base = f"http://{host}:{port}"

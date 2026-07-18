@@ -55,7 +55,7 @@ class TestTrellisClient:
             captured["body"] = json.loads(req.data.decode("utf-8"))
             return _FakeResponse(payload)
 
-        client = TrellisClient(host="127.0.0.1", port=8391, timeout=123)
+        client = TrellisClient(host="127.0.0.1", port=18391, timeout=123)
         request = TrellisMeshRequest(
             image_path=image_path,
             output_dir=output_dir,
@@ -66,7 +66,7 @@ class TestTrellisClient:
         with patch("bim_recon.trellis_client.urlopen", side_effect=fake_urlopen):
             result = client.generate_mesh(request)
 
-        assert captured["url"] == "http://127.0.0.1:8391/generate"
+        assert captured["url"] == "http://127.0.0.1:18391/generate"
         assert captured["timeout"] == 123
         assert captured["body"]["name"] == "chair"
         assert captured["body"]["seed"] == 7

@@ -9,7 +9,10 @@ The gsplat renderer initializes the Visual Studio compiler environment on demand
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,13 +34,21 @@ from bim_recon.gradio_helpers import (
     on_element_select, on_mask_apply, fetch_camera_state,
     _get_scene, _get_falcon, _mask_bbox_to_wall_coords,
     resegment_from_viewpoint, apply_vlm_review,
-    _check_revit_port, _format_agent_error, _get_agent,
-    _build_agent_context, agent_chat,
-    _reset_explorer_agent, _get_explorer_agent,
 )
-from bim_recon.config import load_config, save_config, test_llm_connection
+from bim_recon.config import load_config
 from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
 from bim_recon.pipeline_api import PipelineResults
+from bim_recon.mcp_gateway import StdioMCPGateway
+from bim_recon.revit_workflow import RevitBuildOptions, RevitBuildWorkflow
+from bim_recon.workflow_runtime import stream_workflow_gradio
+from bim_recon.explorer_controller import ExplorerCamera
+from bim_recon.explorer_workflow import ExplorerScanConfig, ExplorerScanWorkflow
+from bim_recon.pipeline_runner import find_scene_files
+from bim_recon.trellis_workflow import (
+    ApprovedMeshObject,
+    TrellisRevitWorkflow,
+    TrellisWorkflowConfig,
+)
 
 
 def build_app() -> gr.Blocks:
@@ -163,116 +174,130 @@ def build_app() -> gr.Blocks:
                 )
                 reseg_out = gr.JSON(label="视角重分割结果")
 
-        # ====== ⑤ AI Agent（Revit MCP） ======
-        gr.Markdown("---\n## ⑤ AI Agent（Revit MCP）")
-        _init_cfg = load_config()
-        with gr.Accordion("⚙️ LLM API 配置", open=False):
-            with gr.Row():
-                llm_api_base = gr.Textbox(
-                    label="API Base", value=_init_cfg.llm.api_base,
-                    scale=3, info="OpenAI 兼容端点，如 http://127.0.0.1:11434/v1",
-                )
-                llm_api_key = gr.Textbox(
-                    label="API Key", value=_init_cfg.llm.api_key,
-                    scale=2, type="password",
-                )
-            with gr.Row():
-                llm_model = gr.Textbox(
-                    label="模型名称", value=_init_cfg.llm.model,
-                    scale=3, info="如 qwen2.5:32b / gpt-4o / deepseek-chat",
-                )
-                test_btn = gr.Button("🔌 测试连接", scale=1)
-                save_cfg_btn = gr.Button("💾 保存配置", variant="primary", scale=1)
-            test_status = gr.Markdown("")
+        # ====== ⑤ Revit 确定性工作流 ======
+        gr.Markdown("---\n## ⑤ Revit 确定性工作流")
         gr.Markdown(
-            "Agent 可使用 Revit MCP 工具自动创建构件。需要 Revit 已运行 + MCP 插件已加载。"
-        )
-        agent_chatbot = gr.Chatbot(
-            label="对话", height=400,
-            placeholder="告诉 Agent 要做什么，如「把检测到的墙全部导入 Revit」",
+            "按固定步骤创建标高、楼板、墙、门窗并核验 ElementId。"
+            "需要 Revit 已运行且 MCP 插件已加载；执行前请检查下列参数。"
         )
         with gr.Row():
-            agent_input = gr.Textbox(
-                label="消息", scale=4, placeholder="如：创建所有墙体，厚度200mm，高度3000mm",
+            revit_wall_thickness = gr.Number(
+                label="墙厚 (mm)", value=200.0, minimum=1.0,
             )
-            agent_send = gr.Button("发送", variant="primary", scale=1)
-
-        # ====== ⑤b B类构件 Mesh 生成（TRELLIS） ======
-        gr.Markdown("---\n## ⑤b B类构件 Mesh 生成（TRELLIS）")
-        gr.Markdown(
-            "B 类构件 = 家具/管道/楼梯等复杂异形件，通过 TRELLIS 生成 3D mesh。\n\n"
-            "**VLM 自动探索**：VLM 在场景中 360° 自主探索，Falcon 分割 + 3D 定位\n"
-            "**手动选取**：在 ⑥ 查看器中漫游到目标 → 捕获渲染 → 手动 mask + 输入物体名 → 生成"
+            revit_floor_thickness = gr.Number(
+                label="楼板厚度 (mm)", value=200.0, minimum=1.0,
+            )
+            revit_create_floor = gr.Checkbox(label="创建楼板", value=True)
+        with gr.Row():
+            revit_offset_x = gr.Number(label="X 偏移 (mm)", value=0.0)
+            revit_offset_y = gr.Number(label="Y 偏移 (mm)", value=0.0)
+            revit_level_name = gr.Textbox(
+                label="标高名称", value="BIM-Recon Level 1",
+            )
+        with gr.Row():
+            revit_check_btn = gr.Button("检测 Revit MCP", variant="secondary")
+            revit_build_btn = gr.Button("执行 Revit 工作流", variant="primary")
+        revit_connection_status = gr.Markdown(
+            "尚未检测。连接检测不会调用 Revit API，也不会打开 Revit 弹窗。"
         )
+        revit_build_status = gr.Markdown("等待执行")
+        revit_build_result = gr.JSON(label="创建与核验结果")
 
-        # B-class mesh state
-        bmesh_scene_state = gr.State("")  # for rendering
-        bmesh_cam_data = gr.State({})     # captured camera
+        # ====== ⑤b B类构件受控工作流 ======
+        gr.Markdown("---\n## ⑤b B类构件受控工作流")
+        gr.Markdown(
+            "自动扫描采用固定视角序列：每个视角只渲染一次，"
+            "按指定标签调用 Falcon，完成三维定位和去重。"
+            "TRELLIS 与 Revit 创建只处理人工勾选的物体。"
+        )
+        bmesh_scene_state = gr.State("")
+        bmesh_cam_data = gr.State({})
+        explorer_results_state = gr.State({})
 
-        with gr.Tab("VLM 自动探索"):
-            gr.Markdown(
-                "VLM Agent 在 3DGS 场景中自主导航，通过 Falcon 检测细粒度物体。\n"
-                "需要 Falcon server (端口 8390) 运行中。\n\n"
-                "**流程**：设置初始视角 → 初始化 → 在对话中引导 Agent 搜索物体"
-            )
-            with gr.Accordion("📍 初始视角设置", open=True):
+        with gr.Tab("自动扫描与审批"):
+            with gr.Accordion("扫描参数", open=True):
                 with gr.Row():
-                    explore_cam_btn = gr.Button("📸 从查看器获取视角", variant="secondary", scale=1)
+                    explore_cam_btn = gr.Button("从查看器获取初始视角")
                     explore_cam_status = gr.Markdown(
-                        "先在 **⑥ 查看器** 中漫游到目标位置，再点击上方按钮获取视角。", scale=2,
+                        "先在 ⑥ 查看器中漫游到扫描起点。"
                     )
                 explore_cam_data = gr.State({})
-                explore_init_btn = gr.Button("🚀 初始化探索 Agent", variant="primary")
-                explore_init_status = gr.Markdown("")
-            explore_chatbot = gr.Chatbot(
-                label="VLM 探索过程", height=400,
-                placeholder="初始化后，输入指令如「搜索房间内所有椅子和桌子」",
-            )
-            with gr.Row():
-                explore_input = gr.Textbox(
-                    label="指令", scale=4,
-                    placeholder="如：搜索房间内所有椅子、桌子、柜子、花瓶",
+                explore_labels = gr.Textbox(
+                    label="开放词汇标签（英文逗号分隔）",
+                    value="chair, table, sofa, cabinet, bed, lamp, vase, plant, shelf, desk",
                 )
-                explore_send = gr.Button("发送", variant="primary", scale=1)
+                with gr.Row():
+                    explore_num_views = gr.Slider(
+                        label="扫描视角数", minimum=1, maximum=12,
+                        value=8, step=1,
+                    )
+                    explore_turn_degrees = gr.Number(
+                        label="每步旋转角度", value=45.0,
+                    )
+                explore_run_btn = gr.Button("执行自动扫描", variant="primary")
+            explore_progress = gr.Markdown("等待扫描")
+            explore_current_view = gr.Image(label="当前扫描视图", height=360)
             explore_gallery = gr.Gallery(
                 label="已发现物体", columns=4, height=250,
-                show_label=False, object_fit="contain", preview=True,
+                show_label=True, object_fit="contain", preview=True,
             )
-            explore_results = gr.State([])
-            with gr.Row():
-                explore_refresh_btn = gr.Button("🔄 刷新已发现物体", variant="secondary")
-                explore_queue_btn = gr.Button("📦 全部加入 TRELLIS 队列", variant="secondary")
-            explore_output = gr.JSON(label="队列状态")
+            explore_select = gr.CheckboxGroup(
+                label="人工确认：选择需要生成 Mesh 的物体",
+                choices=[],
+            )
+            explore_output = gr.JSON(label="扫描结果")
+            with gr.Accordion("TRELLIS 与 Revit 参数", open=True):
+                with gr.Row():
+                    bmesh_width = gr.Number(
+                        label="物体宽度 (m)", value=0.8, minimum=0.05,
+                    )
+                    bmesh_height = gr.Number(
+                        label="物体高度 (m)", value=1.0, minimum=0.05,
+                    )
+                    bmesh_seed = gr.Number(label="种子", value=1, precision=0)
+                bmesh_register_revit = gr.Checkbox(
+                    label="生成后注册到 Revit", value=True,
+                )
+                bmesh_generate_selected_btn = gr.Button(
+                    "生成已确认物体", variant="primary",
+                )
+            bmesh_workflow_status = gr.Markdown("等待人工确认")
+            bmesh_workflow_output = gr.JSON(label="Mesh 与 Revit 结果")
 
         with gr.Tab("手动选取（视角 + Mask）"):
             gr.Markdown(
-                "**步骤**：① 启动 ⑥ 查看器 → ② 漫游到目标物体 → ③ 捕获视角 → ④ 在渲染图上用画笔涂出物体 → ⑤ 输入物体名称 → ⑥ 生成"
+                "步骤：启动 ⑥ 查看器，漫游到目标物体，捕获视角，"
+                "在渲染图上涂出物体，输入英文名称后生成。"
             )
             with gr.Row():
-                bmesh_cam_btn = gr.Button("📸 捕获视角并渲染", variant="secondary", scale=1)
+                bmesh_cam_btn = gr.Button("捕获视角并渲染")
                 bmesh_prompt = gr.Textbox(
-                    label="物体名称（英文，如: chair / lamp / sofa）",
-                    placeholder="输入物体名称...",
-                    scale=2,
+                    label="物体名称（英文）",
+                    placeholder="chair / lamp / sofa",
                 )
-            bmesh_cam_status = gr.Markdown("（需先启动查看器）")
+            bmesh_cam_status = gr.Markdown("需先启动查看器")
             bmesh_mask_editor = gr.ImageMask(
-                label="渲染图（用红色画笔涂出要提取的物体）",
-                type="numpy", height=400,
-                layers=False,
-                brush=gr.Brush(colors=["#FF0000"], default_size=30, color_mode="fixed"),
+                label="渲染图（用红色画笔涂出物体）",
+                type="numpy", height=400, layers=False,
+                brush=gr.Brush(
+                    colors=["#FF0000"], default_size=30, color_mode="fixed",
+                ),
                 transforms=[], sources=[],
             )
             with gr.Row():
-                bmesh_seed_manual = gr.Number(label="种子", value=1, precision=0, scale=1)
-                bmesh_gen_manual_btn = gr.Button("🎯 Mask + 生成 Mesh", variant="primary", scale=2)
+                bmesh_seed_manual = gr.Number(
+                    label="种子", value=1, precision=0,
+                )
+                bmesh_gen_manual_btn = gr.Button(
+                    "Mask + 生成 Mesh", variant="primary",
+                )
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
 
         # ====== ⑥ 3D 查看器（底部） ======
         gr.Markdown("---\n## ⑥ 3D 查看器")
         viewer_btn = gr.Button("▶ 启动查看器", variant="secondary")
-        viewer_html = gr.HTML("<p>点击上方按钮启动 3DGS 查看器（nerfview + 相机捕获端口 8082）</p>")
+        viewer_html = gr.HTML("<p>点击上方按钮启动 3DGS 查看器（nerfview + 相机捕获端口 18082）</p>")
 
         # ====== 事件绑定 ======
 
@@ -406,173 +431,84 @@ def build_app() -> gr.Blocks:
                      results_state, mask_editor],
         )
 
-        # --- AI Agent ---
-        def _on_test_llm(api_base: str, api_key: str, model: str) -> str:
-            return test_llm_connection(api_base, api_key, model)
-
-        def _on_save_config(api_base: str, api_key: str, model: str) -> str:
-            global _AGENT_CACHE, _MCP_CM_CACHE
-            cfg = load_config()
-            from dataclasses import replace as dc_replace
-            new_cfg = dc_replace(cfg, llm=dc_replace(cfg.llm,
-                api_base=api_base, api_key=api_key, model=model))
-            save_config(new_cfg)
-            _AGENT_CACHE = None      # force re-create agent with new model
-            _MCP_CM_CACHE = None     # force re-connect MCP server
-            return "✅ 配置已保存到 config.json，Agent 将使用新模型"
-
-        test_btn.click(
-            fn=_on_test_llm,
-            inputs=[llm_api_base, llm_api_key, llm_model],
-            outputs=test_status,
-        )
-        save_cfg_btn.click(
-            fn=_on_save_config,
-            inputs=[llm_api_base, llm_api_key, llm_model],
-            outputs=test_status,
-        )
-
-        def _agent_respond(message: str, history: list, results, scene_name: str):
-            if not message.strip():
-                yield history, ""
-                return
-
-            from smolagents import (
-                ActionStep, PlanningStep, FinalAnswerStep, ChatMessageStreamDelta,
+        # --- Revit deterministic workflow ---
+        async def _check_revit_connection():
+            config = load_config().revit_mcp
+            gateway = StdioMCPGateway(
+                command=config.command,
+                args=tuple(config.args),
+                cwd=str(ROOT),
+                timeout_seconds=5.0,
             )
-
-            # 1. 显示用户消息
-            history = history + [{"role": "user", "content": message}]
-            yield history, ""
-
-            # 2. 初始化一个不断更新的 assistant 消息
-            assistant_msg = {"role": "assistant", "content": "🤔 **Agent 思考中...**\n\n"}
-            history = history + [assistant_msg]
-            yield history, ""
-
-            # 累积每一步的文本
-            steps_lines: list[str] = []
-            current_step_lines: list[str] = []
-            final_answer = ""
-            step_count = 0
-            in_tool_call = False
-
             try:
-                agent = _get_agent(results, scene_name)
+                result = await gateway.call_tool("check_revit_connection", {})
+            except Exception as exc:
+                return f"❌ Revit MCP 检测失败：{exc}"
+            if isinstance(result, dict) and result.get("connected"):
+                return (
+                    "✅ Revit MCP 插件端口可达 "
+                    f"({result.get('host')}:{result.get('port')}, "
+                    f"{result.get('latencyMs')} ms)。未调用 Revit API。"
+                )
+            detail = result.get("error", "连接不可达") if isinstance(result, dict) else result
+            return f"❌ Revit MCP 插件不可达：{detail}"
 
-                for step in agent.run(message, stream=True):
-                    updated = False
+        async def _run_revit_workflow(
+            results: PipelineResults | None,
+            wall_thickness: float,
+            floor_thickness: float,
+            create_floor: bool,
+            offset_x: float,
+            offset_y: float,
+            level_name: str,
+        ):
+            if results is None:
+                yield "请先加载一次管线结果。", {"error": "missing_pipeline_results"}
+                return
+            config = load_config().revit_mcp
+            gateway = StdioMCPGateway(
+                command=config.command,
+                args=tuple(config.args),
+                cwd=str(ROOT),
+                timeout_seconds=float(config.timeout),
+            )
+            workflow = RevitBuildWorkflow(
+                results,
+                gateway,
+                RevitBuildOptions(
+                    level_name=level_name.strip() or "BIM-Recon Level 1",
+                    wall_thickness=float(wall_thickness),
+                    floor_thickness=float(floor_thickness),
+                    create_floor=bool(create_floor),
+                    offset_x=float(offset_x),
+                    offset_y=float(offset_y),
+                ),
+            )
+            lines: list[str] = []
+            latest: dict = {}
+            async for update in stream_workflow_gradio(workflow):
+                lines.append(update.message)
+                latest = update.payload or latest
+                yield "\n\n".join(lines[-30:]), latest
 
-                    # --- PlanningStep: 规划 ---
-                    if isinstance(step, PlanningStep):
-                        plan = step.plan if hasattr(step, "plan") else ""
-                        if plan:
-                            steps_lines.append(f"📋 **规划**: {plan}")
-                            updated = True
-
-                    # --- ChatMessageStreamDelta: LLM token 流 ---
-                    elif isinstance(step, ChatMessageStreamDelta):
-                        delta = step.content if hasattr(step, "content") else ""
-                        if delta and not in_tool_call:
-                            # token 流附加到当前步骤
-                            if current_step_lines:
-                                current_step_lines[-1] += delta
-                            else:
-                                current_step_lines.append(delta)
-                            updated = True
-
-                    # --- ActionStep: 工具调用 / 观察 ---
-                    elif isinstance(step, ActionStep):
-                        step_count += 1
-
-                        # 工具调用
-                        if step.tool_calls:
-                            for tc in step.tool_calls:
-                                args = tc.arguments
-                                if isinstance(args, dict):
-                                    arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                                else:
-                                    arg_str = str(args)
-                                current_step_lines.append(
-                                    f"**步骤 {step_count}**: 🔧 调用 `{tc.name}({arg_str})`"
-                                )
-                                in_tool_call = True
-                            updated = True
-
-                        # 观察结果
-                        if step.observations:
-                            obs = str(step.observations).strip()
-                            if obs:
-                                current_step_lines.append(f"→ **结果**: {obs}")
-                                in_tool_call = False
-                                # 完成一个完整步骤，保存到历史
-                                steps_lines.extend(current_step_lines)
-                                current_step_lines = []
-                                updated = True
-
-                        # 错误
-                        if step.error:
-                            err = str(step.error)
-                            current_step_lines.append(f"→ **错误**: {err}")
-                            steps_lines.extend(current_step_lines)
-                            current_step_lines = []
-                            updated = True
-
-                        # 最终答案标记
-                        if step.is_final_answer:
-                            if current_step_lines:
-                                steps_lines.extend(current_step_lines)
-                                current_step_lines = []
-
-                    # --- FinalAnswerStep: 最终答案 ---
-                    elif isinstance(step, FinalAnswerStep):
-                        final_answer = str(step.output) if hasattr(step, "output") else str(step)
-                        if current_step_lines:
-                            steps_lines.extend(current_step_lines)
-                            current_step_lines = []
-                        updated = True
-
-                    # 更新 chatbot 显示
-                    if updated:
-                        content_parts = ["🤔 **Agent 思考中...**\n"]
-                        content_parts.extend(steps_lines)
-                        if current_step_lines:
-                            content_parts.extend(current_step_lines)
-
-                        # 如果有最终答案，替换为最终答案
-                        if final_answer:
-                            content_parts = [final_answer]
-
-                        history[-1] = {
-                            "role": "assistant",
-                            "content": "\n".join(content_parts),
-                        }
-                        yield history, ""
-
-                # 流结束后的最终更新
-                if not final_answer and steps_lines:
-                    history[-1] = {
-                        "role": "assistant",
-                        "content": "\n".join(steps_lines),
-                    }
-                    yield history, ""
-
-            except Exception as e:
-                error_msg = _format_agent_error(e)
-                history[-1] = {"role": "assistant", "content": error_msg}
-                yield history, ""
-
-        agent_send.click(
-            fn=_agent_respond,
-            inputs=[agent_input, agent_chatbot, results_state, scene_state],
-            outputs=[agent_chatbot, agent_input],
-        )
-        agent_input.submit(
-            fn=_agent_respond,
-            inputs=[agent_input, agent_chatbot, results_state, scene_state],
-            outputs=[agent_chatbot, agent_input],
+        revit_check_btn.click(
+            fn=_check_revit_connection,
+            outputs=revit_connection_status,
         )
 
+        revit_build_btn.click(
+            fn=_run_revit_workflow,
+            inputs=[
+                results_state,
+                revit_wall_thickness,
+                revit_floor_thickness,
+                revit_create_floor,
+                revit_offset_x,
+                revit_offset_y,
+                revit_level_name,
+            ],
+            outputs=[revit_build_status, revit_build_result],
+        )
         # --- TRELLIS mesh generation ---
         def _on_trellis_generate(image_path: str, name: str, seed: int) -> dict:
             if not image_path:
@@ -599,161 +535,191 @@ def build_app() -> gr.Blocks:
             except Exception as e:
                 return {"错误": f"生成失败: {e}"}
 
-        # --- B类 Mesh: VLM Agent 探索 Tab ---
+        # --- B类 Mesh: deterministic scan and approval ---
         explore_cam_btn.click(
             fn=fetch_camera_state,
             outputs=[explore_cam_status, explore_cam_data],
         )
 
-        def _explorer_init(scene_name: str, camera_data: dict):
-            """初始化探索 Agent：用查看器视角 + 启动 MCP 子进程 + 首条消息。"""
+        async def _run_explorer_scan(
+            scene_name: str,
+            camera_data: dict,
+            labels_text: str,
+            num_views: int,
+            turn_degrees: float,
+        ):
             if not scene_name:
-                return "❌ 未选择场景", []
-            if not camera_data or "position" not in camera_data:
-                return "⚠️ 请先点击「📸 从查看器获取视角」", []
-            import math
-            pos = camera_data["position"]
-            look = camera_data["look_at"]
-            eye_x, eye_y, eye_z = float(pos[0]), float(pos[1]), float(pos[2])
-            dx, dz = float(look[0]) - eye_x, float(look[2]) - eye_z
-            yaw = round(math.degrees(math.atan2(dz, dx)), 1)
-            try:
-                _reset_explorer_agent()
-                agent = _get_explorer_agent(scene_name)
-                msg = (
-                    f"请在位置 ({eye_x:.2f}, {eye_y:.2f}, {eye_z:.2f}) "
-                    f"以朝向 {yaw}° 初始化探索。"
-                    f"调用 explore_init(eye_x={eye_x:.2f}, eye_y={eye_y:.2f}, "
-                    f"eye_z={eye_z:.2f}, initial_yaw={yaw})，"
-                    f"然后简要描述你看到的场景（2-3 句话）。"
+                yield (
+                    "请先选择场景", None, [], gr.update(choices=[]),
+                    {"error": "missing_scene"}, {},
                 )
-                response = agent.run(msg)
-                chat = [{"role": "assistant", "content": str(response)}]
-                return f"✅ Agent 已初始化 (视角来自查看器: {eye_x:.1f}, {eye_y:.1f}, {eye_z:.1f}, yaw={yaw}°)", chat
-            except Exception as e:
-                return _format_agent_error(e), []
-
-        explore_init_btn.click(
-            fn=_explorer_init,
-            inputs=[scene_state, explore_cam_data],
-            outputs=[explore_init_status, explore_chatbot],
-        )
-
-        def _explorer_respond(message: str, history: list, scene_name: str):
-            """流式显示 Agent 探索过程（思考 + 工具调用）。"""
-            if not message.strip():
-                yield history, ""
                 return
-            history = history + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": ""},
-            ]
-            try:
-                agent = _get_explorer_agent(scene_name)
-                from smolagents import PlanningStep, FinalAnswerStep
-
-                steps_lines: list[str] = []
-                current_step_lines: list[str] = []
-                final_answer = ""
-
-                for step in agent.run(message, stream=True):
-                    updated = False
-                    if isinstance(step, PlanningStep):
-                        steps_lines.append(f"📋 **计划**: {step.plan}")
-                        updated = True
-                    elif hasattr(step, "tool_calls") and step.tool_calls:
-                        current_step_lines = []
-                        for tc in step.tool_calls:
-                            name = tc.name if hasattr(tc, "name") else str(tc)
-                            args_str = str(tc.arguments) if hasattr(tc, "arguments") else ""
-                            if len(args_str) > 200:
-                                args_str = args_str[:200] + "…"
-                            current_step_lines.append(f"🔧 **调用**: `{name}`({args_str})")
-                        if hasattr(step, "observations") and step.observations:
-                            obs = str(step.observations)[:300]
-                            current_step_lines.append(f"   ↳ {obs}")
-                        updated = True
-                    elif isinstance(step, FinalAnswerStep):
-                        final_answer = str(step.output) if hasattr(step, "output") else str(step)
-                        updated = True
-
-                    if updated:
-                        parts = ["🤔 **Agent 探索中...**\n"]
-                        parts.extend(steps_lines)
-                        parts.extend(current_step_lines)
-                        if final_answer:
-                            parts = [final_answer]
-                        history[-1] = {"role": "assistant", "content": "\n".join(parts)}
-                        yield history, ""
-
-                if not final_answer and steps_lines:
-                    history[-1] = {"role": "assistant", "content": "\n".join(steps_lines)}
-                    yield history, ""
-            except Exception as e:
-                history[-1] = {"role": "assistant", "content": _format_agent_error(e)}
-                yield history, ""
-
-        explore_send.click(
-            fn=_explorer_respond,
-            inputs=[explore_input, explore_chatbot, scene_state],
-            outputs=[explore_chatbot, explore_input],
-        )
-        explore_input.submit(
-            fn=_explorer_respond,
-            inputs=[explore_input, explore_chatbot, scene_state],
-            outputs=[explore_chatbot, explore_input],
-        )
-
-        def _refresh_explore_gallery(scene_name: str):
-            """从 found_objects.json 读取已发现物体。"""
-            if not scene_name:
-                return [], []
-            found_path = ROOT / "output" / scene_name / "explore" / "found_objects.json"
-            if not found_path.exists():
-                return [], []
-            found = json.loads(found_path.read_text(encoding="utf-8"))
-            gallery = [
-                (o["best_view"], f'{o["label"]} #{o["id"]}')
-                for o in found if o.get("best_view") and Path(o["best_view"]).exists()
-            ]
-            return gallery, found
-
-        explore_refresh_btn.click(
-            fn=_refresh_explore_gallery,
-            inputs=[scene_state],
-            outputs=[explore_gallery, explore_results],
-        )
-
-        def _queue_all_for_trellis(scene_name: str):
-            """从 found_objects.json 读取，写入 TRELLIS 队列。"""
-            if not scene_name:
-                return {"错误": "未选择场景"}
-            found_path = ROOT / "output" / scene_name / "explore" / "found_objects.json"
-            if not found_path.exists():
-                return {"错误": "没有已发现的物体"}
-            found = json.loads(found_path.read_text(encoding="utf-8"))
-            if not found:
-                return {"错误": "没有已发现的物体"}
-            queue_dir = ROOT / "output" / scene_name / "trellis_queue"
-            queue_dir.mkdir(parents=True, exist_ok=True)
-            queued = 0
-            for obj in found:
-                entry = {
-                    "object_id": obj["id"], "label": obj["label"],
-                    "image_path": obj.get("best_view", ""),
-                    "position_3d": obj.get("position_3d", [0, 0, 0]),
-                }
-                (queue_dir / f"{obj['id']}.json").write_text(
-                    json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8",
+            if not camera_data or "position" not in camera_data:
+                yield (
+                    "请先从查看器获取初始视角", None, [],
+                    gr.update(choices=[]),
+                    {"error": "missing_camera"}, {},
                 )
-                queued += 1
-            return {"状态": f"已加入 {queued} 个物体到 TRELLIS 队列",
-                    "队列目录": str(queue_dir)}
+                return
+            labels = tuple(
+                label.strip()
+                for label in labels_text.split(",")
+                if label.strip()
+            )
+            try:
+                ply_path, feat_path = find_scene_files(ROOT / "data" / scene_name)
+                falcon = load_config().falcon
+                position = tuple(float(value) for value in camera_data["position"])
+                look_at = tuple(float(value) for value in camera_data["look_at"])
+                camera = ExplorerCamera(
+                    eye=position,
+                    look_at=look_at,
+                    fov=float(camera_data.get("fov_degrees", 60.0)),
+                )
+                workflow = ExplorerScanWorkflow(ExplorerScanConfig(
+                    ply_path=ply_path,
+                    feat_path=feat_path,
+                    output_root=ROOT / "output" / scene_name / "explore",
+                    camera=camera,
+                    labels=labels,
+                    falcon_host=falcon.host,
+                    falcon_port=falcon.port,
+                    num_views=int(num_views),
+                    turn_degrees=float(turn_degrees),
+                ))
+                lines: list[str] = []
+                current_image = None
+                latest: dict = {}
+                found: list[dict] = []
+                async for update in stream_workflow_gradio(workflow):
+                    lines.append(update.message)
+                    current_image = update.image_path or current_image
+                    latest = update.payload or latest
+                    found = latest.get("found_objects", found)
+                    gallery = [
+                        (obj["best_view"], f'{obj["label"]} ({obj["id"]})')
+                        for obj in found
+                        if obj.get("best_view") and Path(obj["best_view"]).exists()
+                    ]
+                    choices = [
+                        (f'{obj["label"]} ({obj["id"]})', obj["id"])
+                        for obj in found
+                    ]
+                    state = latest if "found_objects" in latest else {
+                        **latest,
+                        "found_objects": found,
+                    }
+                    yield (
+                        "\n\n".join(lines[-30:]),
+                        current_image,
+                        gallery,
+                        gr.update(choices=choices),
+                        latest,
+                        state,
+                    )
+            except Exception as exc:
+                yield (
+                    f"扫描失败: {exc}", None, [], gr.update(choices=[]),
+                    {"error": str(exc)}, {},
+                )
 
-        explore_queue_btn.click(
-            fn=_queue_all_for_trellis,
-            inputs=[scene_state],
-            outputs=[explore_output],
+        explore_run_btn.click(
+            fn=_run_explorer_scan,
+            inputs=[
+                scene_state,
+                explore_cam_data,
+                explore_labels,
+                explore_num_views,
+                explore_turn_degrees,
+            ],
+            outputs=[
+                explore_progress,
+                explore_current_view,
+                explore_gallery,
+                explore_select,
+                explore_output,
+                explorer_results_state,
+            ],
+        )
+
+        async def _run_approved_meshes(
+            selected_ids: list[str],
+            explorer_state: dict,
+            width_m: float,
+            height_m: float,
+            seed: int,
+            register_in_revit: bool,
+        ):
+            found = explorer_state.get("found_objects", []) if explorer_state else []
+            selected = [
+                obj for obj in found if obj.get("id") in set(selected_ids or [])
+            ]
+            if not selected:
+                yield "请先勾选至少一个已发现物体。", {"error": "no_approval"}
+                return
+            status = explorer_state.get("status", {})
+            up_axis = status.get("camera", {}).get("up_axis", 2)
+            approved = tuple(
+                ApprovedMeshObject(
+                    object_id=obj["id"],
+                    label=obj["label"],
+                    image_path=Path(obj["best_view"]),
+                    position_3d=tuple(float(value) for value in obj["position_3d"]),
+                    up_axis=int(up_axis),
+                    width_m=float(width_m),
+                    height_m=float(height_m),
+                    seed=int(seed),
+                )
+                for obj in selected
+            )
+            app_config = load_config()
+            trellis_config = app_config.trellis
+            gateway = None
+            if register_in_revit:
+                revit = app_config.revit_mcp
+                gateway = StdioMCPGateway(
+                    command=revit.command,
+                    args=tuple(revit.args),
+                    cwd=str(ROOT),
+                    timeout_seconds=float(revit.timeout),
+                )
+            output_root = Path(
+                explorer_state.get(
+                    "output_dir",
+                    ROOT / "output" / "_trellis_meshes",
+                )
+            ) / "meshes"
+            workflow = TrellisRevitWorkflow(
+                TrellisWorkflowConfig(
+                    objects=approved,
+                    output_dir=output_root,
+                    register_in_revit=bool(register_in_revit),
+                ),
+                client_factory=lambda: TrellisClient(
+                    host=trellis_config.host,
+                    port=trellis_config.port,
+                    timeout=trellis_config.timeout,
+                ),
+                gateway=gateway,
+            )
+            lines: list[str] = []
+            latest: dict = {}
+            async for update in stream_workflow_gradio(workflow):
+                lines.append(update.message)
+                latest = update.payload or latest
+                yield "\n\n".join(lines[-30:]), latest
+
+        bmesh_generate_selected_btn.click(
+            fn=_run_approved_meshes,
+            inputs=[
+                explore_select,
+                explorer_results_state,
+                bmesh_width,
+                bmesh_height,
+                bmesh_seed,
+                bmesh_register_revit,
+            ],
+            outputs=[bmesh_workflow_status, bmesh_workflow_output],
         )
 
         # --- B类 Mesh: 手动选取 Tab ---

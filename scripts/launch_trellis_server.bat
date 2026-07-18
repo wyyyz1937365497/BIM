@@ -6,7 +6,7 @@ REM Auto-applies xformers Windows patches before starting.
 echo.
 echo ==========================================
 echo   TRELLIS Mesh Generator Server
-echo   URL: http://127.0.0.1:8391
+echo   URL: http://127.0.0.1:18391
 echo ==========================================
 echo.
 
@@ -29,6 +29,6 @@ REM --- Launch server ---
 cd /d G:\TJ\BIM
 set PYTHON=G:\Miniconda3\envs\trellis\python.exe
 set TRELLIS_MODEL=G:/TJ/BIM/TRELLIS/TRELLIS-image-large
-%PYTHON% trellis_server\server.py --host 127.0.0.1 --port 8391 --model %TRELLIS_MODEL%
+%PYTHON% trellis_server\server.py --host 127.0.0.1 --port 18391 --model %TRELLIS_MODEL%
 
 pause

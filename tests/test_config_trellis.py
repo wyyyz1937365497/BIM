@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from bim_recon.config import get_llm_model, get_vlm_model, load_config
+from bim_recon.config import load_config
 
 
 class TestTrellisConfig:
@@ -11,9 +11,8 @@ class TestTrellisConfig:
         cfg = load_config(tmp_path / "missing.json")
 
         assert cfg.vlm.model == "gemma4:12b"
-        assert cfg.llm.model == "qwen2.5:32b"
         assert cfg.trellis.host == "127.0.0.1"
-        assert cfg.trellis.port == 8391
+        assert cfg.trellis.port == 18391
         assert cfg.trellis.model == "microsoft/TRELLIS-image-large"
 
     def test_loads_trellis_section(self, tmp_path):
@@ -22,7 +21,7 @@ class TestTrellisConfig:
             json.dumps({
                 "trellis": {
                     "host": "0.0.0.0",
-                    "port": 9000,
+                    "port": 19000,
                     "model": "G:/TJ/BIM/TRELLIS/TRELLIS-image-large",
                     "timeout": 1200,
                 }
@@ -33,13 +32,13 @@ class TestTrellisConfig:
         cfg = load_config(path)
 
         assert cfg.trellis.host == "0.0.0.0"
-        assert cfg.trellis.port == 9000
+        assert cfg.trellis.port == 19000
         assert cfg.trellis.model == "G:/TJ/BIM/TRELLIS/TRELLIS-image-large"
         assert cfg.trellis.timeout == 1200
 
 
-class TestModelFactories:
-    def test_vlm_factory_uses_vision_config_not_agent_llm(self, tmp_path):
+class TestWorkflowConfig:
+    def test_vlm_config_remains_available_for_pipeline_verification(self, tmp_path):
         path = tmp_path / "config.json"
         path.write_text(
             json.dumps({
@@ -49,19 +48,32 @@ class TestModelFactories:
                     "model": "glm-5v-turbo",
                     "api_key": "test-key",
                 },
-                "llm": {
-                    "provider": "openai",
-                    "api_base": "https://example.invalid/v1",
-                    "model": "glm-5.1",
-                    "api_key": "test-key",
+            }),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(path)
+
+        assert cfg.vlm.model == "glm-5v-turbo"
+        assert not hasattr(cfg, "llm")
+
+    def test_revit_mcp_timeout_is_typed(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps({
+                "revit_mcp": {
+                    "command": "node",
+                    "args": ["server.js"],
+                    "timeout": 300,
                 },
             }),
             encoding="utf-8",
         )
+
         cfg = load_config(path)
 
-        assert get_vlm_model(cfg).model_id == "glm-5v-turbo"
-        assert get_llm_model(cfg).model_id == "glm-5.1"
+        assert cfg.revit_mcp.args == ["server.js"]
+        assert cfg.revit_mcp.timeout == 300
 
 
 class TestElementRouting:

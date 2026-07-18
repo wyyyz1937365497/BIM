@@ -776,7 +776,7 @@ room0 场景（4 墙 + 2 门 + 3 窗）全部在 Revit 中成功创建：
 ```
 transformerv 环境 (Falcon-Perception, torch 2.11+cu128)
   falcon_inference_server.py  ← FastAPI, POST /segment
-       ↕ HTTP (port 8390)
+       ↕ HTTP (port 18390)
 
 bim-recon 环境 (gsplat, torch 2.7+cu128)
   falcon_client.py             ← FalconClient.segment(image, query)
@@ -980,7 +980,7 @@ class FloorPlanProvider:
 
 ---
 
-## 13. 项目完成度总览（2026-07-05 更新）
+## 13. 项目完成度总览（2026-07-17 更新）
 
 ### 阶段完成状态
 
@@ -990,7 +990,7 @@ class FloorPlanProvider:
 | **P1** | 3DGS 重建 + 语义高斯 + 墙体提取（SceneSplat + 虚拟扫描 + 墙线提取） | ✅ 已完成 | 100% |
 | **P2** | 元素检测（门/窗 VLM 验证 + Falcon 分割 + Revit 建模） | ✅ 已完成 | 100% |
 | **P2.5** | Gradio Web UI（单页界面 + Mask 编辑 + 相机捕获 + 视角重分割） | ✅ 已完成 | 100% |
-| **P2.6** | AI Agent（smolagents + Revit MCP + 管线上下文注入） | ✅ 已完成 | 100% |
+| **P2.6** | 确定性 Workflows（A/B 类编排 + Revit MCP + Gradio 事件流） | ✅ 已完成 | 100% |
 | **~~P3~~** | ~~LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真）~~ | ✅ **已被取代** | 100% |
 | **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 40% |
 
@@ -1022,7 +1022,7 @@ class FloorPlanProvider:
 - 元素类型注册表（door/window/column/furniture）
 - room0 完整 Revit 建模验证（4 墙 + 2 门 + 3 窗，自定义尺寸，原生可编辑）
 - 统一管线 `run_pipeline.py`（唯一入口，时间戳输出目录）
-- 150 个单元测试（149 通过，1 个需 MSVC JIT）
+- 210 个单元测试全部通过
 
 #### P2.5 ✅ Gradio Web UI
 - **单页布局**（5 个区块 + 底部 3D 查看器，无 Tab 切换）
@@ -1030,21 +1030,22 @@ class FloorPlanProvider:
   - ② 运行管线：选项（门/窗/Falcon/跳过VLM）→ 实时流式控制台 → 结果下拉
   - ③ 检测结果：墙线俯视图 + VLM 验证图库 + Seg 叠加图库 + JSON 报告
   - ④ 微调：Mask 绘制（gr.ImageMask）+ 视角重分割
-  - ⑤ AI Agent：Revit MCP 聊天
+  - ⑤ Revit 确定性工作流：标高 → 楼板 → 墙 → 门窗 → ElementId 核验
+  - ⑤b B 类受控工作流：固定视角扫描 → 人工确认 → TRELLIS → Revit
   - ⑥ 3D 查看器：nerfview iframe
 - **Mask 绘制**：`gr.ImageMask`（红色画笔）→ alpha 通道提取 → 紧致 bbox → `mask_to_bbox()` → 墙局部坐标
-- **相机捕获**：nerfview HTTP 端点（端口 8082）→ `viewer_camera_patch.py` monkey-patch viser.ViserServer → `GET /camera-state` 返回 position/look_at/fov/c2w
+- **相机捕获**：nerfview HTTP 端点（端口 18082）→ `viewer_camera_patch.py` monkey-patch viser.ViserServer → `GET /camera-state` 返回 position/look_at/fov/c2w
 - **视角重分割**：捕获视角 → GSScene 渲染 → Falcon 分割 → 射线-平面交点（mask_bbox 8 点采样）→ 墙坐标 → 更新结果 + 图库 + Mask 编辑器
 - **全中文 UI**
 
-#### P2.6 ✅ AI Agent
-- **smolagents**（HuggingFace）`ToolCallingAgent` + `ToolCollection.from_mcp`
-- **config.json 统一配置**：VLM + LLM API 地址/密钥/模型名（OpenAI 兼容接口）
-- **Gradio API 配置面板**：API Base / Key / Model 输入 → 测试连接 → 保存到 config.json
-- **管线上下文注入**：墙/门/窗检测结果（坐标、尺寸）自动写入 Agent system prompt
-- **26 个 Revit MCP 工具**自动加载（create_line_based_element / create_point_based_element 等）
-- **轻量级 Revit 连接检测**：TCP 端口 8080 探测（3s 超时，不调用 Revit API）
-- **MCP 连接超时优化**：5s → 30s
+#### P2.6 ✅ 确定性 Workflows
+- **LlamaIndex Workflows**：类型化事件驱动的显式步骤，不使用自主 Agent 循环
+- **A 类重建**：场景加载、坐标系、扫描、墙线、构件检测、验证和结果保存逐步执行
+- **Revit 创建**：标高 → 楼板 → 墙 → 门窗 → ElementId 核验，单一 stdio MCP 会话贯穿一次运行
+- **B 类扫描**：固定视角序列、每视角一次渲染、Falcon 检测、三维定位与去重
+- **B 类生成**：仅处理人工确认物体，TRELLIS 后可选注册 Revit DirectShape
+- **Gradio 事件流**：统一进度、警告、失败和完成事件；UI 不包含聊天或 LLM 配置面板
+- **配置收敛**：仅保留 VLM 图像验证、Revit MCP、TRELLIS 与构件路由配置
 
 ---
 
@@ -1073,11 +1074,11 @@ class FloorPlanProvider:
 
 **新增**：`bim_recon/pipeline_api.py` `mask_to_bbox()` 函数。
 
-#### nerfview 相机捕获（端口 8082 HTTP 端点）
+#### nerfview 相机捕获（端口 18082 HTTP 端点）
 
 **背景**：用户在 nerfview 3D 查看器中漫游到覆盖构件的视角后，需要捕获相机参数用于渲染。
 
-**方案**：`scripts/viewer_camera_patch.py` 在 `viser.ViserServer.__init__` 上打 monkey-patch，自动在端口 8082 启动 HTTP 微服务。
+**方案**：`scripts/viewer_camera_patch.py` 在 `viser.ViserServer.__init__` 上打 monkey-patch，自动在端口 18082 启动 HTTP 微服务。
 
 **API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}`
 
@@ -1121,7 +1122,7 @@ height = point[up_axis]
 - **MCP context manager 存活**：`ToolCollection.from_mcp` 返回的 context manager 必须存储在**模块级全局变量**中，否则 Python GC 回收后关闭 MCP 子进程的 event loop。
 - **OpenAIServerModel**（标准 OpenAI API）：兼容 Ollama（`/v1`）、智谱 ZAI（`/api/paas/v4`）、OpenAI、DeepSeek 等。
 - **管线上下文注入**：检测结果（墙坐标、门窗尺寸）写入 `instructions`（smolagents 参数名，非 `system_prompt`）。
-- **Revit 连接检测**：TCP 端口 8080 探测（3s），不调用 Revit API。
+- **Revit 连接检测**：TCP 端口 18080 探测（3s），不调用 Revit API。
 
 **config.json 统一配置**：
 ```json
@@ -1143,7 +1144,7 @@ height = point[up_axis]
 ```
 trellis 环境 (torch 2.4 + xformers)          bim-recon 环境 (gsplat, torch 2.7)
   TRELLIS/trellis submodule                    bim_recon/trellis_client.py
-  trellis_server/server.py  ← FastAPI 8391 →        ↕ HTTP
+  trellis_server/server.py  ← FastAPI 18391 →       ↕ HTTP
     TrellisImageTo3DPipeline                       bim_recon/mesh_registrar.py
     POST /generate → GLB + PLY                      compute_placement_transform()
                                                     register_mesh_in_revit()

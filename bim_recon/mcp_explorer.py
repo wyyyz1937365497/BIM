@@ -17,7 +17,7 @@ Run with::
     python -m bim_recon.mcp_explorer \\
         --ply data/point_cloud_30000.ply \\
         --feat output/point_cloud_30000/point_cloud_30000_feat.pt \\
-        --falcon-port 8390 \\
+        --falcon-port 18390 \\
         --explore-dir output/explore
 
 Or set env vars ``GS_PLY_PATH``, ``GS_FEAT_PATH``, ``FALCON_PORT``.
@@ -80,7 +80,7 @@ class ExplorerState:
     height: int = 768
     # Falcon connection params.
     falcon_host: str = "127.0.0.1"
-    falcon_port: int = 8390
+    falcon_port: int = 18390
     # Cached scene bounds.
     bounds_min: Tuple[float, ...] = (0.0, 0.0, 0.0)
     bounds_max: Tuple[float, ...] = (10.0, 3.0, 10.0)
@@ -222,7 +222,7 @@ def _check_falcon(s: ExplorerState):
     if not client.health():
         raise RuntimeError(
             f"Falcon server not reachable at {s.falcon_host}:{s.falcon_port}. "
-            "Start it first:  python falcon_inference_server.py --port 8390 ..."
+            "Start it first:  python falcon_inference_server.py --port 18390 ..."
         )
     return client
 
@@ -668,7 +668,7 @@ def _parse_args(argv=None):
                    help="Path to SceneSplat feat.pt (optional, for semantic queries).")
     p.add_argument("--falcon-host", default=os.environ.get("FALCON_HOST", "127.0.0.1"))
     p.add_argument("--falcon-port", type=int,
-                   default=int(os.environ.get("FALCON_PORT", "8390")))
+                   default=int(os.environ.get("FALCON_PORT", "18390")))
     p.add_argument("--explore-dir", default="output/explore",
                    help="Directory to save rendered views.")
     p.add_argument("--width", type=int, default=1024)

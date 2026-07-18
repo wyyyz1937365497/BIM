@@ -1,0 +1,453 @@
+"""Behavioral tests for deterministic workflow orchestration."""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+
+from workflows import Context, Workflow, step
+from workflows.events import StartEvent, StopEvent
+
+from bim_recon.explorer_controller import ExplorerCamera
+from bim_recon.explorer_workflow import ExplorerScanConfig, ExplorerScanWorkflow
+from bim_recon.pipeline_api import ElementResult, PipelineResults
+from bim_recon.pipeline_runner import (
+    PipelineConfig,
+    ReconstructionWorkflow,
+    snap_wall_endpoints,
+)
+from bim_recon.revit_workflow import RevitBuildWorkflow
+from bim_recon.trellis_client import TrellisMeshResult
+from bim_recon.trellis_workflow import (
+    ApprovedMeshObject,
+    TrellisRevitWorkflow,
+    TrellisWorkflowConfig,
+)
+from bim_recon.workflow_events import (
+    WorkflowCompleted,
+    WorkflowFailed,
+    WorkflowProgress,
+)
+from bim_recon.workflow_runtime import (
+    stream_workflow_gradio,
+    stream_workflow_sync,
+)
+
+
+class _TinyWorkflow(Workflow):
+    def __init__(self):
+        super().__init__(timeout=None, verbose=False)
+
+    @step
+    async def run_once(self, ctx: Context, ev: StartEvent) -> StopEvent:
+        ctx.write_event_to_stream(WorkflowProgress(
+            workflow="tiny",
+            stage="one",
+            message="working",
+            payload={"value": 1},
+        ))
+        ctx.write_event_to_stream(WorkflowCompleted(
+            workflow="tiny",
+            result={"ok": True},
+        ))
+        return StopEvent(result={"ok": True})
+
+
+def test_runtime_streams_typed_events_to_sync_and_gradio_adapters():
+    sync_events = list(stream_workflow_sync(_TinyWorkflow()))
+    assert [type(event) for event in sync_events] == [
+        WorkflowProgress,
+        WorkflowCompleted,
+    ]
+
+    async def collect():
+        return [update async for update in stream_workflow_gradio(_TinyWorkflow())]
+
+    updates = asyncio.run(collect())
+    assert [update.kind for update in updates] == ["progress", "completed"]
+    assert updates[-1].payload == {"ok": True}
+
+
+class _FakeGateway:
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self.created_ids: list[int] = []
+
+    async def call_tool(self, name: str, arguments: dict):
+        self.calls.append((name, arguments))
+        if name == "create_level":
+            ids = [1]
+        elif name == "create_surface_based_element":
+            ids = [2]
+        elif name == "create_line_based_element":
+            ids = list(range(101, 101 + len(arguments["data"])))
+        elif name == "create_point_based_element":
+            type_id = arguments["data"][0]["typeId"]
+            ids = [201] if type_id == 94654 else [301]
+        elif name == "get_current_view_elements":
+            ids = self.created_ids
+        elif name == "send_code_to_revit":
+            return {"success": True, "result": {"elementId": 401}}
+        else:
+            raise AssertionError(name)
+        if name != "get_current_view_elements":
+            self.created_ids.extend(ids)
+        if name in {"create_surface_based_element", "create_line_based_element"}:
+            return {"Response": ids}
+        return {"Response": [{"elementId": element_id} for element_id in ids]}
+
+
+def _sample_results(tmp_path: Path) -> PipelineResults:
+    walls = [
+        {"x1": 0.0, "y1": 0.0, "x2": 4.0, "y2": 0.0, "length": 4.0},
+        {"x1": 4.0, "y1": 0.0, "x2": 4.0, "y2": 3.0, "length": 3.0},
+        {"x1": 4.0, "y1": 3.0, "x2": 0.0, "y2": 3.0, "length": 4.0},
+        {"x1": 0.0, "y1": 3.0, "x2": 0.0, "y2": 0.0, "length": 3.0},
+    ]
+    elements = [
+        ElementResult(
+            element_class="door",
+            confirmed=True,
+            vlm_response="yes",
+            image_path="door.png",
+            world_x=1.0,
+            world_y=0.0,
+            wall_idx=0,
+            result_index=0,
+            height_detection={
+                "width_m": 0.9,
+                "sill_height": 0.0,
+                "header_height": 2.1,
+                "element_height": 2.1,
+            },
+        ),
+        ElementResult(
+            element_class="window",
+            confirmed=True,
+            vlm_response="yes",
+            image_path="window.png",
+            world_x=4.0,
+            world_y=1.5,
+            wall_idx=1,
+            result_index=1,
+            height_detection={
+                "width_m": 1.2,
+                "sill_height": 0.8,
+                "header_height": 2.0,
+                "element_height": 1.2,
+            },
+        ),
+    ]
+    return PipelineResults(
+        out_dir=tmp_path,
+        walls=walls,
+        elements=elements,
+        coords={"floor_z": 0.0, "ceiling_z": 3.0},
+    )
+
+
+def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path):
+    gateway = _FakeGateway()
+    workflow = RevitBuildWorkflow(_sample_results(tmp_path), gateway)
+
+    events = list(stream_workflow_sync(workflow))
+
+    completed = next(event for event in events if isinstance(event, WorkflowCompleted))
+    names = [name for name, _arguments in gateway.calls]
+    assert names == [
+        "create_level",
+        "create_surface_based_element",
+        "create_line_based_element",
+        "create_point_based_element",
+        "create_point_based_element",
+        "get_current_view_elements",
+    ]
+    opening_calls = [
+        arguments for name, arguments in gateway.calls
+        if name == "create_point_based_element"
+    ]
+    assert opening_calls[0]["data"][0]["hostWallId"] == 101
+    assert opening_calls[1]["data"][0]["hostWallId"] == 102
+    assert completed.result["missing_ids"] == []
+    assert completed.result["created"]["doors"] == [201]
+
+
+def test_wall_snapping_never_collapses_endpoints_of_the_same_wall():
+    snapped = snap_wall_endpoints([{
+        "x1": 0.0,
+        "y1": 0.0,
+        "x2": 0.3,
+        "y2": 0.0,
+        "length": 99.0,
+    }], threshold=0.5)
+
+    assert len(snapped) == 1
+    assert snapped[0]["x1"] == 0.0
+    assert snapped[0]["x2"] == 0.3
+    assert snapped[0]["length"] == pytest.approx(0.3)
+
+
+def test_revit_workflow_removes_short_curves_from_floor_and_walls(tmp_path):
+    a = (0.4903733028, -1.4737401816)
+    b = (-1.5815451137, 0.4419133492)
+    c = (-1.0266988698, 1.2945968332)
+    d = (-0.6011297413, 1.8727998858)
+    e = (1.6970896625, -0.3509214441)
+
+    def wall(start, end, reported_length):
+        return {
+            "x1": start[0],
+            "y1": start[1],
+            "x2": end[0],
+            "y2": end[1],
+            "length": reported_length,
+        }
+
+    walls = [
+        wall(a, b, 2.6),
+        wall(b, b, 0.6),
+        wall(b, c, 0.9),
+        wall(c, d, 0.7),
+        wall(d, e, 3.3),
+        wall(e, e, 0.35),
+        wall(e, a, 1.4),
+    ]
+    results = PipelineResults(
+        out_dir=tmp_path,
+        walls=walls,
+        elements=[],
+        coords={"floor_z": 0.0, "ceiling_z": 3.0},
+    )
+    gateway = _FakeGateway()
+
+    events = list(stream_workflow_sync(RevitBuildWorkflow(results, gateway)))
+
+    completed = next(event for event in events if isinstance(event, WorkflowCompleted))
+    floor_args = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_surface_based_element"
+    )
+    segments = floor_args["data"][0]["boundary"]["outerLoop"]
+    wall_args = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_line_based_element"
+    )
+    lengths_mm = [
+        (
+            (segment["p1"]["x"] - segment["p0"]["x"]) ** 2
+            + (segment["p1"]["y"] - segment["p0"]["y"]) ** 2
+        ) ** 0.5
+        for segment in segments
+    ]
+
+    assert len(segments) == 5
+    assert min(lengths_mm) >= 1.0
+    assert len(wall_args["data"]) == 5
+    assert completed.result["created"]["walls"] == [101, 102, 103, 104, 105]
+
+
+class _FakeExplorerController:
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.found: list[dict] = []
+        self.turns: list[float] = []
+        self.scan_count = 0
+
+    def initialize(self, camera):
+        path = self.output_dir / "initial.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"png")
+        return str(path)
+
+    def scan_current(self, labels):
+        self.scan_count += 1
+        path = self.output_dir / f"scan-{self.scan_count}.png"
+        path.write_bytes(b"png")
+        tagged = []
+        if self.scan_count == 1:
+            obj = {
+                "id": "obj_001",
+                "label": labels[0],
+                "position_3d": [1.0, 2.0, 0.5],
+                "best_view": str(path),
+                "trellis_status": "pending_approval",
+            }
+            self.found.append(obj)
+            tagged.append(obj)
+        return {
+            "view_path": str(path),
+            "detections": [{"label": labels[0]}],
+            "tagged": tagged,
+            "duplicates": [],
+        }
+
+    def turn(self, degrees):
+        self.turns.append(degrees)
+
+    def persist(self):
+        path = self.output_dir / "found_objects.json"
+        path.write_text("[]", encoding="utf-8")
+        return path
+
+    def status(self):
+        return {"camera": {"up_axis": 2}, "found_count": len(self.found)}
+
+
+def test_explorer_workflow_scans_bounded_views_without_agent_loop(tmp_path):
+    controllers: list[_FakeExplorerController] = []
+
+    def factory(_config, output_dir):
+        controller = _FakeExplorerController(output_dir)
+        controllers.append(controller)
+        return controller
+
+    workflow = ExplorerScanWorkflow(
+        ExplorerScanConfig(
+            ply_path=tmp_path / "scene.ply",
+            feat_path=None,
+            output_root=tmp_path / "explore",
+            camera=ExplorerCamera((0.0, 0.0, 1.0)),
+            labels=("chair", "table"),
+            num_views=3,
+            turn_degrees=120.0,
+        ),
+        controller_factory=factory,
+    )
+
+    events = list(stream_workflow_sync(workflow))
+
+    completed = next(event for event in events if isinstance(event, WorkflowCompleted))
+    assert controllers[0].scan_count == 3
+    assert controllers[0].turns == [120.0, 120.0]
+    assert completed.result["found_objects"][0]["label"] == "chair"
+
+
+class _FakeTrellisClient:
+    def __init__(self, result: TrellisMeshResult):
+        self.result = result
+        self.requests = []
+
+    def health(self):
+        return True
+
+    def generate_mesh(self, request):
+        self.requests.append(request)
+        return self.result
+
+
+def test_trellis_workflow_requires_approval_and_registers_selected_mesh(
+    tmp_path, monkeypatch,
+):
+    image = tmp_path / "chair.png"
+    image.write_bytes(b"png")
+    glb = tmp_path / "chair.glb"
+    glb.write_bytes(b"glb")
+    fake_client = _FakeTrellisClient(TrellisMeshResult(glb, None, None, 1))
+    gateway = _FakeGateway()
+    monkeypatch.setattr(
+        "bim_recon.trellis_workflow.compute_placement_transform",
+        lambda _placement: object(),
+    )
+    monkeypatch.setattr(
+        "bim_recon.trellis_workflow.register_mesh_in_revit",
+        lambda _placement, _transform: {
+            "vertex_count": 8,
+            "face_count": 12,
+            "payload_json": "{}",
+        },
+    )
+    workflow = TrellisRevitWorkflow(
+        TrellisWorkflowConfig(
+            objects=(ApprovedMeshObject(
+                object_id="obj_001",
+                label="chair",
+                image_path=image,
+                position_3d=(1.0, 2.0, 0.5),
+            ),),
+            output_dir=tmp_path / "meshes",
+            register_in_revit=True,
+        ),
+        client_factory=lambda: fake_client,
+        gateway=gateway,
+    )
+
+    events = list(stream_workflow_sync(workflow))
+
+    completed = next(event for event in events if isinstance(event, WorkflowCompleted))
+    assert completed.result["completed"] == 1
+    assert fake_client.requests[0].name == "chair_obj_001"
+    assert gateway.calls[-1][0] == "send_code_to_revit"
+
+
+def test_reconstruction_workflow_surfaces_failed_preflight_without_heavy_steps(
+    monkeypatch,
+):
+    class OfflineFalcon:
+        def __init__(self, **_kwargs):
+            pass
+
+        def health(self):
+            return False
+
+    monkeypatch.setattr("bim_recon.pipeline_runner.FalconClient", OfflineFalcon)
+    workflow = ReconstructionWorkflow(PipelineConfig(name="missing"))
+
+    events = list(stream_workflow_sync(workflow))
+
+    failed = next(event for event in events if isinstance(event, WorkflowFailed))
+    assert failed.stage == "prepare"
+    assert "unreachable" in failed.message
+
+
+def test_gradio_preprocess_callback_runs_uncached_pipeline(
+    tmp_path, monkeypatch,
+):
+    """The uncached callback must copy the upload and launch both subprocesses."""
+    monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "False")
+    from scripts import gradio_app
+
+    source = tmp_path / "uploaded.ply"
+    source.write_bytes(b"ply\n")
+    scenesplat = tmp_path / "SceneSplat"
+    checkpoint = (
+        scenesplat
+        / "ckpt"
+        / "lang-pretrain-concat-scan-ppv2-matt-mcmc-wo-normal-contrastive.pth"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    calls = []
+
+    monkeypatch.setattr(gradio_app, "ROOT", tmp_path)
+    monkeypatch.setattr(gradio_app, "SCENESPLAT", scenesplat)
+    monkeypatch.setattr(
+        gradio_app,
+        "check_preprocess_status",
+        lambda _name: {"feat_pt_exists": False},
+    )
+    monkeypatch.setattr(
+        gradio_app.subprocess,
+        "run",
+        lambda command, cwd, check: calls.append((command, cwd, check)),
+    )
+
+    app = gradio_app.build_app()
+    callback = next(
+        block_fn.fn
+        for block_fn in app.fns.values()
+        if getattr(block_fn.fn, "__name__", "") == "on_preprocess"
+    )
+
+    status, scene_name = callback(str(source), "new-scene")
+
+    copied = tmp_path / "data" / "new-scene" / source.name
+    assert copied.read_bytes() == source.read_bytes()
+    assert scene_name == "new-scene"
+    assert "预处理完成" in status
+    assert len(calls) == 2
+    assert calls[0][0][2] == "scripts.preprocess_gs"
+    assert calls[1][0][2] == "tools.lang_inference"
+    assert all(cwd == str(scenesplat) and check for _cmd, cwd, check in calls)

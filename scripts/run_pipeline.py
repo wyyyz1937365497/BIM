@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("--vlm-model", default=None)
     parser.add_argument("--vlm-api-key", default=None)
     parser.add_argument("--falcon-host", default="127.0.0.1")
-    parser.add_argument("--falcon-port", type=int, default=8390)
+    parser.add_argument("--falcon-port", type=int, default=18390)
     parser.add_argument("--num-heights", type=int, default=8)
     parser.add_argument("--snap-threshold", type=float, default=0.5)
     args = parser.parse_args()

@@ -40,17 +40,10 @@ sys.path.insert(0, str(ROOT))
 from bim_recon.pipeline_api import (
     PipelineResults, load_results, remap_from_json, mask_to_bbox,
 )
-from bim_recon.config import (
-    get_llm_model,
-    get_vlm_model,
-    load_config,
-    save_config,
-    test_llm_connection,
-)
-from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
+from bim_recon.config import load_config
 
-VIEWER_PORT = 8081
-CAMERA_PORT = 8082
+VIEWER_PORT = 18081
+CAMERA_PORT = 18082
 MAX_PORT_WAIT_S = 30
 SCENESPLAT = ROOT / "SceneSplat"
 MAX_CONSOLE_LINES = 200
@@ -560,11 +553,11 @@ def on_mask_apply(editor_value: dict | None, elem_label: str,
 
 
 def fetch_camera_state() -> tuple[str, dict]:
-    """从 nerfview HTTP 端点 (端口 8082) 获取当前相机参数。返回 (显示文本, 原始数据)。"""
+    """从 nerfview HTTP 端点 (端口 18082) 获取当前相机参数。返回 (显示文本, 原始数据)。"""
     import urllib.request
     try:
         with urllib.request.urlopen(
-            "http://127.0.0.1:8082/camera-state", timeout=2,
+            "http://127.0.0.1:18082/camera-state", timeout=2,
         ) as resp:
             data = json.loads(resp.read())
         if "error" in data:
@@ -579,7 +572,7 @@ def fetch_camera_state() -> tuple[str, dict]:
             data,
         )
     except Exception as e:
-        return f"⚠️ 无法连接查看器 (端口 8082)\n\n请先启动下方查看器。\n\n错误: {e}", {}
+        return f"⚠️ 无法连接查看器 (端口 18082)\n\n请先启动下方查看器。\n\n错误: {e}", {}
 
 
 # ---------------------------------------------------------------------------
@@ -610,12 +603,12 @@ def _get_scene(scene_name: str):
 
 
 def _get_falcon():
-    """Lazy-connect to Falcon server (port 8390)."""
+    """Lazy-connect to Falcon server (port 18390)."""
     global _FALCON_CACHE
     if _FALCON_CACHE is not None:
         return _FALCON_CACHE
     from bim_recon.falcon_client import FalconClient
-    falcon = FalconClient("127.0.0.1", 8390)
+    falcon = FalconClient("127.0.0.1", 18390)
     if not falcon.health():
         return None
     _FALCON_CACHE = falcon
@@ -762,7 +755,7 @@ def resegment_from_viewpoint(
     # 2. Falcon segmentation
     falcon = _get_falcon()
     if falcon is None:
-        return rgb_uint8, None, {}, "⚠️ Falcon 服务器未运行 (端口 8390)，仅返回渲染图"
+        return rgb_uint8, None, {}, "⚠️ Falcon 服务器未运行 (端口 18390)，仅返回渲染图"
 
     detections = falcon.segment(rendered_pil, elem.element_class, task="segmentation")
     if not detections:
@@ -879,397 +872,4 @@ def apply_vlm_review(results: PipelineResults | None, confirmed_labels: list[str
     kept = sum(1 for e in all_elems if f"{e.element_class} #{e.result_index}" in confirmed_set)
     return f"VLM审核：{kept}/{total} 个构件已确认，可导出到Revit"
 
-
-# ---------------------------------------------------------------------------
-# AI Agent (smolagents + Revit MCP)
-# ---------------------------------------------------------------------------
-
-_AGENT_CACHE: Any = None    # ToolCallingAgent instance, lazily created
-_MCP_CM_CACHE: Any = None   # ToolCollection context manager — MUST stay alive to keep MCP subprocess + event loop running
-
-REVIT_WS_PORT = 8080  # Revit plugin WebSocket port
-
-
-def _check_revit_port() -> bool:
-    """Lightweight check: is the Revit plugin WebSocket port open?
-
-    This only checks TCP reachability — no Revit API round-trip,
-    so it's fast and doesn't require Revit to respond to commands.
-    """
-    import socket
-    try:
-        with socket.create_connection(("127.0.0.1", REVIT_WS_PORT), timeout=3):
-            return True
-    except (OSError, ConnectionRefusedError):
-        return False
-
-
-def _format_agent_error(e: Exception) -> str:
-    """Format agent errors into user-friendly Chinese messages.
-
-    Detects common LLM API failure modes (rate limit, auth, network, timeout)
-    and provides actionable guidance instead of raw stack traces.
-    """
-    err_str = str(e)
-    err_type = type(e).__name__
-
-    # OpenAI API errors
-    if "429" in err_str or "RateLimitError" in err_type or "余额不足" in err_str:
-        return (
-            "❌ **API 额度不足 / 请求频率超限**\n\n"
-            "LLM API 返回 429 错误，可能原因：\n"
-            "- 账户余额不足，请充值\n"
-            "- 请求过于频繁，请稍后重试\n"
-            "- 免费额度已用完\n\n"
-            f"原始错误：{err_str[:200]}"
-        )
-
-    if "401" in err_str or "AuthenticationError" in err_type or "无效" in err_str and "key" in err_str.lower():
-        return (
-            "❌ **API 认证失败**\n\n"
-            "API Key 无效或已过期。请在 ⚙️ LLM API 配置 面板中检查：\n"
-            "- API Key 是否正确\n"
-            "- API Base URL 是否正确\n\n"
-            f"原始错误：{err_str[:200]}"
-        )
-
-    if "Connection" in err_type or "ConnectionError" in err_type or "Connect" in err_str:
-        return (
-            "❌ **无法连接到 API 服务**\n\n"
-            "可能原因：\n"
-            "- 网络问题（防火墙 / 代理）\n"
-            "- API Base URL 错误\n"
-            "- 服务暂时不可用\n\n"
-            f"原始错误：{err_str[:200]}"
-        )
-
-    if "Timeout" in err_type or "timeout" in err_str.lower():
-        return (
-            "❌ **API 请求超时**\n\n"
-            "LLM 服务响应时间过长，可能原因：\n"
-            "- 服务端负载高\n"
-            "- 请求过于复杂（对话太长）\n"
-            "- 网络延迟\n\n"
-            f"原始错误：{err_str[:200]}"
-        )
-
-    if "Event loop is closed" in err_str:
-        return (
-            "❌ **MCP 连接断开**\n\n"
-            "Revit MCP 子进程的 asyncio 事件循环已关闭。\n"
-            "请点击「💾 保存配置」重置 Agent 连接后重试。"
-        )
-
-    # Generic fallback
-    return f"❌ **Agent 错误** ({err_type})\n\n{err_str[:500]}"
-
-
-def _get_agent(results: PipelineResults | None, scene_name: str):
-    """Lazily create a smolagents ToolCallingAgent with Revit MCP tools."""
-    global _AGENT_CACHE, _MCP_CM_CACHE
-    if _AGENT_CACHE is not None:
-        return _AGENT_CACHE
-
-    from smolagents import ToolCollection, ToolCallingAgent
-    from mcp import StdioServerParameters
-
-    cfg = load_config()
-
-    # Connect to Revit MCP server (stdio)
-    # Store context manager at module scope so it's NOT garbage-collected
-    # (GC would close the MCP subprocess and its asyncio event loop)
-    server_params = StdioServerParameters(
-        command=cfg.revit_mcp.command,
-        args=cfg.revit_mcp.args,
-    )
-    _MCP_CM_CACHE = ToolCollection.from_mcp(
-        server_params,
-        trust_remote_code=True,
-        structured_output=False,
-    )
-    tool_collection = _MCP_CM_CACHE.__enter__()  # type: ignore[attr-defined]
-    tool_list = tool_collection.tools  # type: ignore[attr-defined]
-
-    # Create LLM model from config
-    model = get_llm_model(cfg)
-
-    # Build context from pipeline results
-    context = _build_agent_context(results, scene_name)
-
-    # ToolCallingAgent calls tools directly from main thread (not sandboxed),
-    # which is required for MCP tools that use asyncio internally.
-    agent = ToolCallingAgent(
-        tools=tool_list,
-        model=model,
-        instructions=context,
-        max_steps=20,
-    )
-    _AGENT_CACHE = agent
-    return agent
-
-
-def _build_agent_context(results: PipelineResults | None, scene_name: str) -> str:
-    """Build a system prompt with pipeline detection results and Revit workflow."""
-    parts: list[str] = [
-        "# 角色",
-        "你是一个 BIM 自动化助手。你可以通过 Revit MCP 工具在 Revit 中创建建筑构件。",
-        "你收到的检测数据来自 3DGS 场景分析（单位为米），向 Revit 工具传递坐标时**必须乘以 1000 转换为毫米(mm)**。",
-        "",
-        "# ⚠️ 最关键规则：门窗必须设置 hostWallId",
-        "",
-        "Revit 中门窗只有在**正确设置 hostWallId** 时才会在墙上自动开洞。",
-        "不设 hostWallId 的门窗是自由放置的，**不会在墙上开洞**。",
-        "",
-        "正确流程：",
-        "1. 用 `create_line_based_element` 批量创建所有墙 → **记录每面墙返回的 ElementId**",
-        "2. 用 `create_point_based_element` 创建门窗时，**必须传入 `hostWallId`** 指定宿主墙的 ElementId",
-        "",
-        "# 完整创建流程（必须按此顺序）",
-        "",
-        "## 第 0 步：连接检查",
-        "```",
-        "say_hello()  // 确认 Revit MCP 连接正常",
-        "```",
-        "",
-        "## 第 1 步：创建标高",
-        "```",
-        "create_level(data=[{name: 'BIM-Recon Floor', elevation: 0}])",
-        "```",
-        "",
-        "## 第 2 步：批量创建墙体",
-        "",
-        "用 `create_line_based_element` 一次创建所有墙（data 是数组）：",
-        "```",
-        "create_line_based_element(data=[",
-        "  {category:'OST_Walls', locationLine:{p0:{x,y,z:0}, p1:{x,y,z:0}}, thickness:200, height:2000, baseLevel:0, baseOffset:0},",
-        "  // ... 更多墙",
-        "])",
-        "→ 返回 ElementId 数组，例如 [337703, 337706, 337709, 337712]",
-        "  墙0 = ElementId 337703",
-        "  墙1 = ElementId 337706",
-        "  墙2 = ElementId 337709",
-        "  墙3 = ElementId 337712",
-        "```",
-        "",
-        "**记录每个 ElementId 与检测数据中墙索引(墙#N)的对应关系。**",
-        "",
-        "## 第 3 步：查询族类型",
-        "```",
-        "get_available_family_types(categoryList=['OST_Doors', 'OST_Windows'])",
-        "→ 返回 typeId 列表，从中选择合适的基础类型",
-        "```",
-        "门推荐 typeId: 查到的「单扇 - 与墙齐」系列的任意一个",
-        "窗推荐 typeId: 查到的「固定」系列的任意一个",
-        "（设置 width+height 会自动复制类型并设自定义尺寸）",
-        "",
-        "## 第 4 步：批量创建门（hostWallId = 对应墙的 ElementId）",
-        "```",
-        "create_point_based_element(data=[",
-        "  {",
-        "    name: 'door #1',",
-        "    typeId: <门的 typeId>,",
-        "    locationPoint: {x, y, z: 0},     // 位置坐标 (mm)",
-        "    width: 952,                        // 宽 (mm)",
-        "    height: 1984,                      // 高 (mm)",
-        "    baseLevel: 0,",
-        "    baseOffset: 0,                     // 门: sill=0",
-        "    hostWallId: 337706,               // ← 关键！墙1 的 ElementId",
-        "  },",
-        "])",
-        "```",
-        "",
-        "## 第 5 步：批量创建窗（hostWallId + baseOffset = sill高度）",
-        "```",
-        "create_point_based_element(data=[",
-        "  {",
-        "    name: 'window #2',",
-        "    typeId: <窗的 typeId>,",
-        "    locationPoint: {x, y, z: 0},",
-        "    width: 1426,",
-        "    height: 1290,",
-        "    baseLevel: 0,",
-        "    baseOffset: 701,                  // ← 窗台高度 (mm)，来自检测数据 sill_height",
-        "    hostWallId: 337709,               // ← 关键！墙2 的 ElementId",
-        "  },",
-        "])",
-        "```",
-        "",
-        "# 坐标转换规则",
-        "",
-        "1. 检测数据单位为**米(m)**，Revit 工具单位为**毫米(mm)**",
-        "2. 转换: `mm = round(m * 1000)`",
-        "3. 3DGS 原点可能在负坐标，建议加偏移量（如 +10000mm X, +10000mm Y）避免与原点重叠",
-        "4. Z 坐标统一用 0（baseLevel=0 即地面，baseOffset 控制高度）",
-        "",
-        "# 墙索引映射规则",
-        "",
-        "检测数据中 `墙#N` 对应 `wall_lines_snapped.json` 中的第 N 面墙。",
-        "创建墙时按数组顺序创建，返回的 ElementId 数组索引 = 墙索引。",
-        "门窗的 `wall_idx` 字段告诉你在哪面墙上开洞。",
-        "",
-        "# 其他规则",
-        "",
-        "1. **批量优先**: `create_line_based_element` 和 `create_point_based_element` 的 data 是数组，尽量一次性创建多个",
-        "2. **typeId**: 门窗的 typeId 用 `get_available_family_types` 查询，设 width+height 会自动复制类型",
-        "3. **逐步确认**: 每步完成后简要报告结果（创建了几个、ElementId 是什么）再继续",
-        "4. **错误重试**: 工具返回错误时检查参数（特别是 hostWallId、typeId、单位）后重试",
-        "5. **不创建重复**: 如用户要求「将所有构件导入」，按上述流程一次性完成，不要反复创建",
-        "",
-        "# 场景检测数据",
-        f"场景名称: `{scene_name}`",
-    ]
-
-    if results and results.walls:
-        parts.append(f"\n## 墙体（{len(results.walls)} 面）")
-        for i, w in enumerate(results.walls):
-            parts.append(
-                f"  墙{i}: ({w['x1']:.3f}, {w['y1']:.3f}) → "
-                f"({w['x2']:.3f}, {w['y2']:.3f}), "
-                f"长 {w['length']:.3f}m"
-            )
-
-    if results and results.doors:
-        confirmed = [d for d in results.doors if d.confirmed]
-        parts.append(f"\n## 门（{len(confirmed)} 个已确认）")
-        for d in confirmed:
-            hd = d.height_detection or {}
-            parts.append(
-                f"  门#{d.result_index} (在墙#{d.wall_idx}上): "
-                f"位置({d.world_x:.3f}, {d.world_y:.3f})m, "
-                f"宽 {hd.get('width_m', 0):.3f}m, "
-                f"高 {hd.get('element_height', 0):.3f}m, "
-                f"窗台 {hd.get('sill_height', 0):.3f}m"
-            )
-
-    if results and results.windows:
-        confirmed = [w for w in results.windows if w.confirmed]
-        parts.append(f"\n## 窗（{len(confirmed)} 个已确认）")
-        for w in confirmed:
-            hd = w.height_detection or {}
-            parts.append(
-                f"  窗#{w.result_index} (在墙#{w.wall_idx}上): "
-                f"位置({w.world_x:.3f}, {w.world_y:.3f})m, "
-                f"宽 {hd.get('width_m', 0):.3f}m, "
-                f"高 {hd.get('element_height', 0):.3f}m, "
-                f"窗台 {hd.get('sill_height', 0):.3f}m"
-            )
-
-    if not results or (not results.walls and not results.doors and not results.windows):
-        parts.append("\n（尚未加载检测结果，请先运行管线或在上方加载结果）")
-
-    parts.append("")
-    return "\n".join(parts)
-
-
-def agent_chat(
-    message: str,
-    history: list,
-    results: PipelineResults | None,
-    scene_name: str,
-) -> str:
-    """Handle a chat message from the user."""
-    if not message.strip():
-        return ""
-    # Lightweight Revit connectivity check (TCP port only, no API round-trip)
-    if not _check_revit_port():
-        return "❌ Revit 未连接：端口 8080 不可达。请确认 Revit 已启动且 MCP 插件已加载。"
-    try:
-        agent = _get_agent(results, scene_name)
-        response = agent.run(message)
-        return str(response)
-    except Exception as e:
-        return f"❌ Agent 错误: {e}"
-
-
-
-# ---------------------------------------------------------------------------
-# Explorer Agent (smolagents + Explorer MCP) — mirrors Revit agent
-# ---------------------------------------------------------------------------
-
-_EXP_AGENT_CACHE: Any = None
-_EXP_MCP_CM: Any = None
-
-
-def _reset_explorer_agent():
-    """Kill old explorer subprocess + clear caches."""
-    global _EXP_AGENT_CACHE, _EXP_MCP_CM
-    if _EXP_MCP_CM is not None:
-        try:
-            _EXP_MCP_CM.__exit__(None, None, None)
-        except Exception:
-            pass
-    _EXP_AGENT_CACHE = None
-    _EXP_MCP_CM = None
-
-
-def _get_explorer_agent(scene_name: str):
-    """Create a ToolCallingAgent connected to the explorer MCP server."""
-    global _EXP_AGENT_CACHE, _EXP_MCP_CM
-    if _EXP_AGENT_CACHE is not None:
-        return _EXP_AGENT_CACHE
-
-    from smolagents import ToolCollection, ToolCallingAgent
-    from mcp import StdioServerParameters
-
-    data_dir = ROOT / "data" / scene_name
-    ply_candidates = sorted(data_dir.glob("point_cloud_*.ply")) or sorted(data_dir.glob("*.ply"))
-    if not ply_candidates:
-        raise FileNotFoundError(f"PLY not found in {data_dir}")
-    ply_path = ply_candidates[0]
-    feat_candidates = sorted(data_dir.glob("*_feat.pt"))
-    if not feat_candidates:
-        out_dir = ROOT / "output" / scene_name
-        feat_candidates = sorted(out_dir.glob("*_feat.pt"))
-    feat_path = feat_candidates[0] if feat_candidates else None
-
-    mcp_args = ["-m", "bim_recon.mcp_explorer", "--ply", str(ply_path)]
-    if feat_path and Path(feat_path).exists():
-        mcp_args.extend(["--feat", str(feat_path)])
-    mcp_args.extend(["--explore-dir", str(ROOT / "output" / scene_name / "explore")])
-
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=mcp_args,
-        env=dict(os.environ),
-        cwd=str(ROOT),
-    )
-    _EXP_MCP_CM = ToolCollection.from_mcp(
-        server_params,
-        trust_remote_code=True,
-        structured_output=False,
-    )
-    tool_collection = _EXP_MCP_CM.__enter__()
-    tool_list = tool_collection.tools
-
-    cfg = load_config()
-    model = get_vlm_model(cfg)
-
-    instructions = (
-        "你是一个室内场景探索者。你在 3D Gaussian Splatting 渲染的房间中，"
-        "任务是找到所有 B 类物体（家具、装饰品、电器等）并记录 3D 位置。\n\n"
-        "## 探索策略\n"
-        "1. 首先调用 explore_init 初始化（如果尚未初始化）\n"
-        "2. 系统性地旋转 360°：每次 turn(45) 后 detect_objects\n"
-        "3. 搜索词要多样：chair, table, sofa, cabinet, bed, lamp, vase, plant, shelf, desk\n"
-        "4. 每个检测到的物体调用 tag_object 记录\n"
-        "5. 如果视角不好（看不到物体），step('forward', 1.0) 移动位置\n"
-        "6. 完成后调用 list_found 查看汇总\n\n"
-        "## 重要\n"
-        "- 每次只处理一个视角，不要一次旋转太多\n"
-        "- tag_object 的 bbox 是归一化坐标 [0,1]，从 detect_objects 的返回值中获取\n"
-        "- 用 get_status 确认当前位置和已发现物体数量\n"
-    )
-
-    agent = ToolCallingAgent(
-        tools=tool_list,
-        model=model,
-        instructions=instructions,
-        max_steps=50,
-    )
-    _EXP_AGENT_CACHE = agent
-    return agent
-
-# ---------------------------------------------------------------------------
-# UI — 先定义所有组件，最后统一绑定事件
-# ---------------------------------------------------------------------------
 

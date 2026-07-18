@@ -1,27 +1,21 @@
 {
   "vlm": {
-    "comment": "VLM 用于图像验证和 B 类场景探索 Agent（智谱 GLM-5V-Turbo OpenAI 兼容接口）",
+    "comment": "VLM 用于管线图像验证（智谱 GLM-5V-Turbo OpenAI 兼容接口）",
     "provider": "openai",
     "api_base": "https://open.bigmodel.cn/api/paas/v4",
     "model": "glm-5v-turbo",
     "api_key": ""
   },
-  "llm": {
-    "comment": "LLM 用于 AI Agent (OpenAI 兼容接口)",
-    "provider": "openai",
-    "api_base": "http://127.0.0.1:11434/v1",
-    "model": "qwen2.5:32b",
-    "api_key": "ollama"
-  },
   "revit_mcp": {
     "comment": "Revit MCP Server (stdio transport)",
     "command": "node",
-    "args": ["G:/TJ/BIM/mcp-servers-for-revit/server/build/index.js"]
+    "args": ["G:/TJ/BIM/mcp-servers-for-revit/server/build/index.js"],
+    "timeout": 120
   },
   "trellis": {
     "comment": "TRELLIS B类复杂构件 mesh 生成服务 (conda env: trellis)",
     "host": "127.0.0.1",
-    "port": 8391,
+    "port": 18391,
     "model": "microsoft/TRELLIS-image-large",
     "timeout": 1800
   },

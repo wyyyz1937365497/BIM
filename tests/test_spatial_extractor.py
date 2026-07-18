@@ -172,8 +172,14 @@ class TestExtractSpatial:
         mock = MagicMock()
         mock.render.return_value = RenderResult(
             colors=np.zeros((800, 800, 3), dtype=np.float32),
-            depth=np.zeros((800, 800), dtype=np.float32),
+            depth=np.full((800, 800), 2.5, dtype=np.float32),
             alpha=np.ones((800, 800), dtype=np.float32),
+        )
+        mock.find_free_position.side_effect = (
+            lambda target, direction, **_kwargs: (
+                np.asarray(target) + np.asarray(direction) * 2.5,
+                2.5,
+            )
         )
         return mock
 

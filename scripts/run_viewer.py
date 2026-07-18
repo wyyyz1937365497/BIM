@@ -1,6 +1,6 @@
-"""Launch the SceneSplat Mini Viewer (nerfview) on port 8081.
+"""Launch the SceneSplat Mini Viewer (nerfview) on port 18081.
 
-Also starts a camera-state HTTP endpoint on port 8082 via
+Also starts a camera-state HTTP endpoint on port 18082 via
 ``scripts/viewer_camera_patch.py`` (monkey-patches viser.ViserServer).
 
 This wrapper bypasses ``tools/mini_viewer.py`` and launches the patched
@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SCENESPLAT = ROOT / "SceneSplat"
 PATCH_SCRIPT = ROOT / "scripts" / "viewer_camera_patch.py"
 
-VIEWER_PORT = 8081
-CAMERA_PORT = 8082
+VIEWER_PORT = 18081
+CAMERA_PORT = 18082
 
 
 def _build_env() -> dict[str, str]:

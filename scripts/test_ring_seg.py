@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--img-size", type=int, default=768, help="Image size per view")
     parser.add_argument("--query", default="window", help="Falcon query text")
     parser.add_argument("--falcon-host", default="127.0.0.1")
-    parser.add_argument("--falcon-port", type=int, default=8390)
+    parser.add_argument("--falcon-port", type=int, default=18390)
     parser.add_argument("--no-falcon", action="store_true", help="Skip Falcon segmentation")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
     args = parser.parse_args()

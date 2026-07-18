@@ -73,7 +73,7 @@ def run_pipeline(
     elements: list[str] | None = None,
     use_falcon: bool = True,
     falcon_host: str = "127.0.0.1",
-    falcon_port: int = 8390,
+    falcon_port: int = 18390,
     skip_vlm: bool = False,
 ) -> Path:
     """Run the pipeline and return the output directory path.
@@ -113,7 +113,7 @@ def load_results(out_dir: Path) -> PipelineResults:
     """
     walls = json.loads((out_dir / "wall_lines_snapped.json").read_text("utf-8"))
     report = json.loads((out_dir / "pipeline_report.json").read_text("utf-8"))
-    coords = report.get("coords", {})
+    coords = report.get("coordinate_system", report.get("coords", {}))
 
     topdown = str(out_dir / "wall_lines_topdown.png")
 

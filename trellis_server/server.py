@@ -11,7 +11,7 @@ Usage::
 
     conda activate trellis
     cd G:\\TJ\\BIM
-    python trellis_server/server.py --port 8391
+    python trellis_server/server.py --port 18391
 
 Endpoints:
     GET  /health    — liveness check
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="microsoft/TRELLIS-image-large",
                         help="Model name or local path (e.g. G:/TJ/BIM/TRELLIS/TRELLIS-image-large)")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8391)
+    parser.add_argument("--port", type=int, default=18391)
     args = parser.parse_args()
 
     os.environ["TRELLIS_MODEL"] = args.model
