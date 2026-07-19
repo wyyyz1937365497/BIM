@@ -11,7 +11,7 @@ from workflows.events import Event, StartEvent, StopEvent
 from bim_recon.element_merger import clip_opening_to_wall
 from bim_recon.mcp_gateway import ToolGateway, response_items
 from bim_recon.pipeline_api import PipelineResults
-from bim_recon.wall_geometry import fit_short_corner_walls
+from bim_recon.wall_geometry import fit_short_corner_walls, merge_overlapping_walls
 from bim_recon.workflow_events import (
     WorkflowCompleted,
     WorkflowFailed,
@@ -78,6 +78,7 @@ class _RevitRuntime:
     floor_boundary: list[tuple[float, float]] = field(default_factory=list)
     valid_walls: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
     wall_by_source_index: dict[int, dict[str, Any]] = field(default_factory=dict)
+    wall_aliases: dict[int, int] = field(default_factory=dict)
 
 
 class RevitBuildWorkflow(Workflow):
@@ -110,13 +111,27 @@ class RevitBuildWorkflow(Workflow):
         self, ctx: Context, ev: StartEvent,
     ) -> _CreateLevel | StopEvent:
         rt = self.state
-        fitted_walls, source_indices = fit_short_corner_walls(rt.results.walls)
-        rt.valid_walls = [
-            (source_index, wall)
-            for source_index, wall in zip(source_indices, fitted_walls)
-            if _wall_length_m(wall) >= MIN_WALL_LENGTH_M
-        ]
-        rt.wall_by_source_index = dict(rt.valid_walls)
+        deduplicated_walls, source_groups = merge_overlapping_walls(
+            rt.results.walls,
+        )
+        fitted_walls, deduplicated_indices = fit_short_corner_walls(
+            deduplicated_walls,
+        )
+        rt.valid_walls = []
+        rt.wall_by_source_index = {}
+        rt.wall_aliases = {}
+        for deduplicated_index, wall in zip(
+            deduplicated_indices,
+            fitted_walls,
+        ):
+            if _wall_length_m(wall) < MIN_WALL_LENGTH_M:
+                continue
+            original_indices = source_groups[deduplicated_index]
+            representative_index = original_indices[0]
+            rt.valid_walls.append((representative_index, wall))
+            for source_index in original_indices:
+                rt.wall_aliases[source_index] = representative_index
+                rt.wall_by_source_index[source_index] = wall
         if not rt.valid_walls:
             message = "No non-degenerate reconstructed walls are available for Revit creation"
             ctx.write_event_to_stream(WorkflowFailed(
@@ -125,7 +140,14 @@ class RevitBuildWorkflow(Workflow):
                 message=message,
             ))
             return StopEvent(result={"error": message})
-        fitted_count = len(rt.results.walls) - len(fitted_walls)
+        deduplicated_count = len(rt.results.walls) - len(deduplicated_walls)
+        if deduplicated_count:
+            self._emit(
+                ctx,
+                "prepare",
+                f"Merged {deduplicated_count} overlapping wall segments",
+            )
+        fitted_count = len(deduplicated_walls) - len(fitted_walls)
         if fitted_count:
             self._emit(
                 ctx,
@@ -139,7 +161,9 @@ class RevitBuildWorkflow(Workflow):
                 stage="prepare",
                 message=f"Skipped {skipped} unresolved short wall segments",
             ))
-        rt.floor_boundary = _ordered_boundary(fitted_walls)
+        rt.floor_boundary = _ordered_boundary(
+            [wall for _source_index, wall in rt.valid_walls],
+        )
         confirmed = [element for element in rt.results.elements if element.confirmed]
         self._emit(
             ctx,
@@ -265,6 +289,10 @@ class RevitBuildWorkflow(Workflow):
         wall_ids = _extract_element_ids(payload)
         rt.created["walls"] = wall_ids
         rt.wall_id_by_index = dict(zip(source_indices, wall_ids))
+        for source_index, representative_index in rt.wall_aliases.items():
+            wall_id = rt.wall_id_by_index.get(representative_index)
+            if wall_id is not None:
+                rt.wall_id_by_index[source_index] = wall_id
         if len(wall_ids) != len(walls):
             ctx.write_event_to_stream(WorkflowWarning(
                 workflow=self.workflow_name,
@@ -280,6 +308,7 @@ class RevitBuildWorkflow(Workflow):
     async def create_openings(
         self, ctx: Context, ev: _CreateOpenings,
     ) -> _VerifyCreated:
+        """Place hosted families; Revit cuts their host walls automatically."""
         rt = self.state
         options = rt.options
         by_category: dict[str, list[dict[str, Any]]] = {
@@ -313,13 +342,7 @@ class RevitBuildWorkflow(Workflow):
                 )
             )
             desired_width_m = max(detected_width, width_default / 1000.0)
-            (
-                opening_x,
-                opening_y,
-                clipped_width_m,
-                _opening_start,
-                _opening_end,
-            ) = clip_opening_to_wall(
+            opening_x, opening_y, clipped_width_m, _, _ = clip_opening_to_wall(
                 element.world_x,
                 element.world_y,
                 desired_width_m,
@@ -335,9 +358,6 @@ class RevitBuildWorkflow(Workflow):
                     ),
                 ))
                 continue
-            width = clipped_width_m * 1000.0
-            height = max(detected_height * 1000.0, height_default)
-            base_offset = 0.0 if is_door else max(sill_height * 1000.0, 0.0)
             by_category[key].append({
                 "name": f"Reconstructed {element.element_class} {index + 1}",
                 "typeId": options.door_type_id if is_door else options.window_type_id,
@@ -346,10 +366,12 @@ class RevitBuildWorkflow(Workflow):
                     "y": opening_y * 1000.0 + options.offset_y,
                     "z": options.level_elevation,
                 },
-                "width": width,
-                "height": height,
+                "width": clipped_width_m * 1000.0,
+                "height": max(detected_height * 1000.0, height_default),
                 "baseLevel": options.level_elevation,
-                "baseOffset": base_offset,
+                "baseOffset": (
+                    0.0 if is_door else max(sill_height * 1000.0, 0.0)
+                ),
                 "hostWallId": rt.wall_id_by_index[element.wall_idx],
             })
         for key in ("doors", "windows"):
@@ -404,8 +426,6 @@ class RevitBuildWorkflow(Workflow):
             result=result,
         ))
         return StopEvent(result=result)
-
-
 def _extract_element_ids(value: Any) -> list[int]:
     """Collect element IDs from Revit response envelopes without guessing order."""
     ids: list[int] = []

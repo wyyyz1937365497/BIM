@@ -28,7 +28,7 @@ from bim_recon.gradio_helpers import (
     SCENESPLAT, _SCENE_CACHE, _FALCON_CACHE,
     validate_ply, check_preprocess_status, list_available_scenes,
     find_latest_output, list_available_results, _result_dir_from_label,
-    _prepare_results, run_pipeline_direct, load_results_cb,
+    _prepare_results, run_pipeline_direct, load_results_cb, clean_wall_overlaps_cb,
     _find_element, update_interactive_radar, draw_bbox_on_image,
     on_element_select, on_mask_apply, fetch_camera_state, launch_scene_viewer,
     _get_scene, _get_falcon, _mask_bbox_to_wall_coords,
@@ -103,6 +103,7 @@ def build_app() -> gr.Blocks:
             )
             refresh_results_btn = gr.Button("🔄", scale=1)
             load_btn = gr.Button("📥 加载结果", variant="secondary", scale=1)
+            clean_walls_btn = gr.Button("🧹 清理重叠墙", scale=1)
 
         # ====== ③ 检测结果（按管线流程顺序展示） ======
         gr.Markdown("---\n## ③ 检测结果")
@@ -438,6 +439,14 @@ def build_app() -> gr.Blocks:
 
         load_btn.click(
             fn=_on_load,
+            inputs=[scene_state, results_dropdown],
+            outputs=[results_state, summary_md, vlm_gallery,
+                      radar_gallery, report_json, vlm_review_cbs, elem_sel],
+        )
+        clean_walls_btn.click(
+            fn=lambda scene_name, result_label: clean_wall_overlaps_cb(
+                _result_dir_from_label(scene_name, result_label)
+            ),
             inputs=[scene_state, results_dropdown],
             outputs=[results_state, summary_md, vlm_gallery,
                       radar_gallery, report_json, vlm_review_cbs, elem_sel],

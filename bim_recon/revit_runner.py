@@ -31,6 +31,7 @@ Two usage modes:
             width_ft,               # double (feet)
             height_ft,              # double (feet)
             False,                  # facingFlipped
+            base_door_type_id,      # optional FamilySymbol ID
         ])
 
 The runner delegates actual code execution to the MCP tool; it does NOT
@@ -181,9 +182,10 @@ class RevitScriptRunner:
         width_m: float,
         height_m: float,
         facing_flipped: bool = False,
+        base_type_id: int | None = None,
     ) -> Dict[str, Any]:
         """Create a custom-sized door (metric units)."""
-        return self.run("create_custom_door", parameters=[
+        parameters: list[Any] = [
             host_wall_id,
             m_to_ft(x_m),
             m_to_ft(y_m),
@@ -191,7 +193,10 @@ class RevitScriptRunner:
             m_to_ft(width_m),
             m_to_ft(height_m),
             facing_flipped,
-        ])
+        ]
+        if base_type_id is not None:
+            parameters.append(base_type_id)
+        return self.run("create_custom_door", parameters=parameters)
 
     def create_window(
         self,
@@ -202,9 +207,10 @@ class RevitScriptRunner:
         width_m: float,
         height_m: float,
         facing_flipped: bool = False,
+        base_type_id: int | None = None,
     ) -> Dict[str, Any]:
         """Create a custom-sized window (metric units)."""
-        return self.run("create_custom_window", parameters=[
+        parameters: list[Any] = [
             host_wall_id,
             m_to_ft(x_m),
             m_to_ft(y_m),
@@ -212,7 +218,10 @@ class RevitScriptRunner:
             m_to_ft(width_m),
             m_to_ft(height_m),
             facing_flipped,
-        ])
+        ]
+        if base_type_id is not None:
+            parameters.append(base_type_id)
+        return self.run("create_custom_window", parameters=parameters)
 
     def query_family_types(self, category: str = "OST_Doors") -> Dict[str, Any]:
         """List all family types for a category."""

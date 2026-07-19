@@ -38,6 +38,7 @@ result = runner.run("create_custom_door", parameters=[
     3.0,          # width (feet)
     7.0,          # height (feet)
     false,        # facingFlipped
+    94654,        # base door FamilySymbol ID (optional)
 ])
 ```
 
@@ -83,3 +84,6 @@ Conversion: `1 m = 3.28084 ft`, `1 mm = 1/304.8 ft`.
 | `create_custom_window.cs` | Create a window with custom width/height/sill |
 | `create_walls_from_json.cs` | Batch create walls from pipeline JSON |
 | `delete_elements_by_category.cs` | Delete all elements of a category |
+
+The custom door/window scripts cut `Opening` geometry in the host wall before
+placing the hosted family.

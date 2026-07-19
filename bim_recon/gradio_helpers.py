@@ -43,6 +43,7 @@ from bim_recon.pipeline_api import (
     remap_from_json,
     save_review_results,
 )
+from bim_recon.wall_cleanup import clean_saved_wall_list
 from bim_recon.config import load_config
 
 SCENESPLAT = ROOT / "SceneSplat"
@@ -423,6 +424,34 @@ def load_results_cb(out_dir: str):
     result = _prepare_results(res)
     logger.info(f"结果准备完成，返回给 UI")
     return result
+
+
+def clean_wall_overlaps_cb(out_dir: str):
+    """清理输出目录中的重叠墙，然后重新加载结果。返回 7 个值。"""
+    logger.info(f"清理重叠墙回调: out_dir={out_dir}")
+    if not out_dir or not Path(out_dir).exists():
+        logger.warning(f"输出目录不存在: {out_dir}")
+        return None, "无结果", [], [], None, gr.update(choices=[]), gr.update(choices=[])
+    try:
+        summary = clean_saved_wall_list(out_dir)
+        logger.info(
+            "清理重叠墙完成: 输入 %d, 移除 %d, 输出 %d, 重写 %d 个文件",
+            summary["input_walls"], summary.get("removed_walls", 0),
+            summary["output_walls"], summary.get("rewritten_files", 0),
+        )
+    except Exception as exc:
+        logger.error(f"清理重叠墙失败: {exc}", exc_info=True)
+        return None, f"❌ 清理失败: {exc}", [], [], None, gr.update(choices=[]), gr.update(choices=[])
+    loaded = list(load_results_cb(out_dir))
+    removed = summary.get("removed_walls", 0)
+    if removed:
+        loaded[1] = (
+            f"🧹 已移除 {removed} 面重叠墙"
+            f"（{summary['input_walls']} → {summary['output_walls']}）"
+        )
+    elif isinstance(loaded[1], str):
+        loaded[1] = "无重叠墙需要清理"
+    return tuple(loaded)
 
 
 # ---------------------------------------------------------------------------

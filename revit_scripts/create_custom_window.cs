@@ -9,7 +9,8 @@
 // @param parameters[4] (double) width        - Window width (feet)
 // @param parameters[5] (double) height       - Window height (feet)
 // @param parameters[6] (bool)   facingFlipped - Flip facing (optional, default false)
-// @returns { elementId, typeName, width_mm, height_mm, sill_mm }
+// @param parameters[7] (long)   typeId - Base window FamilySymbol ID (optional)
+// @returns { elementId, openingId, typeName, width_mm, height_mm, sill_mm }
 //
 // Usage:
 //   revit_send_code_to_revit(code=<this file>, parameters=[337596, 5.0, 3.0, 3.3, 3.0, 4.0, false])
@@ -22,23 +23,29 @@ double sillHeight = Convert.ToDouble(parameters[3]);
 double widthFt = Convert.ToDouble(parameters[4]);
 double heightFt = Convert.ToDouble(parameters[5]);
 bool facingFlipped = parameters.Length > 6 && Convert.ToBoolean(parameters[6]);
+long requestedTypeId = parameters.Length > 7 ? Convert.ToInt64(parameters[7]) : -1L;
 
 // --- Find host wall ---
 Element hostElem = document.GetElement(new ElementId(hostWallId));
 if (!(hostElem is Wall hostWall))
     return new { error = $"hostWallId {hostWallId} is not a Wall" };
 
-// --- Find base window FamilySymbol ---
-FamilySymbol baseSymbol = new FilteredElementCollector(document)
-    .OfClass(typeof(FamilySymbol))
-    .OfCategory(BuiltInCategory.OST_Windows)
-    .Cast<FamilySymbol>()
-    .FirstOrDefault(s => s.IsActive) ?? new FilteredElementCollector(document)
-    .OfClass(typeof(FamilySymbol))
-    .OfCategory(BuiltInCategory.OST_Windows)
-    .Cast<FamilySymbol>()
-    .FirstOrDefault();
-
+// --- Find the requested base window FamilySymbol, with an active-type fallback ---
+FamilySymbol baseSymbol = requestedTypeId > 0
+    ? document.GetElement(new ElementId(requestedTypeId)) as FamilySymbol
+    : null;
+if (baseSymbol == null || baseSymbol.Category.Id.Value != (long)BuiltInCategory.OST_Windows)
+{
+    baseSymbol = new FilteredElementCollector(document)
+        .OfClass(typeof(FamilySymbol))
+        .OfCategory(BuiltInCategory.OST_Windows)
+        .Cast<FamilySymbol>()
+        .FirstOrDefault(s => s.IsActive) ?? new FilteredElementCollector(document)
+        .OfClass(typeof(FamilySymbol))
+        .OfCategory(BuiltInCategory.OST_Windows)
+        .Cast<FamilySymbol>()
+        .FirstOrDefault();
+}
 if (baseSymbol == null)
     return new { error = "No window family types found in project" };
 
@@ -82,9 +89,34 @@ if (level == null)
         .FirstOrDefault();
 }
 
-// --- Create family instance ---
-var location = new XYZ(locX, locY, level.Elevation + sillHeight);
+// --- Cut the physical wall opening before placing the hosted family ---
+LocationCurve hostCurve = hostWall.Location as LocationCurve;
+if (hostCurve == null)
+    return new { error = "Host wall has no location curve" };
+IntersectionResult projection = hostCurve.Curve.Project(
+    new XYZ(locX, locY, level.Elevation)
+);
+if (projection == null)
+    return new { error = "Failed to project window location onto host wall" };
+XYZ center = projection.XYZPoint;
+XYZ direction = (
+    hostCurve.Curve.GetEndPoint(1) - hostCurve.Curve.GetEndPoint(0)
+).Normalize();
+XYZ lowerLeft = new XYZ(
+    center.X - direction.X * widthFt / 2.0,
+    center.Y - direction.Y * widthFt / 2.0,
+    level.Elevation + sillHeight
+);
+XYZ upperRight = new XYZ(
+    center.X + direction.X * widthFt / 2.0,
+    center.Y + direction.Y * widthFt / 2.0,
+    level.Elevation + sillHeight + heightFt
+);
+Opening opening = document.Create.NewOpening(hostWall, lowerLeft, upperRight);
+document.Regenerate();
 
+// --- Create the hosted family inside that opening ---
+var location = new XYZ(center.X, center.Y, level.Elevation + sillHeight);
 var instance = document.Create.NewFamilyInstance(
     location,
     customSymbol,
@@ -96,7 +128,7 @@ if (instance == null)
     return new { error = "Failed to create window instance" };
 
 // --- Set sill height ---
-var sillParam = instance.get_Parameter(BuiltInParameter.WINDOW_SILL_HEIGHT_PARAM)
+var sillParam = instance.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM)
              ?? instance.LookupParameter("Sill Height");
 if (sillParam != null && !sillParam.IsReadOnly)
     sillParam.Set(sillHeight);
@@ -107,8 +139,9 @@ if (facingFlipped)
 
 return new
 {
-    elementId = instance(long)instance.Id.Value,
-    typeId = customSymbol(long)instance.Id.Value,
+    elementId = instance.Id.Value,
+    openingId = opening.Id.Value,
+    typeId = customSymbol.Id.Value,
     typeName = typeName,
     width_mm = widthMm,
     height_mm = heightMm,

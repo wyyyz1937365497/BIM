@@ -23,6 +23,7 @@ from bim_recon.revit_workflow import (
     REWRITE_SOLID_200MM_WALL_TYPE_ID,
     RevitBuildWorkflow,
 )
+from bim_recon.revit_runner import RevitScriptRunner
 from bim_recon.trellis_client import TrellisMeshResult
 from bim_recon.trellis_workflow import (
     ApprovedMeshObject,
@@ -78,6 +79,7 @@ class _FakeGateway:
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
         self.created_ids: list[int] = []
+        self._next_script_id = 401
 
     async def call_tool(self, name: str, arguments: dict):
         self.calls.append((name, arguments))
@@ -93,7 +95,10 @@ class _FakeGateway:
         elif name == "get_current_view_elements":
             ids = self.created_ids
         elif name == "send_code_to_revit":
-            return {"success": True, "result": {"elementId": 401}}
+            ids = [self._next_script_id]
+            self._next_script_id += 1
+            self.created_ids.extend(ids)
+            return {"success": True, "result": json.dumps({"elementId": ids[0]})}
         else:
             raise AssertionError(name)
         if name != "get_current_view_elements":
@@ -235,7 +240,7 @@ def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path)
     assert opening_calls[1]["data"][0]["hostWallId"] == 102
     assert completed.result["missing_ids"] == []
     assert completed.result["created"]["doors"] == [201]
-
+    assert completed.result["created"]["windows"] == [301]
 
     import orjson
 
@@ -246,6 +251,30 @@ def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path)
         "2": 103,
         "3": 104,
     }
+
+
+def test_revit_workflow_deduplicates_overlapping_walls_and_keeps_hosts(tmp_path):
+    results = _sample_results(tmp_path)
+    results.walls.append({
+        "x1": 0.02, "y1": 0.01, "x2": 4.02, "y2": 0.01, "length": 4.0,
+    })
+    gateway = _FakeGateway()
+
+    list(stream_workflow_sync(RevitBuildWorkflow(results, gateway)))
+
+    wall_call = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_line_based_element"
+    )
+    opening_calls = [
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_point_based_element"
+    ]
+    assert len(wall_call["data"]) == 4
+    assert opening_calls[0]["data"][0]["hostWallId"] == 101
+    assert opening_calls[1]["data"][0]["hostWallId"] == 102
 
 
 def test_review_selection_limits_revit_creation_to_three_of_six(tmp_path):
@@ -319,6 +348,23 @@ def test_revit_workflow_clips_opening_to_host_wall_endpoint(tmp_path):
     assert payload["locationPoint"]["x"] == pytest.approx(3675.0)
     assert payload["locationPoint"]["y"] == pytest.approx(0.0)
     assert payload["width"] == pytest.approx(650.0)
+
+def test_revit_script_runner_passes_optional_base_type_id():
+    calls: list[dict] = []
+    runner = RevitScriptRunner(mcp_sender=lambda **kwargs: calls.append(kwargs) or {})
+
+    runner.create_door(
+        host_wall_id=101,
+        x_m=1.0,
+        y_m=2.0,
+        sill_m=0.0,
+        width_m=0.9,
+        height_m=2.0,
+        base_type_id=94654,
+    )
+
+    assert calls[0]["parameters"][0] == 101
+    assert calls[0]["parameters"][7] == 94654
 
 
 def test_wall_snapping_never_collapses_endpoints_of_the_same_wall():
