@@ -280,21 +280,24 @@ def build_app() -> gr.Blocks:
                 "**步骤：**\n"
                 "1. 在独立查看器中漫游到目标物体\n"
                 "2. 点击「捕获视角并渲染」\n"
-                "3. 用画笔在渲染图上**粗略框选**目标物体（不必精确）\n"
+                "3. 拖动下方四个滑块，在预览图中用红框框住目标物体\n"
                 "4. 点击「🔍 VLM识别 + Falcon分割」— VLM 自动识别物体，Falcon 生成精确遮罩\n"
                 "5. 确认抠图后点击「生成 Mesh」"
             )
-            with gr.Row():
-                bmesh_cam_btn = gr.Button("捕获视角并渲染", variant="secondary")
+            bmesh_cam_btn = gr.Button("捕获视角并渲染", variant="secondary")
             bmesh_cam_status = gr.Markdown("需先从独立查看器捕获视角")
-            bmesh_mask_editor = gr.ImageMask(
-                label="渲染图（用画笔粗略框选目标物体）",
-                type="numpy", height=400, layers=False,
-                brush=gr.Brush(
-                    colors=["#FF0000"], default_size=50, color_mode="fixed",
-                ),
-                transforms=[], sources=[],
+            bmesh_render_display = gr.Image(
+                label="渲染图", height=400, interactive=False,
             )
+            bmesh_bbox_preview = gr.Image(
+                label="框选预览（红框 = 选中区域）", height=400, interactive=False,
+            )
+            with gr.Row():
+                bbox_left = gr.Slider(0, 100, 10, step=0.5, label="左边界 (%)")
+                bbox_top = gr.Slider(0, 100, 10, step=0.5, label="上边界 (%)")
+            with gr.Row():
+                bbox_right = gr.Slider(0, 100, 90, step=0.5, label="右边界 (%)")
+                bbox_bottom = gr.Slider(0, 100, 90, step=0.5, label="下边界 (%)")
             with gr.Row():
                 bmesh_seed_manual = gr.Number(
                     label="种子", value=1, precision=0,
@@ -313,7 +316,8 @@ def build_app() -> gr.Blocks:
             )
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
-            bmesh_cutout_state = gr.State(None)  # stores the RGBA cutout path
+            bmesh_cutout_state = gr.State(None)
+            bmesh_render_state = gr.State(None)
 
         # ====== ⑥ 独立 3D 查看器 ======
         gr.Markdown(
@@ -833,14 +837,14 @@ def build_app() -> gr.Blocks:
         def _on_bmesh_capture(scene_name: str, viewer_session: dict):
             """Capture a camera from the manager-assigned viewer and render it."""
             if not scene_name:
-                return None, "❌ 请先选择场景"
+                return None, None, "❌ 请先选择场景"
             status, cam_data = fetch_camera_state(viewer_session)
             if not cam_data:
-                return None, status
+                return None, None, status
 
             scene = _get_scene(scene_name)
             if scene is None:
-                return None, f"❌ 无法加载场景 {scene_name}"
+                return None, None, f"❌ 无法加载场景 {scene_name}"
 
             cam = cam_data
             eye = cam.get("position", [0, 0, 0])
@@ -857,18 +861,53 @@ def build_app() -> gr.Blocks:
             render_result = scene.render(pose, width=800, height=600, fov_degrees=fov)
             render_arr = (render_result.colors * 255).clip(0, 255).astype(np.uint8)
 
-            return render_arr, f"✅ 渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
+            preview = _draw_bbox_overlay(render_arr, 10, 10, 90, 90)
+            return render_arr, preview, render_arr, f"✅ 渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
 
         bmesh_cam_btn.click(
             fn=_on_bmesh_capture,
             inputs=[scene_state, viewer_state],
-            outputs=[bmesh_mask_editor, bmesh_cam_status],
+            outputs=[bmesh_render_state, bmesh_bbox_preview, bmesh_render_display, bmesh_cam_status],
         )
 
-        def _on_bmesh_identify(mask_editor_val, scene_name: str):
-            """Rough-bbox → VLM classify → Falcon segment → clean RGBA cutout."""
+        def _draw_bbox_overlay(render_arr, left_pct, top_pct, right_pct, bottom_pct):
+            """Draw a red rectangle on the render at the given percentage coordinates."""
+            if render_arr is None:
+                return None
+            from PIL import Image as PILImage, ImageDraw
+            overlay = PILImage.fromarray(render_arr.copy())
+            h, w = render_arr.shape[:2]
+            x0 = int(left_pct / 100 * w)
+            y0 = int(top_pct / 100 * h)
+            x1 = int(right_pct / 100 * w)
+            y1 = int(bottom_pct / 100 * h)
+            ImageDraw.Draw(overlay).rectangle([x0, y0, x1, y1], outline=(255, 0, 0), width=4)
+            return np.array(overlay)
+
+        def _on_bbox_slider_change(render_arr, left, top, right, bottom):
+            return _draw_bbox_overlay(render_arr, left, top, right, bottom)
+
+        for slider in (bbox_left, bbox_top, bbox_right, bbox_bottom):
+            slider.change(
+                fn=_on_bbox_slider_change,
+                inputs=[bmesh_render_state, bbox_left, bbox_top, bbox_right, bbox_bottom],
+                outputs=bmesh_bbox_preview,
+            )
+
+        def _on_bmesh_identify(render_arr, left, top, right, bottom, scene_name: str):
+            """Slider-bbox → VLM classify → Falcon segment → clean RGBA cutout."""
             from bim_recon.bmesh_extractor import classify_and_segment
             from bim_recon.vlm_verifier import query_vlm
+
+            if render_arr is None:
+                return "", None, None, None, "⚠️ 请先点击「捕获视角并渲染」"
+            h, w = render_arr.shape[:2]
+            bbox = (
+                int(left / 100 * w), int(top / 100 * h),
+                int(right / 100 * w), int(bottom / 100 * h),
+            )
+            if bbox[2] - bbox[0] < 10 or bbox[3] - bbox[1] < 10:
+                return "", None, None, None, "⚠️ 框选区域太小，请调整滑块"
 
             cfg = load_config()
             falcon = _get_falcon()
@@ -877,10 +916,10 @@ def build_app() -> gr.Blocks:
                 return query_vlm(
                     image_path, prompt,
                     cfg.vlm.api_base, cfg.vlm.model, cfg.vlm.api_key,
-                    timeout=30, max_tokens=60,
+                    timeout=30, max_tokens=80,
                 )
 
-            result = classify_and_segment(mask_editor_val, vlm_caller, falcon)
+            result = classify_and_segment(render_arr, bbox, vlm_caller, falcon)
 
             cutout_path = None
             cutout_preview = None
@@ -892,16 +931,16 @@ def build_app() -> gr.Blocks:
                 cutout_preview = np.array(result.cutout)
 
             return (
-                result.label,                          # bmesh_identified_label
-                result.overlay,                        # bmesh_segmentation_preview
-                cutout_preview,                        # bmesh_manual_preview
-                cutout_path,                           # bmesh_cutout_state
-                result.detail,                         # bmesh_cam_status
+                result.label,
+                result.overlay,
+                cutout_preview,
+                cutout_path,
+                result.detail,
             )
 
         bmesh_identify_btn.click(
             fn=_on_bmesh_identify,
-            inputs=[bmesh_mask_editor, scene_state],
+            inputs=[bmesh_render_state, bbox_left, bbox_top, bbox_right, bbox_bottom, scene_state],
             outputs=[
                 bmesh_identified_label, bmesh_segmentation_preview,
                 bmesh_manual_preview, bmesh_cutout_state, bmesh_cam_status,

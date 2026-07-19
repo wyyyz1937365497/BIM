@@ -191,7 +191,11 @@ def query_vlm(
     import io as _io
     img = _PIL.open(image_path)
     if max(img.size) > 768:
-        img = img.resize((768, 768), _PIL.LANCZOS)
+        scale = 768 / max(img.size)
+        img = img.resize(
+            (int(img.size[0] * scale), int(img.size[1] * scale)),
+            _PIL.LANCZOS,
+        )
     buf = _io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     img_b64 = base64.b64encode(buf.getvalue()).decode()

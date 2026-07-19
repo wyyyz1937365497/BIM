@@ -218,49 +218,42 @@ def _draw_segmentation_overlay(
 
 
 def classify_and_segment(
-    mask_editor_value: dict[str, Any] | None,
+    base_rgb: np.ndarray | None,
+    user_bbox: tuple[int, int, int, int] | None,
     vlm_caller,
     falcon_client,
     *,
     vlm_prompt: str = (
-        "Look at the object inside the red rectangle. "
-        "Write a concise referring expression that uniquely identifies "
-        "this exact object for a segmentation model. Include the object "
-        "type plus 1-2 distinguishing features (color, position relative "
-        "to other objects, material). "
-        "Examples: 'the blue office chair on the left', "
-        "'the white ceramic vase on the wooden shelf'. "
-        "Reply with ONLY the expression, no other words."
+        "请看图片中红色方框内的物体，用英文写一个简短的指代短语来描述这个物体。"
+        "需要包含物体种类和1-2个区分特征（颜色、位置、材质等）。"
+        "例如：the blue chair on the left, the white vase on the table。"
+        "只回答这个短语即可。"
     ),
 ) -> ExtractionResult:
     """Run the full classify → segment → cutout pipeline.
 
     Parameters
     ----------
-    mask_editor_value
-        The dict emitted by Gradio's ``ImageMask`` component. Must contain a
-        painted layer and a background image.
+    base_rgb
+        Rendered scene as an ``(H, W, 3)`` uint8 numpy array.
+    user_bbox
+        ``(x0, y0, x1, y1)`` pixel coordinates of the user's selection.
     vlm_caller
         Callable ``(image_path: str, prompt: str) -> str`` that sends the
-        annotated image to a VLM and returns its text reply. The Gradio
-        callback injects :func:`bim_recon.vlm_verifier.query_vlm` with the
-        configured endpoint.
+        annotated image to a VLM and returns its text reply.
     falcon_client
-        ``FalconClient`` (or compatible) with a ``segment(image, query)``
-        method returning a list of detections.
+        ``FalconClient`` (or compatible) with ``segment(image, query)``.
 
     Returns
     -------
     ExtractionResult
-        ``label`` is always set (may be empty on VLM failure). ``cutout`` and
-        ``overlay`` are ``None`` when the pipeline cannot complete. ``detail``
-        is a user-facing status string.
+        ``label`` is always set (may be empty on VLM failure). ``cutout``
+        and ``overlay`` are ``None`` when the pipeline cannot complete.
     """
-    extracted = _extract_user_bbox(mask_editor_value)
-    if extracted is None:
-        return ExtractionResult("", None, None, "⚠️ 请先在渲染图上用画笔粗略框选目标物体")
-    base_rgb, bbox = extracted
+    if base_rgb is None or user_bbox is None:
+        return ExtractionResult("", None, None, "⚠️ 请先捕获视角并框选目标物体")
     h_img, w_img = base_rgb.shape[:2]
+    bbox = user_bbox
 
     annotated = _annotate_bbox(base_rgb, bbox)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -303,3 +296,16 @@ def classify_and_segment(
         label, cutout, overlay,
         f"✅ 识别为「{label}」，Falcon 分割覆盖 {area_pct}% 画面",
     )
+
+
+def classify_and_segment_from_mask_editor(
+    mask_editor_value: dict[str, Any] | None,
+    vlm_caller,
+    falcon_client,
+) -> ExtractionResult:
+    """Backward-compatible wrapper that extracts bbox from a Gradio ImageMask dict."""
+    extracted = _extract_user_bbox(mask_editor_value)
+    if extracted is None:
+        return ExtractionResult("", None, None, "⚠️ 请先在渲染图上框选目标物体")
+    base_rgb, bbox = extracted
+    return classify_and_segment(base_rgb, bbox, vlm_caller, falcon_client)

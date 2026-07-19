@@ -70,7 +70,8 @@ def test_select_detection_picks_centroid_nearest_user_bbox():
 
 
 def test_classify_and_segment_runs_full_pipeline_with_fakes():
-    editor = _editor_dict((50, 40, 120, 100), img_size=(200, 160))
+    base_rgb = np.zeros((160, 200, 3), dtype=np.uint8)
+    bbox = (50, 40, 120, 100)
     falcon_calls: list[str] = []
 
     def fake_vlm(image_path: str, prompt: str) -> str:
@@ -84,7 +85,7 @@ def test_classify_and_segment_runs_full_pipeline_with_fakes():
                 _fake_detection(0.8, 0.8, area=0.05),
             ]
 
-    result = classify_and_segment(editor, fake_vlm, FakeFalcon())
+    result = classify_and_segment(base_rgb, bbox, fake_vlm, FakeFalcon())
 
     assert isinstance(result, ExtractionResult)
     assert result.label == "the brown wooden chair on the left"
@@ -96,20 +97,16 @@ def test_classify_and_segment_runs_full_pipeline_with_fakes():
 
 
 def test_classify_and_segment_reports_when_user_drew_nothing():
-    result = classify_and_segment(
-        {"background": np.zeros((10, 10, 3), np.uint8), "layers": []},
-        lambda *_: "chair",
-        None,
-    )
+    result = classify_and_segment(None, None, lambda *_: "chair", None)
     assert result.label == ""
     assert result.cutout is None
     assert "框选" in result.detail
 
 
 def test_classify_and_segment_reports_when_falcon_finds_nothing():
-    editor = _editor_dict((50, 40, 120, 100))
+    base_rgb = np.zeros((160, 200, 3), dtype=np.uint8)
     result = classify_and_segment(
-        editor,
+        base_rgb, (50, 40, 120, 100),
         lambda *_: "lamp",
         type("F", (), {"segment": lambda self, *a, **k: []})(),
     )
