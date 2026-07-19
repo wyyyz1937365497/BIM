@@ -830,7 +830,7 @@ def resegment_from_viewpoint(
     hfov_rad = 2.0 * np.arctan(np.tan(vfov_rad / 2.0) * aspect)
     hfov_deg = float(np.degrees(hfov_rad))
 
-    img_w, img_h = 800, 600
+    img_w, img_h = 2048, 1536
 
     # 1. Load scene & render
     try:
