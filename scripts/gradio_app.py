@@ -30,7 +30,7 @@ from bim_recon.gradio_helpers import (
     find_latest_output, list_available_results, _result_dir_from_label,
     _prepare_results, run_pipeline_direct, load_results_cb,
     _find_element, update_interactive_radar, draw_bbox_on_image,
-    on_element_select, on_mask_apply, fetch_camera_state,
+    on_element_select, on_mask_apply, fetch_camera_state, launch_scene_viewer,
     _get_scene, _get_falcon, _mask_bbox_to_wall_coords,
     resegment_from_viewpoint, apply_vlm_review,
 )
@@ -301,11 +301,15 @@ def build_app() -> gr.Blocks:
         # ====== ⑥ 独立 3D 查看器 ======
         gr.Markdown(
             "---\n## ⑥ 独立 3D 查看器\n\n"
-            "运行管线时，Viewer Manager 会接收场景及项目相对路径，"
-            "在后台启动查看器并返回分配的端口。"
+            "完成第 ① 步 SceneSplat 预处理后，可为当前场景异步启动独立查看器。"
+        )
+        viewer_start_btn = gr.Button(
+            "启动当前场景的 3D 查看器",
+            variant="primary",
+            interactive=False,
         )
         viewer_panel_html = gr.HTML(
-            "<div>查看器将在运行管线时由 Viewer Manager 异步启动。</div>",
+            "<div>请选择已完成第 ① 步处理的场景。</div>",
         )
 
         # ====== 事件绑定 ======
@@ -373,6 +377,33 @@ def build_app() -> gr.Blocks:
             fn=lambda s: gr.update(choices=list_available_results(s), value=""),
             inputs=scene_state, outputs=results_dropdown,
         )
+
+        def _viewer_launch_availability(scene_name: str):
+            ready = bool(scene_name) and all(
+                check_preprocess_status(scene_name).values()
+            )
+            if ready:
+                return (
+                    gr.update(interactive=True),
+                    {},
+                    "<div>场景已完成第 ① 步处理，可启动独立查看器。</div>",
+                )
+            return (
+                gr.update(interactive=False),
+                {},
+                "<div>请先选择并完成第 ① 步 SceneSplat 预处理。</div>",
+            )
+
+        scene_state.change(
+            fn=_viewer_launch_availability,
+            inputs=scene_state,
+            outputs=[viewer_start_btn, viewer_state, viewer_panel_html],
+        )
+        viewer_start_btn.click(
+            fn=launch_scene_viewer,
+            inputs=scene_state,
+            outputs=[viewer_state, viewer_panel_html],
+        )
         scene_dropdown.change(fn=lambda s: s, inputs=scene_dropdown, outputs=scene_state)
         refresh_scenes_btn.click(
             fn=lambda: gr.update(choices=list_available_scenes()),
@@ -384,7 +415,10 @@ def build_app() -> gr.Blocks:
         )
         run_btn.click(
             fn=run_pipeline_direct,
-            inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
+            inputs=[
+                scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm,
+                viewer_state,
+            ],
             outputs=[console_out, out_dir_box, results_state, summary_md,
                      radar_gallery, vlm_gallery, report_json,
                      vlm_review_cbs, elem_sel, viewer_state, viewer_panel_html],

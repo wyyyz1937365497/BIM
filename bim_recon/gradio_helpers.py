@@ -183,6 +183,39 @@ def start_viewer_for_scene(scene_name: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Scene-bound viewer launch
+# ---------------------------------------------------------------------------
+def launch_scene_viewer(scene_name: str) -> tuple[dict[str, Any], str]:
+    """Launch a viewer only after SceneSplat preprocessing made it renderable."""
+    if not scene_name:
+        session = {"status": "unavailable", "error": "请先选择场景"}
+        return session, viewer_panel(session)
+    readiness = check_preprocess_status(scene_name)
+    if not readiness["preprocessed_exists"] or not readiness["feat_pt_exists"]:
+        session = {
+            "status": "unavailable",
+            "error": "该场景尚未完成第 ① 步 SceneSplat 预处理",
+        }
+        return session, viewer_panel(session)
+    session = start_viewer_for_scene(scene_name)
+    return session, viewer_panel(session)
+
+
+def ensure_scene_viewer(
+    scene_name: str,
+    viewer_session: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str]:
+    """Keep an existing scene viewer or asynchronously start one as a fallback."""
+    if (
+        viewer_session
+        and viewer_session.get("scene") == scene_name
+        and viewer_session.get("url")
+        and viewer_session.get("status") != "exited"
+    ):
+        return viewer_session, viewer_panel(viewer_session)
+    return launch_scene_viewer(scene_name)
+
+# ---------------------------------------------------------------------------
 # 管线运行（流式输出）
 # ---------------------------------------------------------------------------
 
@@ -282,7 +315,8 @@ def _prepare_results(res: PipelineResults):
 
 
 def run_pipeline_direct(scene: str, doors: bool, windows: bool,
-                        falcon: bool, skip_vlm: bool):
+                        falcon: bool, skip_vlm: bool,
+                        viewer_session: dict[str, Any] | None):
     """Run the pipeline while asynchronously starting its scene viewer.
 
     Yields 11 values for Gradio: the existing pipeline outputs plus the
@@ -307,10 +341,9 @@ def run_pipeline_direct(scene: str, doors: bool, windows: bool,
         )
         return
 
-    # The manager returns immediately after Popen; pipeline work is never held
-    # up waiting for the viewer process or its GPU initialization.
-    viewer_session = start_viewer_for_scene(scene)
-    viewer_html = viewer_panel(viewer_session)
+    # Reuse the viewer launched explicitly after step ①; this fallback only
+    # starts it if the user went straight to the pipeline.
+    viewer_session, viewer_html = ensure_scene_viewer(scene, viewer_session)
 
     from bim_recon.pipeline_runner import PipelineConfig, run_pipeline
     app_config = load_config()
