@@ -1,4 +1,4 @@
-"""B-class object extraction: rough-bbox → VLM classify → Falcon segment → cutout.
+"""B-class object extraction: rough-bbox → VLM referring expression → Falcon segment → cutout.
 
 This module implements the interactive manual-extraction pipeline:
 
@@ -6,11 +6,13 @@ This module implements the interactive manual-extraction pipeline:
 2. The user roughly paints over the target object with a brush (only the
    tight bounding box of the paint is used — pixel precision is irrelevant).
 3. :func:`classify_and_segment` sends the bbox-annotated render to a VLM
-   for open-vocabulary classification, then sends the *full* render to
-   Falcon with the returned label for precise semantic segmentation.
-4. The Falcon detection whose centre is closest to the user's bbox is
-   selected; its RLE mask becomes the alpha channel of a clean RGBA
-   cutout, ready for TRELLIS mesh generation.
+   and asks for a **referring expression** — a concise natural-language
+   description that uniquely identifies the object (Falcon's prompt template
+   is ``"Segment these expressions in the image: {query}"``, so rich
+   expressions like ``"the blue armchair on the left near the window"``
+   resolve to exactly one detection instead of every instance of a class).
+4. Falcon segments using that expression; its RLE mask becomes the alpha
+   channel of a clean RGBA cutout, ready for TRELLIS mesh generation.
 
 The helper keeps the Gradio callback thin and is independently testable.
 """
@@ -31,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 _STOPWORDS = {
-    "a", "an", "the", "this", "that", "it", "is", "are", "object", "item",
+    "a", "an", "the", "this", "that", "it", "is", "are", "was", "were",
+    "be", "been", "being", "to", "of", "object", "item",
     "thing", "piece", "yes", "no", "image", "photo", "picture", "shown",
     "visible", "see", "looks", "like", "appears",
 }
-
 
 @dataclass
 class ExtractionResult:
@@ -82,12 +84,40 @@ def _extract_user_bbox(mask_editor_value: dict[str, Any] | None) -> tuple[np.nda
 
 
 def _parse_vlm_label(response: str) -> str:
-    """Reduce a VLM classification reply to a single open-vocabulary label."""
+    """Reduce a VLM reply to a clean referring expression for Falcon.
+
+    Referring expressions naturally start with ``the``/``a`` (e.g.
+    ``"the blue chair on the left"``), so only fall back to single-word
+    extraction when the VLM ignores the instruction and returns a full
+    sentence like ``"It is a chair."``.
+    """
     if not response:
         return ""
-    cleaned = re.sub(r"[^a-zA-Z0-9\s_-]", " ", response).strip().lower()
-    candidates = [word for word in re.split(r"\s+", cleaned) if word and word not in _STOPWORDS]
-    return candidates[0] if candidates else cleaned.split()[0] if cleaned else ""
+    cleaned = response.strip().strip("\"'`.,;:!?()[]{}").strip()
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    words = re.split(r"\s+", lowered)
+
+    # Detect full-sentence patterns — pronoun/subject + copula — that
+    # indicate the VLM ignored the "expression only" instruction.
+    first_two = " ".join(words[:2])
+    sentence_starts = {
+        "it is", "it's", "this is", "that is", "that's",
+        "there is", "there are", "i see", "the object",
+        "the image", "the photo", "this object",
+    }
+    looks_like_sentence = (
+        first_two in sentence_starts
+        or (len(words) > 2 and " ".join(words[:3]) in {"i can see", "this appears"})
+    )
+
+    if not looks_like_sentence and len(words) <= 12:
+        return lowered
+
+    # Fallback: extract the first content word.
+    candidates = [w for w in words if w and w not in _STOPWORDS]
+    return candidates[0] if candidates else words[0]
 
 
 def _annotate_bbox(base_rgb: np.ndarray, bbox: tuple[int, int, int, int]) -> Image.Image:
@@ -194,8 +224,13 @@ def classify_and_segment(
     *,
     vlm_prompt: str = (
         "Look at the object inside the red rectangle. "
-        "What is it? Reply with ONE simple English noun "
-        "(e.g. chair, lamp, vase, cabinet). No other words."
+        "Write a concise referring expression that uniquely identifies "
+        "this exact object for a segmentation model. Include the object "
+        "type plus 1-2 distinguishing features (color, position relative "
+        "to other objects, material). "
+        "Examples: 'the blue office chair on the left', "
+        "'the white ceramic vase on the wooden shelf'. "
+        "Reply with ONLY the expression, no other words."
     ),
 ) -> ExtractionResult:
     """Run the full classify → segment → cutout pipeline.

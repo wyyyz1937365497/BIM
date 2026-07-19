@@ -50,11 +50,13 @@ def test_extract_user_bbox_returns_none_without_paint():
     assert _extract_user_bbox(None) is None
 
 
-def test_parse_vlm_label_extracts_single_noun_from_sentence():
-    assert _parse_vlm_label("It is a wooden chair.") == "wooden"
-    assert _parse_vlm_label("Chair") == "chair"
-    assert _parse_vlm_label("The object is a vase.") == "vase"
-    assert _parse_vlm_label("") == ""
+def test_parse_vlm_label_preserves_referring_expression():
+    assert _parse_vlm_label("the blue office chair on the left") == "the blue office chair on the left"
+    assert _parse_vlm_label("a small white vase") == "a small white vase"
+    assert _parse_vlm_label('"the wooden cabinet"') == "the wooden cabinet"
+def test_parse_vlm_label_falls_back_for_full_sentence():
+    assert _parse_vlm_label("It is a chair.") == "chair"
+    assert _parse_vlm_label("This object appears to be a lamp.") == "lamp"
 
 
 def test_select_detection_picks_centroid_nearest_user_bbox():
@@ -72,7 +74,7 @@ def test_classify_and_segment_runs_full_pipeline_with_fakes():
     falcon_calls: list[str] = []
 
     def fake_vlm(image_path: str, prompt: str) -> str:
-        return "It is a chair."
+        return "the brown wooden chair on the left"
 
     class FakeFalcon:
         def segment(self, image, query, task="segmentation"):
@@ -85,9 +87,8 @@ def test_classify_and_segment_runs_full_pipeline_with_fakes():
     result = classify_and_segment(editor, fake_vlm, FakeFalcon())
 
     assert isinstance(result, ExtractionResult)
-    assert result.label == "chair"
-    assert falcon_calls == ["chair"]
-    assert result.cutout is not None
+    assert result.label == "the brown wooden chair on the left"
+    assert falcon_calls == ["the brown wooden chair on the left"]
     assert result.cutout.mode == "RGBA"
     assert result.overlay is not None
     assert result.overlay.shape == (160, 200, 3)
