@@ -275,23 +275,23 @@ def build_app() -> gr.Blocks:
             bmesh_workflow_status = gr.Markdown("等待人工确认")
             bmesh_workflow_output = gr.JSON(label="Mesh 与 Revit 结果")
 
-        with gr.Tab("手动选取（视角 + Mask）"):
+        with gr.Tab("手动选取（视角 + 框选 + 识别）"):
             gr.Markdown(
-                "步骤：在独立查看器中漫游到目标物体，捕获视角，"
-                "在渲染图上涂出物体，输入英文名称后生成。"
+                "**步骤：**\n"
+                "1. 在独立查看器中漫游到目标物体\n"
+                "2. 点击「捕获视角并渲染」\n"
+                "3. 用画笔在渲染图上**粗略框选**目标物体（不必精确）\n"
+                "4. 点击「🔍 VLM识别 + Falcon分割」— VLM 自动识别物体，Falcon 生成精确遮罩\n"
+                "5. 确认抠图后点击「生成 Mesh」"
             )
             with gr.Row():
-                bmesh_cam_btn = gr.Button("捕获视角并渲染")
-                bmesh_prompt = gr.Textbox(
-                    label="物体名称（英文）",
-                    placeholder="chair / lamp / sofa",
-                )
+                bmesh_cam_btn = gr.Button("捕获视角并渲染", variant="secondary")
             bmesh_cam_status = gr.Markdown("需先从独立查看器捕获视角")
             bmesh_mask_editor = gr.ImageMask(
-                label="渲染图（用红色画笔涂出物体）",
+                label="渲染图（用画笔粗略框选目标物体）",
                 type="numpy", height=400, layers=False,
                 brush=gr.Brush(
-                    colors=["#FF0000"], default_size=30, color_mode="fixed",
+                    colors=["#FF0000"], default_size=50, color_mode="fixed",
                 ),
                 transforms=[], sources=[],
             )
@@ -299,11 +299,21 @@ def build_app() -> gr.Blocks:
                 bmesh_seed_manual = gr.Number(
                     label="种子", value=1, precision=0,
                 )
-                bmesh_gen_manual_btn = gr.Button(
-                    "Mask + 生成 Mesh", variant="primary",
+                bmesh_identify_btn = gr.Button(
+                    "🔍 VLM识别 + Falcon分割", variant="secondary",
                 )
+                bmesh_gen_manual_btn = gr.Button(
+                    "生成 Mesh", variant="primary",
+                )
+            bmesh_identified_label = gr.Textbox(
+                label="VLM 识别结果", interactive=False,
+            )
+            bmesh_segmentation_preview = gr.Image(
+                label="Falcon 分割结果", height=300,
+            )
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
+            bmesh_cutout_state = gr.State(None)  # stores the RGBA cutout path
 
         # ====== ⑥ 独立 3D 查看器 ======
         gr.Markdown(
@@ -855,85 +865,85 @@ def build_app() -> gr.Blocks:
             outputs=[bmesh_mask_editor, bmesh_cam_status],
         )
 
-        def _on_bmesh_manual_generate(mask_editor_val, prompt: str, scene_name: str, seed: int):
-            """从 ImageMask 提取 mask → 清理背景 → TRELLIS 生成。"""
-            if not prompt.strip():
-                return None, {"错误": "请输入物体名称"}
-            if mask_editor_val is None:
-                return None, {"错误": "请先捕获视角并渲染"}
+        def _on_bmesh_identify(mask_editor_val, scene_name: str):
+            """Rough-bbox → VLM classify → Falcon segment → clean RGBA cutout."""
+            from bim_recon.bmesh_extractor import classify_and_segment
+            from bim_recon.vlm_verifier import query_vlm
 
-            layers = (mask_editor_val or {}).get("layers", [])
-            if not layers:
-                return None, {"错误": "请用红色画笔涂出要提取的物体"}
+            cfg = load_config()
+            falcon = _get_falcon()
 
-            mask_arr = layers[0]
-            if not isinstance(mask_arr, np.ndarray) or mask_arr.ndim < 3:
-                return None, {"错误": f"Mask 格式异常: {type(mask_arr)}"}
+            def vlm_caller(image_path: str, prompt: str) -> str:
+                return query_vlm(
+                    image_path, prompt,
+                    cfg.vlm.api_base, cfg.vlm.model, cfg.vlm.api_key,
+                    timeout=30, max_tokens=20,
+                )
 
+            result = classify_and_segment(mask_editor_val, vlm_caller, falcon)
+
+            cutout_path = None
+            cutout_preview = None
+            if result.cutout is not None:
+                out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cutout_path = str(out_dir / f"{result.label}_{int(time.time())}_cutout.png")
+                result.cutout.save(cutout_path)
+                cutout_preview = np.array(result.cutout)
+
+            return (
+                result.label,                          # bmesh_identified_label
+                result.overlay,                        # bmesh_segmentation_preview
+                cutout_preview,                        # bmesh_manual_preview
+                cutout_path,                           # bmesh_cutout_state
+                result.detail,                         # bmesh_cam_status
+            )
+
+        bmesh_identify_btn.click(
+            fn=_on_bmesh_identify,
+            inputs=[bmesh_mask_editor, scene_state],
+            outputs=[
+                bmesh_identified_label, bmesh_segmentation_preview,
+                bmesh_manual_preview, bmesh_cutout_state, bmesh_cam_status,
+            ],
+        )
+
+        def _on_bmesh_generate(cutout_path: str | None, label: str, scene_name: str, seed: int):
+            """Send the Falcon-segmented cutout to TRELLIS for mesh generation."""
+            if not cutout_path:
+                return None, {"错误": "请先点击「🔍 VLM识别 + Falcon分割」生成抠图"}
             from PIL import Image as PILImage
 
-            # Extract background image from the editor (composite layer)
-            bg = mask_editor_val.get("background")
-            if bg is not None and isinstance(bg, np.ndarray):
-                base_img = PILImage.fromarray(bg.astype(np.uint8)).convert("RGB")
-            else:
-                # Use the mask array itself (RGBA, background is the composite)
-                base_img = PILImage.fromarray(mask_arr[:, :, :3].astype(np.uint8)).convert("RGB")
-
-            # Alpha channel from mask layer = where user drew
-            alpha = mask_arr[:, :, 3] if mask_arr.shape[2] == 4 else np.zeros(mask_arr.shape[:2])
-            has_mask = alpha > 10
-
-            if not has_mask.any():
-                return None, {"错误": "未检测到绘制内容 — 请在渲染图上涂出物体"}
-
-            # Find tight bbox of mask
-            rows = np.any(has_mask, axis=1)
-            cols = np.any(has_mask, axis=0)
-            rmin, rmax = np.where(rows)[0][[0, -1]]
-            cmin, cmax = np.where(cols)[0][[0, -1]]
-
-            # Crop with padding
-            pad = 20
-            h_img, w_img = base_img.size[1], base_img.size[0]
-            rmin = max(0, rmin - pad)
-            rmax = min(h_img, rmax + pad)
-            cmin = max(0, cmin - pad)
-            cmax = min(w_img, cmax + pad)
-
-            cropped = base_img.crop((cmin, rmin, cmax, rmax))
-            alpha_crop = alpha[rmin:rmax, cmin:cmax]
-            rgba = cropped.convert("RGBA")
-            rgba.putalpha(Image.fromarray(alpha_crop.astype(np.uint8), mode="L"))
-
+            preview = np.array(PILImage.open(cutout_path).convert("RGBA"))
             cfg = load_config()
             trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
             if not trellis.health():
-                return rgba, {"错误": "TRELLIS 服务不可达"}
+                return preview, {"错误": "TRELLIS 服务不可达"}
 
             out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
             out_dir.mkdir(parents=True, exist_ok=True)
-            clean_path = out_dir / f"{prompt}_{int(time.time())}_clean.png"
-            rgba.save(str(clean_path))
+            name = f"{label or 'object'}_{int(time.time())}"
+            clean_path = out_dir / f"{name}_clean.png"
+            PILImage.open(cutout_path).save(str(clean_path))
 
             try:
                 result = trellis.generate_mesh(TrellisMeshRequest(
                     image_path=clean_path,
                     output_dir=out_dir,
-                    name=f"{prompt}_{int(time.time())}",
+                    name=name,
                     seed=int(seed),
                 ))
-                return rgba, {
-                    "状态": "✅ Mask + 生成成功",
+                return preview, {
+                    "状态": "✅ Mesh 生成成功",
                     "GLB": str(result.glb_path),
                     "PLY": str(result.gaussian_path) if result.gaussian_path else None,
                 }
             except Exception as e:
-                return rgba, {"错误": f"TRELLIS 生成失败: {e}"}
+                return preview, {"错误": f"TRELLIS 生成失败: {e}"}
 
         bmesh_gen_manual_btn.click(
-            fn=_on_bmesh_manual_generate,
-            inputs=[bmesh_mask_editor, bmesh_prompt, scene_state, bmesh_seed_manual],
+            fn=_on_bmesh_generate,
+            inputs=[bmesh_cutout_state, bmesh_identified_label, scene_state, bmesh_seed_manual],
             outputs=[bmesh_manual_preview, bmesh_manual_output],
         )
 
