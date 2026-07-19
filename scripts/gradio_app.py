@@ -223,9 +223,15 @@ def build_app() -> gr.Blocks:
             with gr.Accordion("扫描参数", open=True):
                 with gr.Row():
                     explore_cam_btn = gr.Button("从独立查看器获取初始视角")
-                    explore_cam_status = gr.Markdown(
-                        "在独立查看器中漫游到扫描起点后捕获相机。"
+                    explore_render_btn = gr.Button(
+                        "📸 渲染初始视角", variant="secondary",
                     )
+                explore_cam_status = gr.Markdown(
+                    "在独立查看器中漫游到扫描起点后捕获相机。"
+                )
+                explore_initial_view = gr.Image(
+                    label="初始视角渲染图", height=360,
+                )
                 explore_cam_data = gr.State({})
                 explore_labels = gr.Textbox(
                     label="开放词汇标签（英文逗号分隔）",
@@ -598,6 +604,37 @@ def build_app() -> gr.Blocks:
             fn=fetch_camera_state,
             inputs=[viewer_state],
             outputs=[explore_cam_status, explore_cam_data],
+        )
+
+        def _on_explore_render(scene_name: str, cam_data: dict):
+            """Render the captured initial viewpoint via scene.render (MCP render_from_pose equivalent)."""
+            if not scene_name:
+                return None, "❌ 请先选择场景"
+            if not cam_data or "position" not in cam_data:
+                return None, "⚠️ 请先点击「从独立查看器获取初始视角」捕获相机"
+            scene = _get_scene(scene_name)
+            if scene is None:
+                return None, f"❌ 无法加载场景 {scene_name}"
+
+            eye = cam_data.get("position", [0, 0, 0])
+            target = cam_data.get("look_at", [0, 0, 1])
+            fov = cam_data.get("fov_degrees", 60)
+            up = cam_data.get("up", [0, 0, 1])
+
+            from bim_recon.gs_scene import look_at_pose
+            pose = look_at_pose(
+                (eye[0], eye[1], eye[2]),
+                (target[0], target[1], target[2]),
+                up=(up[0], up[1], up[2]),
+            )
+            render_result = scene.render(pose, width=800, height=600, fov_degrees=fov)
+            render_arr = (render_result.colors * 255).clip(0, 255).astype(np.uint8)
+            return render_arr, f"✅ 初始视角渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
+
+        explore_render_btn.click(
+            fn=_on_explore_render,
+            inputs=[scene_state, explore_cam_data],
+            outputs=[explore_initial_view, explore_cam_status],
         )
 
         async def _run_explorer_scan(
