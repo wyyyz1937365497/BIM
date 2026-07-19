@@ -23,6 +23,7 @@ datasets/
 **/images/
 **/sparse/
 *.ply
+origan_data/
 *.ply.gz
 *.bag
 

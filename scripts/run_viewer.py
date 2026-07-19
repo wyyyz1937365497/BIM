@@ -1,12 +1,11 @@
-"""Launch the SceneSplat Mini Viewer (nerfview) on port 18081.
+"""Launch the standalone SceneSplat Mini Viewer on port 18081.
 
-Also starts a camera-state HTTP endpoint on port 18082 via
-``scripts/viewer_camera_patch.py`` (monkey-patches viser.ViserServer).
-
-This wrapper bypasses ``tools/mini_viewer.py`` and launches the patched
-entry point directly, forwarding all Mini Viewer args.
+The viewer serves its own UI and ``/camera-state`` from that single port via
+``viewer_camera_patch.py``.  Gradio does not own, start, or embed this process.
 """
 from __future__ import annotations
+
+import socket
 
 import os
 import subprocess
@@ -18,7 +17,6 @@ SCENESPLAT = ROOT / "SceneSplat"
 PATCH_SCRIPT = ROOT / "scripts" / "viewer_camera_patch.py"
 
 VIEWER_PORT = 18081
-CAMERA_PORT = 18082
 
 
 def _build_env() -> dict[str, str]:
@@ -32,17 +30,25 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+def _ensure_port_available(host: str, port: int) -> None:
+    """Fail instead of letting Viser silently move the public viewer port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Viewer port {host}:{port} is already in use. "
+                "Stop the existing viewer before launching this scene."
+            ) from exc
+
+
 def launch_viewer(
     input_root: str,
     feature_path: str,
     port: int = VIEWER_PORT,
     host: str = "127.0.0.1",
 ) -> subprocess.Popen[bytes]:
-    """Start nerfview + camera HTTP endpoint. Returns the Popen handle.
-
-    The camera endpoint will be available at
-    ``http://127.0.0.1:{CAMERA_PORT}/camera-state``.
-    """
+    """Start the standalone nerfview process and return its handle."""
     input_path = Path(input_root)
     cmd: list[str] = [
         sys.executable, str(PATCH_SCRIPT),
@@ -69,6 +75,7 @@ def launch_viewer(
         "--host", host,
         "--port", str(port),
     ])
+    _ensure_port_available(host, port)
     env = _build_env()
     return subprocess.Popen(cmd, env=env)
 
@@ -76,13 +83,31 @@ def launch_viewer(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Launch 3DGS Mini Viewer")
-    parser.add_argument("--input-root", default=str(ROOT / "data" / "room0" / "preprocessed"))
-    parser.add_argument("--feature-path", default=str(ROOT / "output" / "room0" / "room0_feat.pt"))
+    parser = argparse.ArgumentParser(
+        description="Launch the standalone 3DGS Mini Viewer",
+    )
+    parser.add_argument(
+        "--scene",
+        help="Scene name; resolves data/<scene>/preprocessed and "
+        "output/<scene>/<scene>_feat.pt.",
+    )
+    parser.add_argument("--input-root")
+    parser.add_argument("--feature-path")
     parser.add_argument("--port", type=int, default=VIEWER_PORT)
     args = parser.parse_args()
-
-    print(f"Starting nerfview on http://127.0.0.1:{args.port}")
-    print(f"Camera endpoint on http://127.0.0.1:{CAMERA_PORT}/camera-state")
-    proc = launch_viewer(args.input_root, args.feature_path, args.port)
+    if args.scene:
+        input_root = ROOT / "data" / args.scene / "preprocessed"
+        feature_path = ROOT / "output" / args.scene / f"{args.scene}_feat.pt"
+    else:
+        if not args.input_root or not args.feature_path:
+            parser.error("pass --scene, or both --input-root and --feature-path")
+        input_root = Path(args.input_root)
+        feature_path = Path(args.feature_path)
+    if not input_root.exists():
+        parser.error(f"Viewer input does not exist: {input_root}")
+    if not feature_path.is_file():
+        parser.error(f"Viewer feature file does not exist: {feature_path}")
+    print(f"Starting standalone nerfview on http://127.0.0.1:{args.port}")
+    print(f"Camera state: http://127.0.0.1:{args.port}/camera-state")
+    proc = launch_viewer(str(input_root), str(feature_path), args.port)
     proc.wait()

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -11,13 +13,16 @@ from workflows.events import StartEvent, StopEvent
 
 from bim_recon.explorer_controller import ExplorerCamera
 from bim_recon.explorer_workflow import ExplorerScanConfig, ExplorerScanWorkflow
-from bim_recon.pipeline_api import ElementResult, PipelineResults
+from bim_recon.pipeline_api import ElementResult, PipelineResults, load_results
 from bim_recon.pipeline_runner import (
     PipelineConfig,
     ReconstructionWorkflow,
     snap_wall_endpoints,
 )
-from bim_recon.revit_workflow import RevitBuildWorkflow
+from bim_recon.revit_workflow import (
+    REWRITE_SOLID_200MM_WALL_TYPE_ID,
+    RevitBuildWorkflow,
+)
 from bim_recon.trellis_client import TrellisMeshResult
 from bim_recon.trellis_workflow import (
     ApprovedMeshObject,
@@ -146,6 +151,57 @@ def _sample_results(tmp_path: Path) -> PipelineResults:
         coords={"floor_z": 0.0, "ceiling_z": 3.0},
     )
 
+def _write_review_json_fixture(results: PipelineResults) -> None:
+    """Write the same per-element JSON shape consumed by load_results."""
+    sections: dict[str, dict] = {}
+    for element_class in sorted({e.element_class for e in results.elements}):
+        class_elements = [
+            element
+            for element in results.elements
+            if element.element_class == element_class
+        ]
+        entries = [
+            {
+                "confirmed": element.confirmed,
+                "candidate": {
+                    "element_class": element.element_class,
+                    "world_x": element.world_x,
+                    "world_y": element.world_y,
+                    "wall_idx": element.wall_idx,
+                },
+                "height_detection": element.height_detection,
+                "image_path": "",
+                "vlm_response": element.vlm_response,
+            }
+            for element in class_elements
+        ]
+        section = {
+            "element": element_class,
+            "confirmed": sum(bool(entry["confirmed"]) for entry in entries),
+            "results": entries,
+        }
+        (results.out_dir / f"{element_class}s_verified.json").write_text(
+            json.dumps(section),
+            encoding="utf-8",
+        )
+        sections[element_class] = section
+    (results.out_dir / "wall_lines_snapped.json").write_text(
+        json.dumps(results.walls),
+        encoding="utf-8",
+    )
+    (results.out_dir / "pipeline_report.json").write_text(
+        json.dumps({
+            "coordinate_system": results.coords,
+            "elements": sections,
+            "merged_elements": {
+                "confirmed": sum(
+                    section["confirmed"] for section in sections.values()
+                ),
+            },
+        }),
+        encoding="utf-8",
+    )
+
 
 def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path):
     gateway = _FakeGateway()
@@ -163,6 +219,14 @@ def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path)
         "create_point_based_element",
         "get_current_view_elements",
     ]
+    wall_call = next(
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_line_based_element"
+    )
+    assert {
+        item["typeId"] for item in wall_call["data"]
+    } == {REWRITE_SOLID_200MM_WALL_TYPE_ID}
     opening_calls = [
         arguments for name, arguments in gateway.calls
         if name == "create_point_based_element"
@@ -172,6 +236,69 @@ def test_revit_workflow_creates_hosts_before_openings_and_verifies_ids(tmp_path)
     assert completed.result["missing_ids"] == []
     assert completed.result["created"]["doors"] == [201]
 
+
+    import orjson
+
+    orjson.dumps(completed.result)
+    assert completed.result["wall_id_by_index"] == {
+        "0": 101,
+        "1": 102,
+        "2": 103,
+        "3": 104,
+    }
+
+
+def test_review_selection_limits_revit_creation_to_three_of_six(tmp_path):
+    from bim_recon.gradio_helpers import apply_vlm_review
+
+    results = _sample_results(tmp_path)
+    door = results.elements[0]
+    window = results.elements[1]
+    window.result_index = 0
+    results.elements.extend([
+        replace(door, result_index=1, confirmed=True),
+        replace(window, result_index=1, confirmed=True),
+        replace(door, result_index=2, confirmed=True),
+        replace(window, result_index=2, confirmed=True),
+    ])
+    _write_review_json_fixture(results)
+
+    selected = ["door #0", "window #0", "door #1"]
+    updated_results, status = apply_vlm_review(results, selected)
+
+    assert updated_results is results
+    assert [element.confirmed for element in results.elements] == [
+        True, True, True, False, False, False,
+    ]
+    assert "3/6" in status
+    assert "3 个 JSON 文件" in status
+
+    reloaded = load_results(tmp_path)
+    persisted_states = {
+        f"{element.element_class} #{element.result_index}": element.confirmed
+        for element in reloaded.elements
+    }
+    assert persisted_states == {
+        "door #0": True,
+        "door #1": True,
+        "door #2": False,
+        "window #0": True,
+        "window #1": False,
+        "window #2": False,
+    }
+    report = json.loads((tmp_path / "pipeline_report.json").read_text("utf-8"))
+    assert report["elements"]["door"]["confirmed"] == 2
+    assert report["elements"]["window"]["confirmed"] == 1
+    assert report["merged_elements"]["confirmed"] == 3
+
+    gateway = _FakeGateway()
+    list(stream_workflow_sync(RevitBuildWorkflow(results, gateway)))
+    opening_calls = [
+        arguments
+        for name, arguments in gateway.calls
+        if name == "create_point_based_element"
+    ]
+    assert sum(len(arguments["data"]) for arguments in opening_calls) == 3
 
 def test_revit_workflow_clips_opening_to_host_wall_endpoint(tmp_path):
     results = _sample_results(tmp_path)

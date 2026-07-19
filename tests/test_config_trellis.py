@@ -14,6 +14,8 @@ class TestTrellisConfig:
         assert cfg.trellis.host == "127.0.0.1"
         assert cfg.trellis.port == 18391
         assert cfg.trellis.model == "microsoft/TRELLIS-image-large"
+        assert cfg.falcon.host == "127.0.0.1"
+        assert cfg.falcon.port == 18390
 
     def test_loads_trellis_section(self, tmp_path):
         path = tmp_path / "config.json"
@@ -35,6 +37,21 @@ class TestTrellisConfig:
         assert cfg.trellis.port == 19000
         assert cfg.trellis.model == "G:/TJ/BIM/TRELLIS/TRELLIS-image-large"
         assert cfg.trellis.timeout == 1200
+
+    def test_loads_falcon_section(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps({
+                "falcon": {"host": "0.0.0.0", "port": 19001, "timeout": 45},
+            }),
+            encoding="utf-8",
+        )
+
+        cfg = load_config(path)
+
+        assert cfg.falcon.host == "0.0.0.0"
+        assert cfg.falcon.port == 19001
+        assert cfg.falcon.timeout == 45
 
 
 class TestWorkflowConfig:

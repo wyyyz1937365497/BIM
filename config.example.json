@@ -12,12 +12,24 @@
     "args": ["G:/TJ/BIM/mcp-servers-for-revit/server/build/index.js"],
     "timeout": 120
   },
+  "falcon": {
+    "comment": "Falcon-Perception 分割服务 (conda env: transformerv)",
+    "host": "127.0.0.1",
+    "port": 18390,
+    "timeout": 300
+  },
   "trellis": {
     "comment": "TRELLIS B类复杂构件 mesh 生成服务 (conda env: trellis)",
     "host": "127.0.0.1",
     "port": 18391,
     "model": "microsoft/TRELLIS-image-large",
     "timeout": 1800
+  },
+  "viewer_service": {
+    "comment": "独立 Mini Viewer 进程管理 API（bim-recon 环境）",
+    "host": "127.0.0.1",
+    "port": 18083,
+    "viewer_port": 18081
   },
   "element_routing": {
     "comment": "A=参数化Revit图元(Wall/Door/Window), B=TRELLIS mesh+DirectShape",

@@ -31,6 +31,15 @@ class RevitMCPConfig:
     timeout: int = 120
 
 @dataclass(frozen=True)
+class FalconConfig:
+    """Falcon-Perception HTTP server config."""
+
+    host: str = "127.0.0.1"
+    port: int = 18390
+    timeout: int = 300
+
+
+@dataclass(frozen=True)
 class TrellisConfig:
     """TRELLIS mesh generation HTTP server config."""
 
@@ -38,6 +47,14 @@ class TrellisConfig:
     port: int = 18391
     model: str = "microsoft/TRELLIS-image-large"
     timeout: int = 1800
+
+@dataclass(frozen=True)
+class ViewerServiceConfig:
+    """FastAPI process manager for the standalone Mini Viewer."""
+
+    host: str = "127.0.0.1"
+    port: int = 18083
+    viewer_port: int = 18081
 
 
 @dataclass(frozen=True)
@@ -77,7 +94,9 @@ class AppConfig:
     """Top-level application config."""
     vlm: ModelConfig
     revit_mcp: RevitMCPConfig
+    falcon: FalconConfig
     trellis: TrellisConfig
+    viewer_service: ViewerServiceConfig = field(default_factory=ViewerServiceConfig)
     element_routing: ElementRoutingConfig = field(default_factory=ElementRoutingConfig)
 
 
@@ -94,7 +113,9 @@ def load_config(path: Path | str | None = None) -> AppConfig:
 
     vlm_raw = raw.get("vlm", {})
     mcp_raw = raw.get("revit_mcp", {})
+    falcon_raw = raw.get("falcon", {})
     trellis_raw = raw.get("trellis", {})
+    viewer_raw = raw.get("viewer_service", {})
     routing_raw = raw.get("element_routing", {})
 
     return AppConfig(
@@ -109,11 +130,21 @@ def load_config(path: Path | str | None = None) -> AppConfig:
             args=mcp_raw.get("args", []),
             timeout=int(mcp_raw.get("timeout", 120)),
         ),
+        falcon=FalconConfig(
+            host=falcon_raw.get("host", "127.0.0.1"),
+            port=int(falcon_raw.get("port", 18390)),
+            timeout=int(falcon_raw.get("timeout", 300)),
+        ),
         trellis=TrellisConfig(
             host=trellis_raw.get("host", "127.0.0.1"),
             port=trellis_raw.get("port", 18391),
             model=trellis_raw.get("model", "microsoft/TRELLIS-image-large"),
             timeout=trellis_raw.get("timeout", 1800),
+        ),
+        viewer_service=ViewerServiceConfig(
+            host=viewer_raw.get("host", "127.0.0.1"),
+            port=int(viewer_raw.get("port", 18083)),
+            viewer_port=int(viewer_raw.get("viewer_port", 18081)),
         ),
         element_routing=ElementRoutingConfig(
             routing=routing_raw if routing_raw else ElementRoutingConfig().routing,
@@ -136,11 +167,21 @@ def save_config(config: AppConfig) -> None:
             "args": config.revit_mcp.args,
             "timeout": config.revit_mcp.timeout,
         },
+        "falcon": {
+            "host": config.falcon.host,
+            "port": config.falcon.port,
+            "timeout": config.falcon.timeout,
+        },
         "trellis": {
             "host": config.trellis.host,
             "port": config.trellis.port,
             "model": config.trellis.model,
             "timeout": config.trellis.timeout,
+        },
+        "viewer_service": {
+            "host": config.viewer_service.host,
+            "port": config.viewer_service.port,
+            "viewer_port": config.viewer_service.viewer_port,
         },
         "element_routing": dict(config.element_routing.routing),
     }

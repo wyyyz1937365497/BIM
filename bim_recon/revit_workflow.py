@@ -46,6 +46,10 @@ class _VerifyCreated(Event):
     pass
 
 
+REWRITE_SOLID_200MM_WALL_TYPE_ID = 398
+REWRITE_SOLID_200MM_WALL_TYPE_NAME = "常规 - 200mm"
+
+
 @dataclass(frozen=True, slots=True)
 class RevitBuildOptions:
     """Explicit Revit creation settings; every length is in millimetres."""
@@ -56,7 +60,7 @@ class RevitBuildOptions:
     offset_y: float = 0.0
     wall_thickness: float = 200.0
     floor_thickness: float = 200.0
-    wall_type_id: int | None = None
+    wall_type_id: int = REWRITE_SOLID_200MM_WALL_TYPE_ID
     floor_type_id: int | None = None
     door_type_id: int = 94654
     window_type_id: int = 93304
@@ -245,11 +249,15 @@ class RevitBuildWorkflow(Workflow):
                 "baseLevel": options.level_elevation,
                 "baseOffset": 0.0,
             }
-            if options.wall_type_id is not None:
-                item["typeId"] = options.wall_type_id
+            item["typeId"] = options.wall_type_id
             walls.append(item)
             source_indices.append(source_index)
-        self._emit(ctx, "walls", f"Creating {len(walls)} walls...")
+        self._emit(
+            ctx,
+            "walls",
+            f"Creating {len(walls)} walls as "
+            f"{REWRITE_SOLID_200MM_WALL_TYPE_NAME} (type {options.wall_type_id})...",
+        )
         payload = await self.gateway.call_tool(
             "create_line_based_element",
             {"data": walls},
@@ -384,7 +392,10 @@ class RevitBuildWorkflow(Workflow):
             ))
         result = {
             "created": rt.created,
-            "wall_id_by_index": rt.wall_id_by_index,
+            "wall_id_by_index": {
+                str(wall_index): element_id
+                for wall_index, element_id in rt.wall_id_by_index.items()
+            },
             "verified_ids": sorted(expected_ids & observed_ids),
             "missing_ids": missing,
         }

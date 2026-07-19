@@ -24,10 +24,9 @@ from PIL import Image
 
 # Import all helpers (callbacks, business logic, constants)
 from bim_recon.gradio_helpers import (
-    logger, ROOT, VIEWER_PORT, CAMERA_PORT, MAX_CONSOLE_LINES,
-    SCENESPLAT, MAX_PORT_WAIT_S, _SCENE_CACHE, _FALCON_CACHE,
+    logger, ROOT, MAX_CONSOLE_LINES,
+    SCENESPLAT, _SCENE_CACHE, _FALCON_CACHE,
     validate_ply, check_preprocess_status, list_available_scenes,
-    _wait_for_port, _kill_child_procs, start_viewer,
     find_latest_output, list_available_results, _result_dir_from_label,
     _prepare_results, run_pipeline_direct, load_results_cb,
     _find_element, update_interactive_radar, draw_bbox_on_image,
@@ -56,6 +55,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown("# 3DGS → BIM 自动重建管线")
         scene_state = gr.State("")
         results_state = gr.State(None)
+        viewer_state = gr.State({})
 
         # ====== ① 场景与数据准备 ======
         gr.Markdown("## ① 场景与数据准备")
@@ -141,7 +141,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown("---\n## ④ 微调")
         gr.Markdown(
             "**方式一** — 手动 Mask：选择构件 → 在立面图上用红色画笔涂出门窗区域 → 重算尺寸\n\n"
-            "**方式二** — 视角重分割：在下方查看器漫游到覆盖构件的视角 → 获取视角 → 以此视角重新分割"
+            "**方式二** — 在独立 3D 查看器中漫游到覆盖构件的视角 → 获取视角 → 以此视角重新分割"
         )
         camera_data = gr.State({})  # 存储捕获的相机参数
         with gr.Row():
@@ -166,8 +166,10 @@ def build_app() -> gr.Blocks:
                 remap_btn = gr.Button("📐 从 Mask 重算墙坐标", variant="primary")
                 remap_out = gr.JSON(label="手动 Mask 结果")
                 gr.Markdown("---\n#### 🔲 方式二：视角重分割")
-                cam_btn = gr.Button("📸 从查看器获取视角", variant="secondary")
-                cam_status = gr.Markdown("（需先启动下方查看器）")
+                cam_btn = gr.Button("📸 从独立查看器获取视角", variant="secondary")
+                cam_status = gr.Markdown(
+                    "运行管线后，Viewer Manager 会异步启动该场景的独立查看器。"
+                )
                 reseg_btn = gr.Button("🔲 以此视角重新分割", variant="primary")
                 reseg_preview = gr.Image(
                     label="新视角渲染 + Falcon 分割", height=300,
@@ -178,11 +180,13 @@ def build_app() -> gr.Blocks:
         gr.Markdown("---\n## ⑤ Revit 确定性工作流")
         gr.Markdown(
             "按固定步骤创建标高、楼板、墙、门窗并核验 ElementId。"
-            "需要 Revit 已运行且 MCP 插件已加载；执行前请检查下列参数。"
+            "墙固定使用 Rewrite 项目中的“常规 - 200mm”实心基本墙"
+            "（类型 ID 398）。需要 Revit 已运行且 MCP 插件已加载。"
         )
         with gr.Row():
             revit_wall_thickness = gr.Number(
-                label="墙厚 (mm)", value=200.0, minimum=1.0,
+                label="墙厚 (mm，实心墙类型固定)", value=200.0,
+                minimum=200.0, maximum=200.0, interactive=False,
             )
             revit_floor_thickness = gr.Number(
                 label="楼板厚度 (mm)", value=200.0, minimum=1.0,
@@ -217,9 +221,9 @@ def build_app() -> gr.Blocks:
         with gr.Tab("自动扫描与审批"):
             with gr.Accordion("扫描参数", open=True):
                 with gr.Row():
-                    explore_cam_btn = gr.Button("从查看器获取初始视角")
+                    explore_cam_btn = gr.Button("从独立查看器获取初始视角")
                     explore_cam_status = gr.Markdown(
-                        "先在 ⑥ 查看器中漫游到扫描起点。"
+                        "在独立查看器中漫游到扫描起点后捕获相机。"
                     )
                 explore_cam_data = gr.State({})
                 explore_labels = gr.Textbox(
@@ -266,7 +270,7 @@ def build_app() -> gr.Blocks:
 
         with gr.Tab("手动选取（视角 + Mask）"):
             gr.Markdown(
-                "步骤：启动 ⑥ 查看器，漫游到目标物体，捕获视角，"
+                "步骤：在独立查看器中漫游到目标物体，捕获视角，"
                 "在渲染图上涂出物体，输入英文名称后生成。"
             )
             with gr.Row():
@@ -275,7 +279,7 @@ def build_app() -> gr.Blocks:
                     label="物体名称（英文）",
                     placeholder="chair / lamp / sofa",
                 )
-            bmesh_cam_status = gr.Markdown("需先启动查看器")
+            bmesh_cam_status = gr.Markdown("需先从独立查看器捕获视角")
             bmesh_mask_editor = gr.ImageMask(
                 label="渲染图（用红色画笔涂出物体）",
                 type="numpy", height=400, layers=False,
@@ -294,10 +298,15 @@ def build_app() -> gr.Blocks:
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
 
-        # ====== ⑥ 3D 查看器（底部） ======
-        gr.Markdown("---\n## ⑥ 3D 查看器")
-        viewer_btn = gr.Button("▶ 启动查看器", variant="secondary")
-        viewer_html = gr.HTML("<p>点击上方按钮启动 3DGS 查看器（nerfview + 相机捕获端口 18082）</p>")
+        # ====== ⑥ 独立 3D 查看器 ======
+        gr.Markdown(
+            "---\n## ⑥ 独立 3D 查看器\n\n"
+            "运行管线时，Viewer Manager 会接收场景及项目相对路径，"
+            "在后台启动查看器并返回分配的端口。"
+        )
+        viewer_panel_html = gr.HTML(
+            "<div>查看器将在运行管线时由 Viewer Manager 异步启动。</div>",
+        )
 
         # ====== 事件绑定 ======
 
@@ -353,7 +362,6 @@ def build_app() -> gr.Blocks:
         validate_btn.click(fn=on_validate, inputs=ply_file, outputs=val_status)
         preprocess_btn.click(fn=on_preprocess, inputs=[ply_file, scene_name],
                              outputs=[prep_status, scene_state])
-        viewer_btn.click(fn=start_viewer, inputs=scene_state, outputs=viewer_html)
 
         # --- 管线与结果 ---
         scene_state.change(
@@ -378,8 +386,8 @@ def build_app() -> gr.Blocks:
             fn=run_pipeline_direct,
             inputs=[scene_state, cb_doors, cb_windows, cb_falcon, cb_skipvlm],
             outputs=[console_out, out_dir_box, results_state, summary_md,
-                      radar_gallery, vlm_gallery, report_json,
-                     vlm_review_cbs, elem_sel],
+                     radar_gallery, vlm_gallery, report_json,
+                     vlm_review_cbs, elem_sel, viewer_state, viewer_panel_html],
         )
         # 管线运行完成后，刷新结果下拉列表并选中最新结果
         out_dir_box.change(
@@ -402,7 +410,7 @@ def build_app() -> gr.Blocks:
         )
         review_btn.click(fn=apply_vlm_review,
                          inputs=[results_state, vlm_review_cbs],
-                         outputs=review_status)
+                         outputs=[results_state, review_status])
         vlm_review_cbs.change(
             fn=update_interactive_radar,
             inputs=[vlm_review_cbs, results_state],
@@ -417,6 +425,7 @@ def build_app() -> gr.Blocks:
         )
         cam_btn.click(
             fn=fetch_camera_state,
+            inputs=[viewer_state],
             outputs=[cam_status, camera_data],
         )
         remap_btn.click(
@@ -455,6 +464,7 @@ def build_app() -> gr.Blocks:
 
         async def _run_revit_workflow(
             results: PipelineResults | None,
+            confirmed_labels: list[str],
             wall_thickness: float,
             floor_thickness: float,
             create_floor: bool,
@@ -465,6 +475,10 @@ def build_app() -> gr.Blocks:
             if results is None:
                 yield "请先加载一次管线结果。", {"error": "missing_pipeline_results"}
                 return
+            results, _review_status = apply_vlm_review(
+                results, confirmed_labels,
+            )
+            assert results is not None
             config = load_config().revit_mcp
             gateway = StdioMCPGateway(
                 command=config.command,
@@ -500,6 +514,7 @@ def build_app() -> gr.Blocks:
             fn=_run_revit_workflow,
             inputs=[
                 results_state,
+                vlm_review_cbs,
                 revit_wall_thickness,
                 revit_floor_thickness,
                 revit_create_floor,
@@ -538,6 +553,7 @@ def build_app() -> gr.Blocks:
         # --- B类 Mesh: deterministic scan and approval ---
         explore_cam_btn.click(
             fn=fetch_camera_state,
+            inputs=[viewer_state],
             outputs=[explore_cam_status, explore_cam_data],
         )
 
@@ -724,11 +740,11 @@ def build_app() -> gr.Blocks:
 
         # --- B类 Mesh: 手动选取 Tab ---
 
-        def _on_bmesh_capture(scene_name: str):
-            """捕获视角 → 渲染 → 加载到 ImageMask。"""
+        def _on_bmesh_capture(scene_name: str, viewer_session: dict):
+            """Capture a camera from the manager-assigned viewer and render it."""
             if not scene_name:
                 return None, "❌ 请先选择场景"
-            status, cam_data = fetch_camera_state()
+            status, cam_data = fetch_camera_state(viewer_session)
             if not cam_data:
                 return None, status
 
@@ -755,7 +771,7 @@ def build_app() -> gr.Blocks:
 
         bmesh_cam_btn.click(
             fn=_on_bmesh_capture,
-            inputs=[scene_state],
+            inputs=[scene_state, viewer_state],
             outputs=[bmesh_mask_editor, bmesh_cam_status],
         )
 

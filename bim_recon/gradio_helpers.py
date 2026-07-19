@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import atexit
 import logging
 import shutil
 import subprocess
@@ -38,13 +37,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bim_recon.pipeline_api import (
-    PipelineResults, load_results, remap_from_json, mask_to_bbox,
+    PipelineResults,
+    load_results,
+    mask_to_bbox,
+    remap_from_json,
+    save_review_results,
 )
 from bim_recon.config import load_config
 
-VIEWER_PORT = 18081
-CAMERA_PORT = 18082
-MAX_PORT_WAIT_S = 30
 SCENESPLAT = ROOT / "SceneSplat"
 MAX_CONSOLE_LINES = 200
 
@@ -122,58 +122,64 @@ def list_available_scenes() -> list[str]:
 # Viewer
 # ---------------------------------------------------------------------------
 
-def _wait_for_port(port: int, timeout: float = MAX_PORT_WAIT_S) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=2) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(1.0)
-    return False
+def viewer_service_url() -> str:
+    """Return the FastAPI viewer-manager endpoint."""
+    config = load_config().viewer_service
+    return f"http://{config.host}:{config.port}"
 
 
-_CHILD_PROCS: list = []
-
-def _kill_child_procs():
-    """Kill all tracked child processes (viewer, pipeline, etc.)."""
-    for p in _CHILD_PROCS:
-        if p.poll() is None:  # still running
-            try:
-                p.kill()
-            except Exception:
-                pass
-    _CHILD_PROCS.clear()
-
-atexit.register(_kill_child_procs)
+def viewer_url(viewer_session: dict[str, Any] | None = None) -> str:
+    """Return the viewer URL assigned by the manager for this UI session."""
+    if viewer_session and viewer_session.get("url"):
+        return str(viewer_session["url"])
+    return ""
 
 
-def start_viewer(scene_name: str) -> str:
-    if not scene_name:
-        return '<p style="color:red">请先选择场景</p>'
-    input_root = str(ROOT / "data" / scene_name / "preprocessed")
-    feat_path = str(ROOT / "output" / scene_name / f"{scene_name}_feat.pt")
-    if not Path(input_root).exists():
-        return f'<p style="color:red">预处理数据不存在: {input_root}</p>'
-    if not Path(feat_path).exists():
-        return f'<p style="color:red">feat.pt 不存在: {feat_path}</p>'
-    subprocess.run(
-        f'for /f "tokens=5" %a in (\'netstat -aon ^| findstr :{VIEWER_PORT} ^| findstr LISTENING\') do taskkill /f /pid %a',
-        shell=True, capture_output=True,
+def viewer_panel(viewer_session: dict[str, Any] | None) -> str:
+    """Render the viewer launch state and an explicit external-page control."""
+    url = viewer_url(viewer_session)
+    if not url:
+        if viewer_session and viewer_session.get("error"):
+            return (
+                "<div style=\"color:#b91c1c;\"><strong>Viewer Manager 不可用：</strong>"
+                f"{viewer_session['error']}<br>"
+                "请先运行 <code>python scripts/viewer_service.py</code>。</div>"
+            )
+        return "<div>查看器将在运行管线时由 Viewer Manager 异步启动。</div>"
+    status = str(viewer_session.get("status", "starting"))
+    return (
+        f"<div><strong>查看器状态：</strong>{status} · {url}</div>"
+        f"<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">"
+        "<button style=\"margin-top:8px;padding:8px 14px;cursor:pointer;\">"
+        "↗ 打开 3D 查看器</button></a>"
     )
-    proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "scripts" / "run_viewer.py"),
-         "--input-root", input_root, "--feature-path", feat_path,
-         "--port", str(VIEWER_PORT)],
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+
+
+def start_viewer_for_scene(scene_name: str) -> dict[str, Any]:
+    """Ask the FastAPI manager to spawn the scene viewer without waiting for it."""
+    payload = {
+        "scene": scene_name,
+        "input_root": (Path("data") / scene_name / "preprocessed").as_posix(),
+        "feature_path": (
+            Path("output") / scene_name / f"{scene_name}_feat.pt"
+        ).as_posix(),
+    }
+    request = urllib.request.Request(
+        f"{viewer_service_url()}/viewer",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    _CHILD_PROCS.append(proc)
-    if not _wait_for_port(VIEWER_PORT):
-        return f'<p style="color:red">查看器启动失败 (端口 {VIEWER_PORT})</p>'
-    return (f'<iframe src="http://127.0.0.1:{VIEWER_PORT}" '
-            f'style="width:100%;height:600px;border:none;"></iframe>')
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return json.loads(response.read())
+    except Exception as exc:
+        logger.warning("Viewer manager request failed: %s", exc)
+        return {
+            "status": "unavailable",
+            "error": str(exc),
+            "manager_url": viewer_service_url(),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -277,14 +283,17 @@ def _prepare_results(res: PipelineResults):
 
 def run_pipeline_direct(scene: str, doors: bool, windows: bool,
                         falcon: bool, skip_vlm: bool):
-    """Run pipeline directly (no subprocess). Yields 9 values for Gradio.
+    """Run the pipeline while asynchronously starting its scene viewer.
 
-    yield: (console, out_dir, results, summary, radar_gallery,
-            vlm_gallery, report, vlm_cb, elem_dd)
+    Yields 11 values for Gradio: the existing pipeline outputs plus the
+    manager-owned viewer session and its external-page control.
     """
+    empty_viewer = {}
     if not scene:
-        yield ("Error: no scene selected", "", None, "", None, [], None,
-               gr.update(), gr.update())
+        yield (
+            "Error: no scene selected", "", None, "", None, [], None,
+            gr.update(), gr.update(), empty_viewer, viewer_panel(empty_viewer),
+        )
         return
     elems = []
     if doors:
@@ -292,14 +301,20 @@ def run_pipeline_direct(scene: str, doors: bool, windows: bool,
     if windows:
         elems.append("window")
     if not elems:
-        yield ("Error: select at least one element type", "", None, "",
-               None, [], None, gr.update(), gr.update())
+        yield (
+            "Error: select at least one element type", "", None, "", None, [],
+            None, gr.update(), gr.update(), empty_viewer, viewer_panel(empty_viewer),
+        )
         return
+
+    # The manager returns immediately after Popen; pipeline work is never held
+    # up waiting for the viewer process or its GPU initialization.
+    viewer_session = start_viewer_for_scene(scene)
+    viewer_html = viewer_panel(viewer_session)
 
     from bim_recon.pipeline_runner import PipelineConfig, run_pipeline
     app_config = load_config()
     vlm = app_config.vlm
-
     pipe_config = PipelineConfig(
         name=scene,
         elements=elems,
@@ -311,41 +326,51 @@ def run_pipeline_direct(scene: str, doors: bool, windows: bool,
 
     console_lines: list[str] = []
     final_data = {}
-
     for msg, data in run_pipeline(pipe_config):
         console_lines.append(msg)
         console = "\n".join(console_lines[-MAX_CONSOLE_LINES:])
         if msg.startswith("ERROR"):
-            yield (f"{console}\n\nPipeline failed.", "", None, "Failed",
-                   None, [], None, gr.update(), gr.update())
+            yield (
+                f"{console}\n\nPipeline failed.", "", None, "Failed", None, [],
+                None, gr.update(), gr.update(), viewer_session, viewer_html,
+            )
             return
-        yield (console, "", None, "Running...", None, [], None,
-               gr.update(), gr.update())
+        yield (
+            console, "", None, "Running...", None, [], None,
+            gr.update(), gr.update(), viewer_session, viewer_html,
+        )
         final_data = data
 
-    # Pipeline complete — load results
     out_dir = final_data.get("out_dir", "")
     if not out_dir:
-        yield (f"Pipeline finished but no output directory.\n" +
-               "\n".join(console_lines[-10:]), "", None, "Failed",
-               None, [], None, gr.update(), gr.update())
+        yield (
+            f"Pipeline finished but no output directory.\n"
+            + "\n".join(console_lines[-10:]),
+            "", None, "Failed", None, [], None,
+            gr.update(), gr.update(), viewer_session, viewer_html,
+        )
         return
 
     console = "\n".join(console_lines[-MAX_CONSOLE_LINES:]) + f"\nDone: {out_dir}"
-    logger.info(f"Pipeline complete: {out_dir}")
-
+    logger.info("Pipeline complete: %s", out_dir)
     try:
         res = load_results(Path(out_dir))
-        logger.info(f"Results loaded: {len(res.doors)} doors, {len(res.windows)} windows")
-    except Exception as e:
-        logger.error(f"Failed to load results: {e}", exc_info=True)
-        yield (f"{console}\nError loading results: {e}", out_dir, None,
-               "Error", None, [], None, gr.update(), gr.update())
+        logger.info(
+            "Results loaded: %s doors, %s windows", len(res.doors), len(res.windows),
+        )
+    except Exception as exc:
+        logger.error("Failed to load results: %s", exc, exc_info=True)
+        yield (
+            f"{console}\nError loading results: {exc}", out_dir, None, "Error",
+            None, [], None, gr.update(), gr.update(), viewer_session, viewer_html,
+        )
         return
 
-    r = _prepare_results(res)
-    # r = (res, summary, vlm_imgs, radar_imgs, report, vlm_cb, elem_dd)
-    yield (console, out_dir, r[0], r[1], r[3], r[2], r[4], r[5], r[6])
+    prepared = _prepare_results(res)
+    yield (
+        console, out_dir, prepared[0], prepared[1], prepared[3], prepared[2],
+        prepared[4], prepared[5], prepared[6], viewer_session, viewer_html,
+    )
 
 
 def load_results_cb(out_dir: str):
@@ -552,14 +577,19 @@ def on_mask_apply(editor_value: dict | None, elem_label: str,
     }
 
 
-def fetch_camera_state() -> tuple[str, dict]:
-    """从 nerfview HTTP 端点 (端口 18082) 获取当前相机参数。返回 (显示文本, 原始数据)。"""
-    import urllib.request
+def fetch_camera_state(
+    viewer_session: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Read camera state from the exact viewer port assigned to this session."""
+    url = viewer_url(viewer_session)
+    if not url:
+        return (
+            "⚠️ 查看器尚未启动。运行管线会通过 Viewer Manager 异步启动它。",
+            {},
+        )
     try:
-        with urllib.request.urlopen(
-            "http://127.0.0.1:18082/camera-state", timeout=2,
-        ) as resp:
-            data = json.loads(resp.read())
+        with urllib.request.urlopen(f"{url}/camera-state", timeout=2) as response:
+            data = json.loads(response.read())
         if "error" in data:
             return f"⚠️ {data['error']}", {}
         pos = data["position"]
@@ -571,8 +601,13 @@ def fetch_camera_state() -> tuple[str, dict]:
             f"**Aspect**: {data['aspect']:.3f}",
             data,
         )
-    except Exception as e:
-        return f"⚠️ 无法连接查看器 (端口 18082)\n\n请先启动下方查看器。\n\n错误: {e}", {}
+    except Exception as exc:
+        return (
+            f"⚠️ 无法连接查看器 ({url})。\n\n"
+            "请等待 Viewer Manager 完成启动后重试。\n\n"
+            f"错误: {exc}",
+            {},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -863,13 +898,30 @@ def resegment_from_viewpoint(
     )
 
 
-def apply_vlm_review(results: PipelineResults | None, confirmed_labels: list[str]) -> str:
+def apply_vlm_review(
+    results: PipelineResults | None,
+    confirmed_labels: list[str],
+) -> tuple[PipelineResults | None, str]:
+    """Persist checkbox selections as the authoritative Revit export set."""
     if results is None:
-        return "未加载结果"
+        return None, "未加载结果"
     all_elems = results.doors + results.windows
-    confirmed_set = set(confirmed_labels)
-    total = len(all_elems)
-    kept = sum(1 for e in all_elems if f"{e.element_class} #{e.result_index}" in confirmed_set)
-    return f"VLM审核：{kept}/{total} 个构件已确认，可导出到Revit"
+    confirmed_set = set(confirmed_labels or [])
+    previous_states = [element.confirmed for element in all_elems]
+    try:
+        for element in all_elems:
+            label = f"{element.element_class} #{element.result_index}"
+            element.confirmed = label in confirmed_set
+        saved_paths = save_review_results(results, all_elems)
+    except Exception:
+        for element, previous in zip(all_elems, previous_states):
+            element.confirmed = previous
+        raise
+    kept = sum(element.confirmed for element in all_elems)
+    return (
+        results,
+        f"VLM审核：{kept}/{len(all_elems)} 个构件已确认；"
+        f"已保存到 {len(saved_paths)} 个 JSON 文件",
+    )
 
 

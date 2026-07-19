@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -198,6 +198,108 @@ def _load_elements(out_dir: Path, filename: str) -> list[ElementResult]:
             overlay_image=ring_img or view_str or None,
         ))
     return results
+
+
+def save_review_results(
+    results: PipelineResults,
+    elements: Iterable[ElementResult] | None = None,
+) -> list[Path]:
+    """Persist manual review decisions to verified JSON and pipeline report."""
+    reviewed = list(results.elements if elements is None else elements)
+    states: dict[str, dict[int, bool]] = {}
+    for element in reviewed:
+        states.setdefault(element.element_class, {})[element.result_index] = bool(
+            element.confirmed
+        )
+    if not states:
+        return []
+
+    documents: list[tuple[Path, dict[str, Any]]] = []
+    persisted: set[tuple[str, int]] = set()
+    for path in sorted(results.out_dir.glob("*_verified.json")):
+        data = json.loads(path.read_text("utf-8"))
+        element_class = str(data.get("element", ""))
+        class_states = states.get(element_class)
+        if not class_states:
+            continue
+        entries = data.get("results")
+        if not isinstance(entries, list):
+            raise ValueError(f"Invalid review results array in {path}")
+        for result_index, entry in enumerate(entries):
+            if result_index not in class_states:
+                continue
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Invalid review result #{result_index} in {path}"
+                )
+            entry["confirmed"] = class_states[result_index]
+            persisted.add((element_class, result_index))
+        data["confirmed"] = sum(
+            bool(entry.get("confirmed"))
+            for entry in entries
+            if isinstance(entry, dict)
+        )
+        documents.append((path, data))
+
+    expected = {
+        (element_class, result_index)
+        for element_class, class_states in states.items()
+        for result_index in class_states
+    }
+    missing = sorted(expected - persisted)
+    if missing:
+        raise ValueError(
+            "Review results have no matching *_verified.json entries: "
+            + ", ".join(f"{name} #{index}" for name, index in missing)
+        )
+
+    report_path = results.out_dir / "pipeline_report.json"
+    report: dict[str, Any] | None = None
+    if report_path.exists():
+        report = json.loads(report_path.read_text("utf-8"))
+        sections = report.get("elements", {})
+        if isinstance(sections, dict):
+            for element_class, class_states in states.items():
+                section = sections.get(element_class)
+                if not isinstance(section, dict):
+                    continue
+                entries = section.get("results", [])
+                if not isinstance(entries, list):
+                    continue
+                for result_index, confirmed in class_states.items():
+                    if result_index < len(entries) and isinstance(
+                        entries[result_index], dict
+                    ):
+                        entries[result_index]["confirmed"] = confirmed
+                section["confirmed"] = sum(
+                    bool(entry.get("confirmed"))
+                    for entry in entries
+                    if isinstance(entry, dict)
+                )
+            merged = report.get("merged_elements")
+            if isinstance(merged, dict):
+                merged["confirmed"] = sum(
+                    section.get("confirmed", 0)
+                    for section in sections.values()
+                    if isinstance(section, dict)
+                )
+        documents.append((report_path, report))
+
+    for path, data in documents:
+        _write_json_atomic(path, data)
+    if report is not None:
+        results.report = report
+    return [path for path, _data in documents]
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Replace one JSON document without exposing a partially written file."""
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 # ---------------------------------------------------------------------------
