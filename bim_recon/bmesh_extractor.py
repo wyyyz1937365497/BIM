@@ -18,6 +18,7 @@ The helper keeps the Gradio callback thin and is independently testable.
 """
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import re
@@ -237,7 +238,8 @@ def _rle_to_alpha(detection, x0: int, y0: int, x1: int, y1: int, crop_size):
     except ImportError:
         logger.warning("pycocotools not available; falling back to opaque alpha")
         return None
-    counts = rle.encode("utf-8") if isinstance(rle, str) else rle
+    # Falcon server base64-encodes the COCO RLE counts bytes for JSON transport.
+    counts = base64.b64decode(rle) if isinstance(rle, str) else rle
     try:
         full_mask = mask_utils.decode({"counts": counts, "size": list(size)})
     except Exception as exc:

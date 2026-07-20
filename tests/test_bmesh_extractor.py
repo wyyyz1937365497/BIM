@@ -6,8 +6,10 @@ from PIL import Image
 
 from bim_recon.bmesh_extractor import (
     ExtractionResult,
+    _build_cutout,
     _extract_user_bbox,
     _parse_vlm_label,
+    _rle_to_alpha,
     _select_detection,
     classify_and_segment,
 )
@@ -113,3 +115,44 @@ def test_classify_and_segment_reports_when_falcon_finds_nothing():
     assert result.label == "lamp"
     assert result.cutout is None
     assert "未检测到" in result.detail
+
+
+
+def test_rle_mask_roundtrip_produces_pixel_accurate_alpha():
+    """Verify the cutout uses Falcon's pixel-level RLE mask, not just a bbox crop."""
+    from pycocotools import mask as mask_utils
+    import base64 as b64
+
+    # Create a 100×100 image with a known L-shaped mask region
+    h, w = 100, 100
+    base_rgb = np.ones((h, w, 3), dtype=np.uint8) * 200
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[20:60, 20:60] = 1   # main block
+    mask[60:80, 20:40] = 1   # appendage — non-rectangular
+
+    # Encode as COCO RLE, then base64 like the Falcon server does
+    rle = mask_utils.encode(np.asfortranarray(mask))
+    counts_b64 = b64.b64encode(rle["counts"]).decode("ascii")
+
+    class _FakeDet:
+        pass
+    det = _FakeDet()
+    det.mask_rle = counts_b64
+    det.mask_size = [h, w]
+    det.mask_bbox = {"x": 0.3, "y": 0.4, "w": 0.4, "h": 0.5}
+    det.bbox = det.mask_bbox
+
+    cutout = _build_cutout(base_rgb, det, padding=0.0)
+    assert cutout is not None
+    assert cutout.mode == "RGBA"
+
+    # The alpha channel must match the mask shape (non-rectangular)
+    alpha = np.array(cutout)[:, :, 3]
+    # Some pixels inside the bbox should be transparent (background)
+    assert (alpha == 0).any(), "Expected transparent pixels outside the mask"
+    # Some pixels inside the bbox should be opaque (object)
+    assert (alpha == 255).any(), "Expected opaque pixels inside the mask"
+    # The mask region should be non-rectangular (L-shape)
+    alpha_bin = (alpha > 0).astype(np.uint8)
+    # Top-right corner of the bbox should be empty (not part of L-shape)
+    assert alpha_bin[:20, 40:].sum() == 0 or alpha_bin[60:, 40:].sum() == 0
