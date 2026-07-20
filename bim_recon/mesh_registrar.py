@@ -523,19 +523,27 @@ def register_mesh_in_revit(
         "face_count": len(transform.faces),
     }
 
+    # Write payload to a temp file — large meshes (>1MB JSON) stall the
+    # MCP stdio transport.  The C# script auto-detects file paths.
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w",
+    ) as tmp:
+        json.dump(payload, tmp)
+        payload_path = tmp.name
+
     if runner is not None:
         result = runner.run(
             "create_directshape_from_mesh",
-            parameters=[json.dumps(payload)],
+            parameters=[payload_path],
         )
         if "_note" in result:
-            # No MCP sender configured — return for manual dispatch
-            return {**base_info, "status": "formatted", "payload_json": json.dumps(payload)}
+            return {**base_info, "status": "formatted", "payload_path": payload_path}
         return {**base_info, "status": "ok", **result}
 
     return {
         **base_info,
         "status": "formatted",
-        "payload_json": json.dumps(payload),
+        "payload_path": payload_path,
         "script_name": "create_directshape_from_mesh",
     }

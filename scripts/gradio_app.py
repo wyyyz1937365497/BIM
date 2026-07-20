@@ -807,6 +807,7 @@ def build_app() -> gr.Blocks:
                     )
                     try:
                         transform = compute_placement_transform(placement)
+                        from bim_recon.mcp_gateway import StdioMCPGateway
                         revit_cfg = cfg.revit_mcp
                         runner = RevitScriptRunner(mcp_sender=None)
                         revit_result = register_mesh_in_revit(
@@ -814,8 +815,7 @@ def build_app() -> gr.Blocks:
                         )
                         placement_info["revit"] = revit_result
                         if revit_result.get("status") == "formatted":
-                            # Actually dispatch to Revit MCP
-                            from bim_recon.mcp_gateway import StdioMCPGateway
+                            # Call the compiled create_directshape_from_mesh MCP tool
                             gateway = StdioMCPGateway(
                                 command=revit_cfg.command,
                                 args=tuple(revit_cfg.args),
@@ -824,11 +824,8 @@ def build_app() -> gr.Blocks:
                             )
                             import asyncio as _aio
                             resp = _aio.run(gateway.call_tool(
-                                "send_code_to_revit",
-                                {
-                                    "code": runner.load_code("create_directshape_from_mesh"),
-                                    "parameters": [revit_result["payload_json"]],
-                                },
+                                "create_directshape_from_mesh",
+                                {"meshFile": revit_result["payload_path"]},
                             ))
                             placement_info["revit_response"] = resp
                             output["Revit"] = "✅ DirectShape 已创建"
