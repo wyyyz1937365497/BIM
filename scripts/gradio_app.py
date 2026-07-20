@@ -9,6 +9,7 @@ The gsplat renderer initializes the Visual Studio compiler environment on demand
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import shutil
 import subprocess
@@ -208,6 +209,21 @@ def build_app() -> gr.Blocks:
         )
         revit_build_status = gr.Markdown("等待执行")
         revit_build_result = gr.JSON(label="创建与核验结果")
+
+        gr.Markdown(
+            "### ⑤b B 类物体确定性导入（Falcon 分割 → TRELLIS Mesh → DirectShape）\n"
+            "对管线已确认的家具等 B 类检测结果，自动渲染视角、Falcon 分割抠图、"
+            "TRELLIS 生成 mesh、并通过编译版 `create_directshape_from_mesh` 注册到 Revit。"
+            "需要 Falcon 服务（端口 18390）、TRELLIS 服务（端口 18391）和 Revit MCP 同时在线。"
+        )
+        with gr.Row():
+            bclass_seed = gr.Number(label="TRELLIS 种子", value=1, precision=0)
+            bclass_debug = gr.Checkbox(label="保存分割调试图", value=False)
+            bclass_run_btn = gr.Button(
+                "执行 B 类物体确定性导入", variant="primary",
+            )
+        bclass_status = gr.Markdown("等待执行")
+        bclass_result = gr.JSON(label="B 类物体导入结果")
 
         # ====== ⑤b B类构件手动提取 ======
         # (自动化扫描与审批已暂时移除，仅保留手动选取流程)
@@ -520,6 +536,142 @@ def build_app() -> gr.Blocks:
                 revit_level_name,
             ],
             outputs=[revit_build_status, revit_build_result],
+        )
+        # --- B-class deterministic extraction → TRELLIS → DirectShape ---
+        async def _run_bclass_workflow(
+            results: PipelineResults | None,
+            scene_name: str,
+            seed: int,
+            debug: bool,
+        ):
+            if results is None:
+                yield "请先加载一次管线结果。", {"error": "missing_pipeline_results"}
+                return
+            if not scene_name:
+                yield "请先选择场景。", {"error": "missing_scene"}
+                return
+            b_elements = [
+                e for e in results.elements
+                if e.confirmed and e.element_class not in {"door", "window"}
+            ]
+            if not b_elements:
+                yield "未发现已确认的 B 类物体（运行管线时勾选 furniture）。", {
+                    "error": "no_b_class_elements",
+                }
+                return
+
+            from bim_recon.bmesh_pipeline import extract_bclass_element
+            from bim_recon.trellis_workflow import (
+                TrellisRevitWorkflow,
+                TrellisWorkflowConfig,
+                approved_object_from_extraction,
+            )
+
+            scene = _get_scene(scene_name)
+            if scene is None:
+                yield f"❌ 无法加载场景 {scene_name}", {"error": "scene_load_failed"}
+                return
+            falcon = _get_falcon()
+            if falcon is None:
+                yield "❌ Falcon 服务不可达，请先启动 Falcon-Perception。", {
+                    "error": "falcon_unreachable",
+                }
+                return
+
+            coords = results.coords or {}
+            up_axis = int(coords.get("up_axis", 2))
+            floor_z = float(coords.get("floor_z", 0.0))
+            ceiling_z = float(coords.get("ceiling_z", 3.0))
+            center = coords.get("center", [0.0, 0.0])
+            scan_center = (float(center[0]), float(center[1]))
+
+            out_dir = ROOT / "output" / scene_name / "_bclass_deterministic"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            extractions = []
+            lines: list[str] = []
+            for idx, element in enumerate(b_elements, start=1):
+                lines.append(
+                    f"[{idx}/{len(b_elements)}] 提取 {element.element_class} "
+                    f"#{element.result_index}..."
+                )
+                yield "\n\n".join(lines[-30:]), {"phase": "extract", "current": idx}
+                try:
+                    extraction = await asyncio.to_thread(
+                        extract_bclass_element,
+                        element, scene, falcon,
+                        output_dir=out_dir,
+                        scan_center=scan_center,
+                        floor_z=floor_z, ceiling_z=ceiling_z,
+                        up_axis=up_axis,
+                        debug=bool(debug),
+                    )
+                except Exception as exc:
+                    lines.append(f"  ⚠️ 提取失败: {exc}")
+                    yield "\n\n".join(lines[-30:]), {"phase": "extract", "current": idx}
+                    continue
+                if extraction is None:
+                    lines.append("  ⚠️ Falcon 未分割到目标物体，跳过")
+                    yield "\n\n".join(lines[-30:]), {"phase": "extract", "current": idx}
+                    continue
+                extractions.append(extraction)
+                lines.append(
+                    f"  ✅ 抠图就绪: {extraction.cutout_path.name} "
+                    f"@ ({extraction.position_3d[0]:.2f},"
+                    f"{extraction.position_3d[1]:.2f},"
+                    f"{extraction.position_3d[2]:.2f})"
+                )
+                yield "\n\n".join(lines[-30:]), {"phase": "extract", "current": idx}
+
+            if not extractions:
+                lines.append("❌ 没有可用的抠图，终止")
+                yield "\n\n".join(lines[-30:]), {"error": "no_cutouts"}
+                return
+
+            cfg = load_config()
+            trellis_cfg = cfg.trellis
+            client_factory = lambda: TrellisClient(
+                host=trellis_cfg.host, port=trellis_cfg.port,
+                timeout=trellis_cfg.timeout,
+            )
+            revit_cfg = cfg.revit_mcp
+            gateway = StdioMCPGateway(
+                command=revit_cfg.command,
+                args=tuple(revit_cfg.args),
+                cwd=str(ROOT),
+                timeout_seconds=float(revit_cfg.timeout),
+            )
+            objects = tuple(
+                approved_object_from_extraction(ex, seed=int(seed))
+                for ex in extractions
+            )
+            workflow = TrellisRevitWorkflow(
+                TrellisWorkflowConfig(
+                    objects=objects,
+                    output_dir=out_dir,
+                    register_in_revit=True,
+                ),
+                client_factory=client_factory,
+                gateway=gateway,
+            )
+            latest: dict = {}
+            async for update in stream_workflow_gradio(workflow):
+                lines.append(update.message)
+                latest = update.payload or latest
+                yield "\n\n".join(lines[-30:]), latest
+            summary = {
+                "objects_total": len(objects),
+                "completed": latest.get("completed", 0) if isinstance(latest, dict) else 0,
+                "failed": latest.get("failed", 0) if isinstance(latest, dict) else 0,
+                "output_dir": str(out_dir),
+                "manifest": latest,
+            }
+            yield "✅ B 类物体确定性导入完成\n\n" + "\n".join(lines[-30:]), summary
+
+        bclass_run_btn.click(
+            fn=_run_bclass_workflow,
+            inputs=[results_state, scene_state, bclass_seed, bclass_debug],
+            outputs=[bclass_status, bclass_result],
         )
         # --- TRELLIS mesh generation ---
         def _on_trellis_generate(image_path: str, name: str, seed: int) -> dict:

@@ -482,27 +482,21 @@ def _build_axis_remap_rotation(up_axis: int) -> np.ndarray:
 def register_mesh_in_revit(
     placement: MeshPlacement,
     transform: MeshTransform,
-    runner: Any | None = None,
 ) -> dict[str, Any]:
-    """Send the transformed mesh to Revit as a DirectShape via C# script.
+    """Build the DirectShape mesh payload and persist it for the compiled tool.
 
-    If *runner* is a :class:`~bim_recon.revit_runner.RevitScriptRunner` with an
-    MCP sender configured, the mesh is immediately created in Revit.
-
-    If *runner* is ``None`` (e.g. when Revit is not running or the pipeline is
-    executed headless), the formatted payload and C# code are returned for
-    later manual dispatch via ``send_code_to_revit``.
+    The compiled ``create_directshape_from_mesh`` MCP tool is invoked by the
+    caller via the MCP gateway (file-path mode). This helper only writes the
+    Revit-ready payload to a temp file and returns its path so the caller can
+    dispatch ``{"meshFile": payload_path}`` in any environment.
 
     Args:
         placement: The placement specification (name, category, etc.).
         transform: The computed mesh transform (vertices in meters, faces).
-        runner: Optional ``RevitScriptRunner`` instance. If provided and has
-            an MCP sender, the DirectShape is created immediately.
 
     Returns:
-        Dict with keys: ``status``, ``vertex_count``, ``face_count``, and
-        either ``element_id`` (if Revit was called) or ``payload_json`` +
-        ``script_name`` (for manual dispatch).
+        Dict with keys: ``status`` ("formatted"), ``payload_path``,
+        ``vertex_count``, ``face_count``, ``script_name``.
     """
     meters_to_feet = 3.280839895013123
 
@@ -518,13 +512,6 @@ def register_mesh_in_revit(
         "faces": faces_flat,
     }
 
-    base_info = {
-        "vertex_count": len(vertices_feet),
-        "face_count": len(transform.faces),
-    }
-
-    # Write payload to a temp file — large meshes (>1MB JSON) stall the
-    # MCP stdio transport.  The C# script auto-detects file paths.
     import tempfile
     with tempfile.NamedTemporaryFile(
         suffix=".json", delete=False, mode="w",
@@ -532,18 +519,10 @@ def register_mesh_in_revit(
         json.dump(payload, tmp)
         payload_path = tmp.name
 
-    if runner is not None:
-        result = runner.run(
-            "create_directshape_from_mesh",
-            parameters=[payload_path],
-        )
-        if "_note" in result:
-            return {**base_info, "status": "formatted", "payload_path": payload_path}
-        return {**base_info, "status": "ok", **result}
-
     return {
-        **base_info,
         "status": "formatted",
         "payload_path": payload_path,
+        "vertex_count": len(vertices_feet),
+        "face_count": len(transform.faces),
         "script_name": "create_directshape_from_mesh",
     }

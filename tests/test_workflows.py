@@ -99,6 +99,11 @@ class _FakeGateway:
             self._next_script_id += 1
             self.created_ids.extend(ids)
             return {"success": True, "result": json.dumps({"elementId": ids[0]})}
+        elif name == "create_directshape_from_mesh":
+            ids = [self._next_script_id]
+            self._next_script_id += 1
+            self.created_ids.extend(ids)
+            return {"Success": True, "Response": ids[0]}
         else:
             raise AssertionError(name)
         if name != "get_current_view_elements":
@@ -634,7 +639,7 @@ def test_trellis_workflow_requires_approval_and_registers_selected_mesh(
         lambda _placement, _transform: {
             "vertex_count": 8,
             "face_count": 12,
-            "payload_json": "{}",
+            "payload_path": str(tmp_path / "payload.json"),
         },
     )
     workflow = TrellisRevitWorkflow(
@@ -657,7 +662,7 @@ def test_trellis_workflow_requires_approval_and_registers_selected_mesh(
     completed = next(event for event in events if isinstance(event, WorkflowCompleted))
     assert completed.result["completed"] == 1
     assert fake_client.requests[0].name == "chair_obj_001"
-    assert gateway.calls[-1][0] == "send_code_to_revit"
+    assert gateway.calls[-1][0] == "create_directshape_from_mesh"
 
 
 def test_reconstruction_workflow_surfaces_failed_preflight_without_heavy_steps(

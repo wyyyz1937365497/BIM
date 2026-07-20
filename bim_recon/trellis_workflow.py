@@ -16,7 +16,6 @@ from bim_recon.mesh_registrar import (
     compute_placement_transform,
     register_mesh_in_revit,
 )
-from bim_recon.revit_runner import RevitScriptRunner
 from bim_recon.trellis_client import (
     TrellisClient,
     TrellisMeshRequest,
@@ -64,6 +63,27 @@ class TrellisWorkflowConfig:
 TrellisFactory = Callable[[], TrellisClient]
 
 
+def approved_object_from_extraction(
+    extraction,
+    *,
+    seed: int = 1,
+) -> ApprovedMeshObject:
+    """Convert a :class:`~bim_recon.bmesh_pipeline.BClassExtraction` into an
+    :class:`ApprovedMeshObject` ready for the TRELLIS workflow.
+    """
+    return ApprovedMeshObject(
+        object_id=f"{extraction.element.element_class}_{extraction.element.result_index}",
+        label=extraction.element.element_class,
+        image_path=extraction.cutout_path,
+        position_3d=extraction.position_3d,
+        up_axis=extraction.up_axis,
+        width_m=extraction.width_m,
+        height_m=extraction.height_m,
+        seed=seed,
+    )
+
+
+
 class TrellisRevitWorkflow(Workflow):
     """Generate approved meshes one-by-one and optionally create DirectShapes."""
 
@@ -81,7 +101,6 @@ class TrellisRevitWorkflow(Workflow):
         self.gateway = gateway
         self.client: TrellisClient | None = None
         self.results: list[dict[str, Any]] = []
-        self.script = RevitScriptRunner().load_code("create_directshape_from_mesh")
 
     @step
     async def prepare(
@@ -250,11 +269,11 @@ class TrellisRevitWorkflow(Workflow):
         if not self.config.register_in_revit:
             return base
         assert self.gateway is not None
-        response = await self.gateway.call_tool("send_code_to_revit", {
-            "code": self.script,
-            "parameters": [formatted["payload_json"]],
-            "transactionMode": "auto",
-        })
+        # Use the compiled create_directshape_from_mesh MCP tool (file path mode)
+        response = await self.gateway.call_tool(
+            "create_directshape_from_mesh",
+            {"meshFile": formatted["payload_path"]},
+        )
         return {**base, "revit_response": response}
 
     def _write_manifest(self) -> Path:
