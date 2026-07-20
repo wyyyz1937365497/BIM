@@ -82,6 +82,56 @@ def _extract_user_bbox(mask_editor_value: dict[str, Any] | None) -> tuple[np.nda
     bbox = (int(x_sel[0]), int(y_sel[0]), int(x_sel[-1]), int(y_sel[-1]))
     return base_rgb, bbox
 
+class _DebugSink:
+    """Save intermediate artifacts when a debug directory is configured."""
+
+    def __init__(self, debug_dir: str | Path | None):
+        self.dir = Path(debug_dir) if debug_dir else None
+        if self.dir:
+            self.dir.mkdir(parents=True, exist_ok=True)
+
+    def save_image(self, name: str, arr: np.ndarray) -> None:
+        if self.dir is None or arr is None:
+            return
+        Image.fromarray(arr).save(self.dir / name)
+
+    def save_text(self, name: str, text: str) -> None:
+        if self.dir is None:
+            return
+        (self.dir / name).write_text(text or "", encoding="utf-8")
+
+    def save_temp(self, pil_image: Image.Image, name: str) -> str:
+        """Return a path to *pil_image* for VLM consumption.
+
+        When a debug dir is set the image persists there; otherwise it goes
+        to an auto-deleted temp file.
+        """
+        if self.dir:
+            path = str(self.dir / name)
+            pil_image.save(path)
+            return path
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            path = tmp.name
+        pil_image.save(path)
+        return path
+
+
+def _crop_with_padding(
+    base_rgb: np.ndarray, bbox: tuple[int, int, int, int], padding_ratio: float = 0.2,
+) -> Image.Image:
+    """Crop to the bbox interior with symmetric padding for VLM fallback input."""
+    x0, y0, x1, y1 = bbox
+    bw = x1 - x0
+    bh = y1 - y0
+    pad_x = int(bw * padding_ratio)
+    pad_y = int(bh * padding_ratio)
+    h_img, w_img = base_rgb.shape[:2]
+    cx0 = max(0, x0 - pad_x)
+    cy0 = max(0, y0 - pad_y)
+    cx1 = min(w_img, x1 + pad_x)
+    cy1 = min(h_img, y1 + pad_y)
+    return Image.fromarray(base_rgb).crop((cx0, cy0, cx1, cy1))
+
 
 def _parse_vlm_label(response: str) -> str:
     """Reduce a VLM reply to a clean referring expression for Falcon.
@@ -223,6 +273,7 @@ def classify_and_segment(
     vlm_caller,
     falcon_client,
     *,
+    debug_dir: str | Path | None = None,
     vlm_prompt: str = (
         "请看图片中红色方框内的物体，用英文写一个简短的指代短语来描述这个物体。"
         "需要包含物体种类和1-2个区分特征（颜色、位置、材质等）。"
@@ -243,6 +294,10 @@ def classify_and_segment(
         annotated image to a VLM and returns its text reply.
     falcon_client
         ``FalconClient`` (or compatible) with ``segment(image, query)``.
+    debug_dir
+        If set, every intermediate artifact is saved here for debugging:
+        the original render, the annotated image sent to the VLM, the raw
+        VLM response, the Falcon overlay, and the final cutout.
 
     Returns
     -------
@@ -255,23 +310,48 @@ def classify_and_segment(
     h_img, w_img = base_rgb.shape[:2]
     bbox = user_bbox
 
-    annotated = _annotate_bbox(base_rgb, bbox)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        annotated_path = tmp.name
-    annotated.save(annotated_path)
+    debug = _DebugSink(debug_dir)
+    debug.save_image("00_render.png", base_rgb)
 
+    # --- Step 1: VLM classification (full image + red box annotation) ---
+    annotated = _annotate_bbox(base_rgb, bbox)
+    debug.save_image("01_vlm_input_annotated.png", np.array(annotated))
+
+    annotated_path = debug.save_temp(annotated, "01_vlm_input_annotated.png")
     try:
         vlm_response = vlm_caller(annotated_path, vlm_prompt)
     except Exception as exc:
-        Path(annotated_path).unlink(missing_ok=True)
         return ExtractionResult("", None, None, f"❌ VLM 调用失败: {exc}")
     finally:
-        Path(annotated_path).unlink(missing_ok=True)
+        if debug_dir is None:
+            Path(annotated_path).unlink(missing_ok=True)
+
+    debug.save_text("02_vlm_response.txt", vlm_response)
 
     label = _parse_vlm_label(vlm_response)
+
+    # --- Fallback: if VLM returned empty, retry with a tight crop + simple prompt ---
+    if not label:
+        cropped = _crop_with_padding(base_rgb, bbox, padding_ratio=0.2)
+        debug.save_image("01b_vlm_input_cropped.png", np.array(cropped))
+        cropped_path = debug.save_temp(cropped, "01b_vlm_input_cropped.png")
+        simple_prompt = "这张图片里是什么物体？请用英文回答物体的名称，例如 chair, lamp, vase。只回答一个词。"
+        try:
+            vlm_response_crop = vlm_caller(cropped_path, simple_prompt)
+        except Exception:
+            vlm_response_crop = ""
+        finally:
+            if debug_dir is None:
+                Path(cropped_path).unlink(missing_ok=True)
+        debug.save_text("02b_vlm_response_cropped.txt", vlm_response_crop)
+        label = _parse_vlm_label(vlm_response_crop)
+        if label:
+            vlm_response = vlm_response_crop
+
     if not label:
         return ExtractionResult("", None, None, f"⚠️ VLM 未能识别物体（原始回复: {vlm_response!r}）")
 
+    # --- Step 2: Falcon segmentation ---
     if falcon_client is None:
         return ExtractionResult(label, None, None, f"⚠️ 识别为「{label}」，但 Falcon 服务不可用")
 
@@ -291,6 +371,10 @@ def classify_and_segment(
 
     cutout = _build_cutout(base_rgb, selected)
     overlay = _draw_segmentation_overlay(base_rgb, selected)
+    debug.save_image("03_falcon_overlay.png", overlay)
+    if cutout is not None:
+        debug.save_image("04_cutout.png", np.array(cutout))
+
     area_pct = round((selected.mask_area_ratio or 0) * 100, 1)
     return ExtractionResult(
         label, cutout, overlay,
@@ -302,10 +386,12 @@ def classify_and_segment_from_mask_editor(
     mask_editor_value: dict[str, Any] | None,
     vlm_caller,
     falcon_client,
+    *,
+    debug_dir: str | Path | None = None,
 ) -> ExtractionResult:
     """Backward-compatible wrapper that extracts bbox from a Gradio ImageMask dict."""
     extracted = _extract_user_bbox(mask_editor_value)
     if extracted is None:
         return ExtractionResult("", None, None, "⚠️ 请先在渲染图上框选目标物体")
     base_rgb, bbox = extracted
-    return classify_and_segment(base_rgb, bbox, vlm_caller, falcon_client)
+    return classify_and_segment(base_rgb, bbox, vlm_caller, falcon_client, debug_dir=debug_dir)

@@ -879,15 +879,17 @@ def build_app() -> gr.Blocks:
                     timeout=30, max_tokens=80,
                 )
 
-            result = classify_and_segment_from_mask_editor(mask_editor_val, vlm_caller, falcon)
+            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            debug_dir = out_dir / f"debug_{int(time.time())}"
+            result = classify_and_segment_from_mask_editor(
+                mask_editor_val, vlm_caller, falcon, debug_dir=debug_dir,
+            )
 
             cutout_path = None
             cutout_preview = None
             if result.cutout is not None:
-                out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                cutout_path = str(out_dir / f"{result.label}_{int(time.time())}_cutout.png")
-                result.cutout.save(cutout_path)
+                cutout_path = str(debug_dir / "04_cutout.png")
                 cutout_preview = np.array(result.cutout)
 
             return (
