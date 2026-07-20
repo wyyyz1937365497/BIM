@@ -944,7 +944,6 @@ def build_app() -> gr.Blocks:
                         MeshPlacement, compute_placement_transform,
                         register_mesh_in_revit,
                     )
-                    from bim_recon.revit_runner import RevitScriptRunner
                     placement = MeshPlacement(
                         glb_path=Path(mesh_result.glb_path),
                         world_x=world_x,
@@ -961,10 +960,7 @@ def build_app() -> gr.Blocks:
                         transform = compute_placement_transform(placement)
                         from bim_recon.mcp_gateway import StdioMCPGateway
                         revit_cfg = cfg.revit_mcp
-                        runner = RevitScriptRunner(mcp_sender=None)
-                        revit_result = register_mesh_in_revit(
-                            placement, transform, runner=runner,
-                        )
+                        revit_result = register_mesh_in_revit(placement, transform)
                         placement_info["revit"] = revit_result
                         if revit_result.get("status") == "formatted":
                             # Call the compiled create_directshape_from_mesh MCP tool
@@ -974,8 +970,7 @@ def build_app() -> gr.Blocks:
                                 cwd=str(ROOT),
                                 timeout_seconds=float(revit_cfg.timeout),
                             )
-                            import asyncio as _aio
-                            resp = _aio.run(gateway.call_tool(
+                            resp = asyncio.run(gateway.call_tool(
                                 "create_directshape_from_mesh",
                                 {"meshFile": revit_result["payload_path"]},
                             ))
