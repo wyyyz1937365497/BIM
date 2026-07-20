@@ -661,7 +661,8 @@ def find_best_yaw_silhouette(
     camera_target: tuple[float, float, float],
     camera_up_axis: int,
     camera_fov: float,
-    camera_img_size: int,
+    camera_img_w: int,
+    camera_img_h: int,
     world_pos: tuple[float, float, float],
     element_width_m: float,
     *,
@@ -693,7 +694,10 @@ def find_best_yaw_silhouette(
             original rendering. The mesh is projected through this camera.
         camera_up_axis: World up axis at capture time (usually 2 for Z-up).
         camera_fov: Camera vertical FOV in degrees.
-        camera_img_size: Edge length of the original (square) rendering.
+        camera_img_w, camera_img_h: Dimensions of the original rendering. Must
+            match the actual image used for Falcon segmentation; non-square
+            images are handled correctly (focal derived from the vertical FOV
+            and ``camera_img_h``, x-centering uses ``camera_img_w``).
         world_pos: (x, y, z) world position where the mesh should be placed
             for projection. Use the depth-backprojected mask centre.
         element_width_m: Physical width for scale matching (same value used
@@ -739,14 +743,20 @@ def find_best_yaw_silhouette(
     right = np.cross(fwd, up_vec)
     right /= np.linalg.norm(right) + 1e-12
     down = np.cross(fwd, right)
-    focal = 0.5 * camera_img_size / np.tan(np.radians(camera_fov) / 2.0)
+    # Focal length: FOV is vertical → derive from img_h. Square pixels →
+    # focal_x == focal_y. x-centering uses img_w, y-centering uses img_h.
+    focal_y = 0.5 * camera_img_h / np.tan(np.radians(camera_fov) / 2.0)
+    focal_x = focal_y  # square pixels
+    center_x = camera_img_w / 2.0
+    center_y = camera_img_h / 2.0
 
     # Reconstruct the crop region in full-image pixel coords.
     # norm_bbox uses center-x/center-y convention; padding expands each side.
-    bx_c = norm_bbox.get("x", 0.5) * camera_img_size
-    by_c = norm_bbox.get("y", 0.5) * camera_img_size
-    bw = max(norm_bbox.get("w", 0.2) * camera_img_size, 4.0)
-    bh = max(norm_bbox.get("h", 0.2) * camera_img_size, 4.0)
+    # x-coordinates scale by img_w, y-coordinates by img_h (non-square aware).
+    bx_c = norm_bbox.get("x", 0.5) * camera_img_w
+    by_c = norm_bbox.get("y", 0.5) * camera_img_h
+    bw = max(norm_bbox.get("w", 0.2) * camera_img_w, 4.0)
+    bh = max(norm_bbox.get("h", 0.2) * camera_img_h, 4.0)
     pad_x = bw * cutout_padding
     pad_y = bh * cutout_padding
     crop_x0 = bx_c - bw / 2.0 - pad_x
@@ -781,8 +791,8 @@ def find_best_yaw_silhouette(
         if not np.any(valid):
             return np.zeros((crop_h, crop_w), dtype=bool)
 
-        px_full = (x_cam[valid] / z_cam[valid]) * focal + camera_img_size / 2.0
-        py_full = (y_cam[valid] / z_cam[valid]) * focal + camera_img_size / 2.0
+        px_full = (x_cam[valid] / z_cam[valid]) * focal_x + center_x
+        py_full = (y_cam[valid] / z_cam[valid]) * focal_y + center_y
 
         # Map from full-image coords to crop-local coords
         px_crop = px_full - crop_x0

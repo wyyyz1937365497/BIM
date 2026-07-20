@@ -973,7 +973,6 @@ def build_app() -> gr.Blocks:
                         cutout_alpha = cutout_arr[:, :, 3] if cutout_arr.ndim == 3 else cutout_arr
                         # Falcon bbox is in normalized coords of the FULL rendering.
                         # render_state stored the full rendering size.
-                        cam_img_size = max(img_w, img_h)
                         auto_yaw_result = find_best_yaw_silhouette(
                             glb_path=Path(mesh_result.glb_path),
                             cutout_alpha=cutout_alpha,
@@ -982,7 +981,8 @@ def build_app() -> gr.Blocks:
                             camera_target=tuple(float(v) for v in cam["target"]),
                             camera_up_axis=up_axis,
                             camera_fov=float(cam.get("fov", 50.0)),
-                            camera_img_size=int(cam_img_size),
+                            camera_img_w=int(img_w),
+                            camera_img_h=int(img_h),
                             world_pos=(world_x, world_y, world_z),
                             element_width_m=max(element_width_m, 0.1),
                             up_axis=up_axis,

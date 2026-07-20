@@ -585,20 +585,23 @@ class TestFindBestYawSilhouette:
 
     def _bbox_from_projection(
         self, vertices_centered: np.ndarray, yaw_deg: float,
-        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
+        eye: tuple, target: tuple, up_axis: int, fov: float,
+        img_w: int, img_h: int,
         padding: float = 0.15,
     ) -> dict:
         """Project the yawed mesh and derive a normalized bbox that encloses it.
 
         This mirrors what Falcon would detect: a tight bbox around the visible
-        object silhouette, with a small padding margin.
+        object silhouette, with a small padding margin. Supports non-square
+        images (x scales by img_w, y by img_h).
         """
         up = np.zeros(3); up[up_axis] = 1.0
         eye_a = np.array(eye, float); tgt_a = np.array(target, float)
         fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
         right = np.cross(fwd, up); right /= np.linalg.norm(right)
         down = np.cross(fwd, right)
-        focal = 0.5 * img_size / np.tan(np.radians(fov) / 2.0)
+        focal_y = 0.5 * img_h / np.tan(np.radians(fov) / 2.0)
+        focal_x = focal_y  # square pixels
 
         yaw = np.radians(yaw_deg)
         c, s = np.cos(yaw), np.sin(yaw)
@@ -611,33 +614,36 @@ class TestFindBestYawSilhouette:
         rel = world - eye_a
         z = rel @ fwd; x = rel @ right; y = rel @ down
         v = z > 0.1
-        px = (x[v] / z[v]) * focal + img_size / 2.0
-        py = (y[v] / z[v]) * focal + img_size / 2.0
+        px = (x[v] / z[v]) * focal_x + img_w / 2.0
+        py = (y[v] / z[v]) * focal_y + img_h / 2.0
 
         x0, x1 = px.min(), px.max()
         y0, y1 = py.min(), py.max()
         w = x1 - x0; h = y1 - y0
         pad_x = w * padding; pad_y = h * padding
-        cx = (x0 + x1) / 2 / img_size
-        cy = (y0 + y1) / 2 / img_size
+        cx = (x0 + x1) / 2 / img_w
+        cy = (y0 + y1) / 2 / img_h
         return {
             "x": float(cx), "y": float(cy),
-            "w": float((w + 2 * pad_x) / img_size),
-            "h": float((h + 2 * pad_y) / img_size),
+            "w": float((w + 2 * pad_x) / img_w),
+            "h": float((h + 2 * pad_y) / img_h),
         }
 
     def _project_silhouette(
         self, vertices_centered: np.ndarray, yaw_deg: float,
-        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
+        eye: tuple, target: tuple, up_axis: int, fov: float,
+        img_w: int, img_h: int,
         bbox: dict, padding: float = 0.08,
     ) -> np.ndarray:
-        """Synthesize a silhouette: yaw the mesh, project, rasterize, crop."""
+        """Synthesize a silhouette: yaw the mesh, project, rasterize, crop.
+        Supports non-square images."""
         up = np.zeros(3); up[up_axis] = 1.0
         eye_a = np.array(eye, float); tgt_a = np.array(target, float)
         fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
         right = np.cross(fwd, up); right /= np.linalg.norm(right)
         down = np.cross(fwd, right)
-        focal = 0.5 * img_size / np.tan(np.radians(fov) / 2.0)
+        focal_y = 0.5 * img_h / np.tan(np.radians(fov) / 2.0)
+        focal_x = focal_y
 
         yaw = np.radians(yaw_deg)
         c, s = np.cos(yaw), np.sin(yaw)
@@ -650,12 +656,12 @@ class TestFindBestYawSilhouette:
         rel = world - eye_a
         z = rel @ fwd; x = rel @ right; y = rel @ down
         v = z > 0.1
-        px_full = (x[v] / z[v]) * focal + img_size / 2.0
-        py_full = (y[v] / z[v]) * focal + img_size / 2.0
+        px_full = (x[v] / z[v]) * focal_x + img_w / 2.0
+        py_full = (y[v] / z[v]) * focal_y + img_h / 2.0
 
-        bw = bbox["w"] * img_size; bh = bbox["h"] * img_size
+        bw = bbox["w"] * img_w; bh = bbox["h"] * img_h
         pad_x = bw * padding; pad_y = bh * padding
-        cx = bbox["x"] * img_size; cy = bbox["y"] * img_size
+        cx = bbox["x"] * img_w; cy = bbox["y"] * img_h
         x0 = cx - bw / 2.0 - pad_x; y0 = cy - bh / 2.0 - pad_y
         crop_w = max(int(bw + 2 * pad_x), 4); crop_h = max(int(bh + 2 * pad_y), 4)
         px_c = px_full - x0; py_c = py_full - y0
@@ -677,16 +683,18 @@ class TestFindBestYawSilhouette:
         cam_eye = (0.0, -3.0, 1.0)
         cam_target = (0.0, 0.0, 0.0)
         bbox = self._bbox_from_projection(
-            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50,
+            img_w=300, img_h=300,
         )
         gt_alpha = self._project_silhouette(
-            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50,
+            img_w=300, img_h=300,
             bbox=bbox,
         )
         result = find_best_yaw_silhouette(
             glb_path=glb, cutout_alpha=gt_alpha, norm_bbox=bbox,
             camera_eye=cam_eye, camera_target=cam_target,
-            camera_up_axis=2, camera_fov=50, camera_img_size=300,
+            camera_up_axis=2, camera_fov=50, camera_img_w=300, camera_img_h=300,
             world_pos=(0.0, 0.0, 0.0), element_width_m=2.0, up_axis=2,
         )
         diff = min(abs(result["best_yaw"] - gt_yaw), 360 - abs(result["best_yaw"] - gt_yaw))
@@ -704,22 +712,63 @@ class TestFindBestYawSilhouette:
         cam_target = (0.0, 0.0, 0.0)
         for gt_yaw in [30.0, 137.0, 270.0]:
             bbox = self._bbox_from_projection(
-                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50,
+                img_w=300, img_h=300,
             )
             gt_alpha = self._project_silhouette(
-                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50,
+                img_w=300, img_h=300,
                 bbox=bbox,
             )
             result = find_best_yaw_silhouette(
                 glb_path=glb, cutout_alpha=gt_alpha, norm_bbox=bbox,
                 camera_eye=cam_eye, camera_target=cam_target,
-                camera_up_axis=2, camera_fov=50, camera_img_size=300,
+                camera_up_axis=2, camera_fov=50, camera_img_w=300, camera_img_h=300,
                 world_pos=(0.0, 0.0, 0.0), element_width_m=2.0, up_axis=2,
             )
             diff = min(abs(result["best_yaw"] - gt_yaw), 360 - abs(result["best_yaw"] - gt_yaw))
             assert diff < 5.0, (
                 f"GT yaw={gt_yaw}: recovered {result['best_yaw']} "
                 f"(IoU={result['best_iou']})"
+            )
+
+    def test_recovers_known_yaw_nonsquare_image(self, tmp_path):
+        """Non-square rendering (e.g. 2048x1536 = 4:3) must not break projection.
+
+        Regression: the original implementation assumed square images and used
+        max(w,h) for both focal and centering, causing IoU~0.04 on 4:3 images.
+        """
+        glb = self._build_asymmetric_glb(tmp_path)
+        verts, faces = parse_glb_vertices_faces(glb)
+        verts = _sample_surface_points(verts, faces, target_count=5000)
+        centered = verts - verts.mean(0)
+
+        cam_eye = (1.5, -2.5, 1.0)
+        cam_target = (0.0, 0.0, 0.0)
+        for gt_yaw in [45.0, 200.0]:
+            bbox = self._bbox_from_projection(
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=45,
+                img_w=400, img_h=300,  # 4:3 aspect ratio
+            )
+            gt_alpha = self._project_silhouette(
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=45,
+                img_w=400, img_h=300,
+                bbox=bbox,
+            )
+            result = find_best_yaw_silhouette(
+                glb_path=glb, cutout_alpha=gt_alpha, norm_bbox=bbox,
+                camera_eye=cam_eye, camera_target=cam_target,
+                camera_up_axis=2, camera_fov=45, camera_img_w=400, camera_img_h=300,
+                world_pos=(0.0, 0.0, 0.0), element_width_m=2.0, up_axis=2,
+            )
+            diff = min(abs(result["best_yaw"] - gt_yaw), 360 - abs(result["best_yaw"] - gt_yaw))
+            assert diff < 5.0, (
+                f"GT yaw={gt_yaw}: recovered {result['best_yaw']} "
+                f"(IoU={result['best_iou']})"
+            )
+            assert result["best_iou"] > 0.15, (
+                f"GT yaw={gt_yaw}: IoU={result['best_iou']} too low "
+                f"(non-square regression)"
             )
 
     def test_returns_dict_with_required_keys(self, tmp_path):
@@ -729,7 +778,7 @@ class TestFindBestYawSilhouette:
         result = find_best_yaw_silhouette(
             glb_path=glb, cutout_alpha=fake_alpha, norm_bbox=bbox,
             camera_eye=(0, -3, 1), camera_target=(0, 0, 0),
-            camera_up_axis=2, camera_fov=50, camera_img_size=300,
+            camera_up_axis=2, camera_fov=50, camera_img_w=300, camera_img_h=300,
             world_pos=(0, 0, 0), element_width_m=2.0,
         )
         assert "best_yaw" in result
