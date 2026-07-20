@@ -876,7 +876,7 @@ def build_app() -> gr.Blocks:
                 return query_vlm(
                     image_path, prompt,
                     cfg.vlm.api_base, cfg.vlm.model, cfg.vlm.api_key,
-                    timeout=30, max_tokens=80,
+                    timeout=30,
                 )
 
             out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"

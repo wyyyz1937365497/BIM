@@ -35,12 +35,16 @@ Usage::
 from __future__ import annotations
 
 import base64
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from bim_recon.candidate_extractor import Candidate
@@ -154,7 +158,7 @@ def query_vlm(
     model: str,
     api_key: str = "",
     timeout: int = 120,
-    max_tokens: int = 200,
+    max_tokens: int | None = None,
 ) -> str:
     """Send an image + prompt to an OpenAI-compatible VLM and return the response.
 
@@ -163,7 +167,7 @@ def query_vlm(
     supports the OpenAI vision format:
 
     - OpenAI: ``gpt-4o``, ``gpt-4-turbo``
-    - 智谱 ZAI: ``glm-4v``, ``glm-4o``
+    - 智谱 ZAI: ``glm-4v``, ``glm-5v-turbo``
     - Qwen: ``qwen-vl-max``, ``qwen-vl-plus``
     - Ollama: ``gemma4:12b`` (via ``/v1`` endpoint)
     - DeepSeek, Moonshot, etc.
@@ -176,7 +180,9 @@ def query_vlm(
         model: Model name.
         api_key: API key (empty string for local servers like Ollama).
         timeout: Request timeout in seconds.
-        max_tokens: Max tokens in the response.
+        max_tokens: Max tokens in the response. ``None`` (default) lets the
+            model use its own maximum — recommended for reasoning models like
+            glm-5v-turbo that spend tokens on internal chain-of-thought.
 
     Returns:
         The VLM's text response.
@@ -201,9 +207,9 @@ def query_vlm(
     img_b64 = base64.b64encode(buf.getvalue()).decode()
 
     client = OpenAI(base_url=api_base, api_key=api_key or "empty", timeout=timeout)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+    kwargs: dict = {
+        "model": model,
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -217,8 +223,18 @@ def query_vlm(
                 ],
             }
         ],
-        max_tokens=max_tokens,
-    )
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    resp = client.chat.completions.create(**kwargs)
+
+    finish_reason = resp.choices[0].finish_reason
+    if finish_reason and finish_reason != "stop":
+        logger.warning(
+            "VLM %s returned finish_reason=%s (content may be truncated); "
+            "consider not limiting max_tokens for reasoning models",
+            model, finish_reason,
+        )
     return resp.choices[0].message.content or ""
 
 
