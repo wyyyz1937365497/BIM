@@ -636,6 +636,8 @@ def build_app() -> gr.Blocks:
 
             cfg = load_config()
             trellis_cfg = cfg.trellis
+            from bim_recon.pose_refiner import create_pose_refiner
+            pose_refiner = create_pose_refiner(cfg.pose_refiner)
             client_factory = lambda: TrellisClient(
                 host=trellis_cfg.host, port=trellis_cfg.port,
                 timeout=trellis_cfg.timeout,
@@ -656,6 +658,7 @@ def build_app() -> gr.Blocks:
                     objects=objects,
                     output_dir=out_dir,
                     register_in_revit=True,
+                    pose_refiner=pose_refiner,
                 ),
                 client_factory=client_factory,
                 gateway=gateway,
@@ -1006,6 +1009,42 @@ def build_app() -> gr.Blocks:
                         category="OST_GenericModel",
                         name=label or name,
                     )
+                    pose_refinement = None
+                    try:
+                        from bim_recon.pose_refiner import (
+                            PoseObservation,
+                            create_pose_refiner,
+                        )
+                        pose_refiner = create_pose_refiner(cfg.pose_refiner)
+                        if pose_refiner is not None:
+                            render_rgb = np.asarray((render_state or {}).get("rgb"))
+                            if render_rgb.shape[:2] != np.asarray(depth_map).shape:
+                                raise ValueError("manual RGB/depth observation shapes differ")
+                            full_mask = np.zeros(np.asarray(depth_map).shape, dtype=np.float32)
+                            x0 = max(0, int((cx_norm - w_norm / 2 - 0.08) * img_w))
+                            y0 = max(0, int((cy_norm - h_norm / 2 - 0.08) * img_h))
+                            x1 = min(img_w, int((cx_norm + w_norm / 2 + 0.08) * img_w))
+                            y1 = min(img_h, int((cy_norm + h_norm / 2 + 0.08) * img_h))
+                            full_mask[y0:y1, x0:x1] = 1.0
+                            observation = PoseObservation(
+                                rgb=render_rgb,
+                                depth=np.asarray(depth_map, dtype=np.float32),
+                                mask=full_mask,
+                                norm_bbox=(cx_norm, cy_norm, w_norm, h_norm),
+                                camera_eye=tuple(float(v) for v in cam["eye"]),
+                                camera_target=tuple(float(v) for v in cam["target"]),
+                                camera_up=tuple(float(v) for v in cam.get("up", [0, 0, 1])),
+                                camera_fov=float(cam.get("fov", 50.0)),
+                                camera_image_size=(int(img_w), int(img_h)),
+                                up_axis=up_axis,
+                            )
+                            pose_refinement = pose_refiner.refine_placement(
+                                placement, observation,
+                            )
+                            if pose_refinement.accepted:
+                                placement = pose_refinement.placement
+                    except Exception as exc:
+                        pose_refinement = {"error": str(exc)}
                     try:
                         transform = compute_placement_transform(placement)
                         from bim_recon.mcp_gateway import StdioMCPGateway
@@ -1015,6 +1054,12 @@ def build_app() -> gr.Blocks:
                         if auto_yaw_result is not None:
                             placement_info["auto_yaw"] = auto_yaw_result
                             placement_info["resolved_yaw"] = resolved_yaw
+                        if pose_refinement is not None:
+                            placement_info["pose_refinement"] = (
+                                pose_refinement.diagnostics()
+                                if hasattr(pose_refinement, "diagnostics")
+                                else pose_refinement
+                            )
                         placement_info["revit"] = revit_result
                         if revit_result.get("status") == "formatted":
                             gateway = StdioMCPGateway(

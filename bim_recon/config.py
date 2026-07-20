@@ -49,6 +49,27 @@ class TrellisConfig:
     timeout: int = 1800
 
 @dataclass(frozen=True)
+class PoseRefinerConfig:
+    """Optional learned residual pose refinement for B-class meshes."""
+
+    enabled: bool = False
+    checkpoint: str = ""
+    device: str = "cuda"
+    input_size: int = 128
+    iterations: int = 2
+    confidence_threshold: float = 0.65
+    min_quality_score: float = 0.20
+    quality_tolerance: float = 0.02
+    min_mask_pixels: int = 256
+    min_depth_ratio: float = 0.02
+    max_rotation_degrees: float = 20.0
+    max_translation_m: float = 0.25
+    max_log_scale: float = 0.15
+    gravity_locked: bool = True
+    floor_contact: bool = True
+
+
+@dataclass(frozen=True)
 class ViewerServiceConfig:
     """FastAPI process manager for the standalone Mini Viewer."""
 
@@ -96,6 +117,7 @@ class AppConfig:
     revit_mcp: RevitMCPConfig
     falcon: FalconConfig
     trellis: TrellisConfig
+    pose_refiner: PoseRefinerConfig = field(default_factory=PoseRefinerConfig)
     viewer_service: ViewerServiceConfig = field(default_factory=ViewerServiceConfig)
     element_routing: ElementRoutingConfig = field(default_factory=ElementRoutingConfig)
 
@@ -117,6 +139,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     trellis_raw = raw.get("trellis", {})
     viewer_raw = raw.get("viewer_service", {})
     routing_raw = raw.get("element_routing", {})
+    pose_raw = raw.get("pose_refiner", {})
 
     return AppConfig(
         vlm=ModelConfig(
@@ -140,6 +163,23 @@ def load_config(path: Path | str | None = None) -> AppConfig:
             port=trellis_raw.get("port", 18391),
             model=trellis_raw.get("model", "microsoft/TRELLIS-image-large"),
             timeout=trellis_raw.get("timeout", 1800),
+        ),
+        pose_refiner=PoseRefinerConfig(
+            enabled=bool(pose_raw.get("enabled", False)),
+            checkpoint=str(pose_raw.get("checkpoint", "")),
+            device=str(pose_raw.get("device", "cuda")),
+            input_size=int(pose_raw.get("input_size", 128)),
+            iterations=int(pose_raw.get("iterations", 2)),
+            confidence_threshold=float(pose_raw.get("confidence_threshold", 0.65)),
+            min_quality_score=float(pose_raw.get("min_quality_score", 0.20)),
+            quality_tolerance=float(pose_raw.get("quality_tolerance", 0.02)),
+            min_mask_pixels=int(pose_raw.get("min_mask_pixels", 256)),
+            min_depth_ratio=float(pose_raw.get("min_depth_ratio", 0.02)),
+            max_rotation_degrees=float(pose_raw.get("max_rotation_degrees", 20.0)),
+            max_translation_m=float(pose_raw.get("max_translation_m", 0.25)),
+            max_log_scale=float(pose_raw.get("max_log_scale", 0.15)),
+            gravity_locked=bool(pose_raw.get("gravity_locked", True)),
+            floor_contact=bool(pose_raw.get("floor_contact", True)),
         ),
         viewer_service=ViewerServiceConfig(
             host=viewer_raw.get("host", "127.0.0.1"),
@@ -177,6 +217,23 @@ def save_config(config: AppConfig) -> None:
             "port": config.trellis.port,
             "model": config.trellis.model,
             "timeout": config.trellis.timeout,
+        },
+        "pose_refiner": {
+            "enabled": config.pose_refiner.enabled,
+            "checkpoint": config.pose_refiner.checkpoint,
+            "device": config.pose_refiner.device,
+            "input_size": config.pose_refiner.input_size,
+            "iterations": config.pose_refiner.iterations,
+            "confidence_threshold": config.pose_refiner.confidence_threshold,
+            "min_quality_score": config.pose_refiner.min_quality_score,
+            "quality_tolerance": config.pose_refiner.quality_tolerance,
+            "min_mask_pixels": config.pose_refiner.min_mask_pixels,
+            "min_depth_ratio": config.pose_refiner.min_depth_ratio,
+            "max_rotation_degrees": config.pose_refiner.max_rotation_degrees,
+            "max_translation_m": config.pose_refiner.max_translation_m,
+            "max_log_scale": config.pose_refiner.max_log_scale,
+            "gravity_locked": config.pose_refiner.gravity_locked,
+            "floor_contact": config.pose_refiner.floor_contact,
         },
         "viewer_service": {
             "host": config.viewer_service.host,

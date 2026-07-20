@@ -335,6 +335,50 @@ class TestComputePlacementTransform:
         result = transform.rotation @ np.array([0, 1, 0])
         np.testing.assert_allclose(result, [0, 0, 1], atol=1e-6)
 
+    def test_refined_overrides_apply_rotation_translation_and_scale(self, tmp_path):
+        glb_path = self._make_test_glb(tmp_path)
+        rotation = np.array([
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=2.0, world_y=3.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+            up_axis=2,
+            rotation_override=tuple(tuple(float(v) for v in row) for row in rotation),
+            translation_offset=(0.2, -0.1, 0.5),
+            scale_multiplier=1.25,
+            preserve_floor_contact=False,
+        )
+
+        transform = compute_placement_transform(placement)
+
+        np.testing.assert_allclose(transform.rotation, rotation, atol=1e-6)
+        assert transform.scale == pytest.approx(1.25)
+        assert transform.translation[0] == pytest.approx(2.2)
+        assert transform.translation[1] == pytest.approx(2.9)
+        assert transform.translation[2] == pytest.approx(1.125)
+
+    def test_floor_contact_is_preserved_after_override(self, tmp_path):
+        glb_path = self._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=1.5, ceiling_z=4.0,
+            element_width_m=1.0, element_height_m=1.0,
+            rotation_override=((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+            translation_offset=(0.0, 0.0, 0.4),
+            scale_multiplier=0.8,
+            preserve_floor_contact=True,
+        )
+
+        transform = compute_placement_transform(placement)
+
+        assert transform.vertices_world[:, 2].min() == pytest.approx(1.5, abs=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Placement diagnostics (PCA + serializer)

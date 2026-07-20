@@ -36,17 +36,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class BClassExtraction:
-    """One B-class element prepared for TRELLIS mesh generation.
-
-    Attributes:
-        element: The source pipeline detection (for element_class, width, etc.).
-        cutout_path: Path to a clean RGBA PNG ready for TRELLIS.
-        position_3d: (x, y, z) world position of the object centre.
-        up_axis: World up axis (0/1/2) — drives TRELLIS axis remap.
-        render_path: The rendered RGB view used for segmentation.
-        width_m / height_m: Estimated footprint for placement scaling.
-        detail: Human-readable status for Gradio logging.
-    """
+    """One B-class element prepared for TRELLIS mesh generation."""
 
     element: ElementResult
     cutout_path: Path
@@ -56,6 +46,14 @@ class BClassExtraction:
     width_m: float
     height_m: float
     detail: str
+    depth_path: Path | None = None
+    mask_path: Path | None = None
+    norm_bbox: dict[str, float] | None = None
+    camera_eye: tuple[float, float, float] | None = None
+    camera_target: tuple[float, float, float] | None = None
+    camera_up: tuple[float, float, float] | None = None
+    camera_fov: float = 45.0
+    camera_image_size: tuple[int, int] = (800, 800)
 
 
 def render_element_front_view(
@@ -124,6 +122,7 @@ def render_element_front_view(
     output_dir.mkdir(parents=True, exist_ok=True)
     img_path = output_dir / f"{name_prefix}_{index:03d}.png"
     Image.fromarray(rgb).save(str(img_path))
+    np.save(str(img_path.with_suffix(".depth.npy")), render.depth.astype(np.float32))
 
     return img_path, rgb, render.depth, h_axes[0], h_axes[1]
 
@@ -243,6 +242,27 @@ def _rle_to_alpha(detection, x0: int, y0: int, x1: int, y1: int, crop_size):
     if mask_crop.shape != (crop_size[1], crop_size[0]):
         return None
     return Image.fromarray((mask_crop * 255).astype(np.uint8), mode="L")
+
+def _full_frame_mask(detection, height: int, width: int) -> np.ndarray | None:
+    """Decode Falcon RLE into an aligned full-frame uint8 mask."""
+
+    import base64
+
+    rle = getattr(detection, "mask_rle", None)
+    size = getattr(detection, "mask_size", None)
+    if not rle or not size:
+        return None
+    try:
+        from pycocotools import mask as mask_utils
+
+        counts = base64.b64decode(rle) if isinstance(rle, str) else rle
+        decoded = mask_utils.decode({"counts": counts, "size": list(size)})
+    except Exception as exc:
+        logger.warning("Full Falcon RLE decode failed: %s", exc)
+        return None
+    if decoded.shape != (height, width):
+        return None
+    return (decoded > 0).astype(np.uint8) * 255
 
 
 def _draw_bbox_overlay(rgb: np.ndarray, norm_bbox: dict) -> np.ndarray:
@@ -384,6 +404,20 @@ def extract_bclass_element(
     width_m = float(hd.get("width_m") or max(norm_bbox["w"] * 5.0, 0.3))
     height_m = float(hd.get("element_height") or default_height_m)
 
+    # Persist a full-frame mask aligned with the saved RGB/depth render.
+    # Use Falcon's pixel mask when available; bbox is an explicit fallback.
+    mask_full = _full_frame_mask(detection, img_size, img_size)
+    if mask_full is None:
+        mask_full = np.zeros((img_size, img_size), dtype=np.uint8)
+        x0 = max(0, int((norm_bbox["x"] - norm_bbox["w"] / 2 - 0.08) * img_size))
+        y0 = max(0, int((norm_bbox["y"] - norm_bbox["h"] / 2 - 0.08) * img_size))
+        x1 = min(img_size, int((norm_bbox["x"] + norm_bbox["w"] / 2 + 0.08) * img_size))
+        y1 = min(img_size, int((norm_bbox["y"] + norm_bbox["h"] / 2 + 0.08) * img_size))
+        if x1 > x0 and y1 > y0:
+            mask_full[y0:y1, x0:x1] = 255
+    mask_path = render_path.with_suffix(".mask.png")
+    Image.fromarray(mask_full, mode="L").save(str(mask_path))
+
     return BClassExtraction(
         element=element,
         cutout_path=cutout_path,
@@ -393,9 +427,17 @@ def extract_bclass_element(
         width_m=width_m,
         height_m=height_m,
         detail=f"Falcon segmented {label} ({norm_bbox['w']:.2f}×{norm_bbox['h']:.2f})",
+        depth_path=render_path.with_suffix(".depth.npy"),
+        mask_path=mask_path,
+        norm_bbox={key: float(value) for key, value in norm_bbox.items()},
+        camera_eye=(float(eye[0]), float(eye[1]), float(eye[2])),
+        camera_target=(float(target[0]), float(target[1]), float(target[2])),
+        camera_up=tuple(float(value) for value in (
+            [1.0 if axis == up_axis else 0.0 for axis in range(3)]
+        )),
+        camera_fov=float(fov),
+        camera_image_size=(int(img_size), int(img_size)),
     )
-
-
 __all__ = [
     "BClassExtraction",
     "render_element_front_view",

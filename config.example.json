@@ -25,6 +25,24 @@
     "model": "microsoft/TRELLIS-image-large",
     "timeout": 1800
   },
+  "pose_refiner": {
+    "comment": "可选 B 类 mesh 残差姿态精修（需先训练 checkpoint）",
+    "enabled": false,
+    "checkpoint": "output/pose_refiner.pt",
+    "device": "cuda",
+    "input_size": 128,
+    "iterations": 2,
+    "confidence_threshold": 0.65,
+    "min_quality_score": 0.20,
+    "quality_tolerance": 0.02,
+    "min_mask_pixels": 256,
+    "min_depth_ratio": 0.02,
+    "max_rotation_degrees": 20.0,
+    "max_translation_m": 0.25,
+    "max_log_scale": 0.15,
+    "gravity_locked": true,
+    "floor_contact": true
+  },
   "viewer_service": {
     "comment": "独立 Mini Viewer 进程管理 API（bim-recon 环境）",
     "host": "127.0.0.1",

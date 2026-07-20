@@ -70,6 +70,13 @@ class MeshPlacement:
             TRELLIS's image-space facing and the 3DGS scene convention; adjust
             per-placement if a future scene needs a different correction.
             Default 90.0.
+        rotation_override: Optional full 3x3 world rotation. When provided it
+            replaces the axis-remap plus yaw rotation used by the legacy path.
+        translation_offset: World-space residual translation in meters.
+        scale_multiplier: Positive residual multiplier applied after the
+            detected physical-width scale.
+        preserve_floor_contact: Keep the mesh base on ``floor_z`` after a
+            rotation or scale override.
         category: Revit built-in category for DirectShape.
         name: Human-readable name for the DirectShape element.
     """
@@ -83,6 +90,10 @@ class MeshPlacement:
     element_height_m: float
     up_axis: int = 2
     yaw_degrees: float = 90.0
+    rotation_override: tuple[tuple[float, float, float], ...] | None = None
+    translation_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    scale_multiplier: float = 1.0
+    preserve_floor_contact: bool = True
     category: str = "OST_GenericModel"
     name: str = "B-class Mesh"
 
@@ -426,26 +437,50 @@ def compute_placement_transform(placement: MeshPlacement) -> MeshTransform:
     if room_height > 0 and scaled_height > room_height:
         scale = scale * (room_height / scaled_height)
 
-    # Build rotation matrix: axis remap first (TRELLIS Y-up → 3DGS up_axis),
-    # then yaw around the world up axis to correct the constant image-space
-    # facing offset (positive yaw_degrees = clockwise from above).
-    axis_remap = _build_axis_remap_rotation(placement.up_axis)
-    yaw = _build_yaw_rotation(placement.up_axis, placement.yaw_degrees)
-    rotation = yaw @ axis_remap
+    # Build rotation matrix: axis-remap plus legacy yaw, unless a learned
+    # full rotation override is supplied.
+    if placement.rotation_override is not None:
+        rotation = np.asarray(placement.rotation_override, dtype=np.float32)
+        if rotation.shape != (3, 3):
+            raise ValueError("rotation_override must be a 3x3 matrix")
+        if not np.all(np.isfinite(rotation)):
+            raise ValueError("rotation_override must contain finite values")
+        if abs(float(np.linalg.det(rotation))) < 1e-6:
+            raise ValueError("rotation_override must be non-singular")
+    else:
+        axis_remap = _build_axis_remap_rotation(placement.up_axis)
+        yaw = _build_yaw_rotation(placement.up_axis, placement.yaw_degrees)
+        rotation = yaw @ axis_remap
 
-    # Center the mesh at origin in TRELLIS space, then apply rotation + scale
+    # Center the mesh at origin in TRELLIS space, then apply rotation + scale.
     centered = vertices - mesh_center
     rotated = centered @ rotation.T
+    scale *= float(placement.scale_multiplier)
+    if scale <= 0 or not np.isfinite(scale):
+        raise ValueError("scale_multiplier must produce a positive finite scale")
     scaled = rotated * scale
 
-    # Translation: place centroid at candidate's world position on the floor
+    # Translation: place the mesh centroid at candidate's world position.
     translation = np.zeros(3, dtype=np.float32)
     h_axes_world = [i for i in range(3) if i != placement.up_axis]
     translation[h_axes_world[0]] = placement.world_x
     translation[h_axes_world[1]] = placement.world_y
-    # Place mesh base at floor level (shift up by half the scaled height)
-    mesh_height_scaled = mesh_extents[v_axis_mesh] * scale
-    translation[placement.up_axis] = placement.floor_z + mesh_height_scaled / 2.0
+    if placement.preserve_floor_contact:
+        # Rotation can change the vertical extent, so use the actual transformed
+        # minimum rather than assuming the unrotated mesh height.
+        vertical = scaled[:, placement.up_axis]
+        translation[placement.up_axis] = placement.floor_z - float(vertical.min())
+    else:
+        mesh_height_scaled = mesh_extents[v_axis_mesh] * scale
+        translation[placement.up_axis] = placement.floor_z + mesh_height_scaled / 2.0
+    translation += np.asarray(placement.translation_offset, dtype=np.float32)
+
+    if placement.preserve_floor_contact:
+        # A learned vertical offset is allowed, but keep the minimum at the
+        # requested floor after the residual horizontal translation is applied.
+        translation[placement.up_axis] += placement.floor_z - float(
+            (scaled + translation)[..., placement.up_axis].min()
+        )
 
     vertices_world = scaled + translation
 
