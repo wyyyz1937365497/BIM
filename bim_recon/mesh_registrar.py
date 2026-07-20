@@ -650,6 +650,222 @@ def serialize_placement_diagnostics(
 
 
 # ---------------------------------------------------------------------------
+# Auto-yaw via silhouette matching (render-and-compare)
+# ---------------------------------------------------------------------------
+
+def find_best_yaw_silhouette(
+    glb_path: Path,
+    cutout_alpha: np.ndarray,
+    norm_bbox: dict,
+    camera_eye: tuple[float, float, float],
+    camera_target: tuple[float, float, float],
+    camera_up_axis: int,
+    camera_fov: float,
+    camera_img_size: int,
+    world_pos: tuple[float, float, float],
+    element_width_m: float,
+    *,
+    up_axis: int = 2,
+    cutout_padding: float = 0.08,
+    coarse_step: float = 10.0,
+    fine_step: float = 1.0,
+) -> dict[str, Any]:
+    """Find the yaw that best aligns the mesh with the original cutout image.
+
+    Strategy (analysis by synthesis):
+      For each candidate yaw, project the mesh to the original camera's image
+      plane, build a silhouette in the cutout's coordinate frame, and compute
+      IoU with the cutout's alpha mask. The yaw with the highest IoU wins.
+
+    This is robust to TRELLIS's canonical-pose convention failures (e.g. cubic
+    objects generated at an arbitrary angle) because it directly measures
+      "does the reconstruction, placed at this yaw, look like what we saw?"
+
+    Args:
+        glb_path: TRELLIS-generated GLB file.
+        cutout_alpha: (H, W) mask from the cutout's alpha channel. Any non-zero
+            pixel counts as occupied.
+        norm_bbox: Falcon bbox in normalized image coords. Must contain
+            ``{"x", "y", "w", "h"}`` where x/y are the CENTER (not corner),
+            matching the convention used by ``backproject_mask_centre`` and
+            the Gradio cutout pipeline.
+        camera_eye, camera_target: World-space camera pose used to capture the
+            original rendering. The mesh is projected through this camera.
+        camera_up_axis: World up axis at capture time (usually 2 for Z-up).
+        camera_fov: Camera vertical FOV in degrees.
+        camera_img_size: Edge length of the original (square) rendering.
+        world_pos: (x, y, z) world position where the mesh should be placed
+            for projection. Use the depth-backprojected mask centre.
+        element_width_m: Physical width for scale matching (same value used
+            in :class:`MeshPlacement`).
+        up_axis: World up axis used by the placement transform.
+        cutout_padding: Fraction of bbox size used as padding when the cutout
+            was cropped (default 0.08 = 8%). Used to reconstruct the crop
+            region in the full image.
+        coarse_step, fine_step: Two-stage search granularity in degrees.
+
+    Returns:
+        Dict with:
+          ``best_yaw``: the recovered yaw_degrees.
+          ``best_iou``: IoU at the best yaw (0-1; >0.3 is typically a confident
+            match, <0.15 suggests the silhouette geometry is ambiguous).
+          ``coarse_scores``: list of {yaw, iou} for the coarse scan (debugging).
+          ``method``: ``"silhouette_iou"``.
+    """
+    vertices, faces = parse_glb_vertices_faces(glb_path)
+
+    # Densify: sparse meshes (e.g. test cubes with 8 verts) don't produce
+    # usable silhouettes from vertex projection alone. Sample surface points
+    # when the vertex count is too low.
+    if len(vertices) < 2000 and len(faces) > 0:
+        vertices = _sample_surface_points(vertices, faces, target_count=5000)
+
+    centered = vertices - vertices.mean(axis=0)
+
+    # Scale: match element_width_m to the mesh's largest horizontal extent
+    # (TRELLIS Y-up → mesh horizontal axes are X and Z)
+    mesh_h_extent = max(centered[:, 0].ptp(), centered[:, 2].ptp())
+    if mesh_h_extent < 1e-6:
+        mesh_h_extent = 1.0
+    scale = element_width_m / mesh_h_extent
+
+    # Camera frame (same convention as render_element_front_view)
+    up_vec = np.zeros(3, dtype=np.float64)
+    up_vec[camera_up_axis] = 1.0
+    eye = np.array(camera_eye, dtype=np.float64)
+    target = np.array(camera_target, dtype=np.float64)
+    fwd = target - eye
+    fwd /= np.linalg.norm(fwd) + 1e-12
+    right = np.cross(fwd, up_vec)
+    right /= np.linalg.norm(right) + 1e-12
+    down = np.cross(fwd, right)
+    focal = 0.5 * camera_img_size / np.tan(np.radians(camera_fov) / 2.0)
+
+    # Reconstruct the crop region in full-image pixel coords.
+    # norm_bbox uses center-x/center-y convention; padding expands each side.
+    bx_c = norm_bbox.get("x", 0.5) * camera_img_size
+    by_c = norm_bbox.get("y", 0.5) * camera_img_size
+    bw = max(norm_bbox.get("w", 0.2) * camera_img_size, 4.0)
+    bh = max(norm_bbox.get("h", 0.2) * camera_img_size, 4.0)
+    pad_x = bw * cutout_padding
+    pad_y = bh * cutout_padding
+    crop_x0 = bx_c - bw / 2.0 - pad_x
+    crop_y0 = by_c - bh / 2.0 - pad_y
+    crop_w = max(int(bw + 2 * pad_x), 4)
+    crop_h = max(int(bh + 2 * pad_y), 4)
+
+    # Resize cutout_alpha to match the reconstructed crop dimensions
+    from PIL import Image as _PILImage
+    alpha_img = _PILImage.fromarray(
+        (cutout_alpha > 0).astype(np.uint8) * 255, mode="L",
+    ).resize((crop_w, crop_h), _PILImage.BILINEAR)
+    cutout_mask = np.array(alpha_img, dtype=bool)
+
+    axis_remap = _build_axis_remap_rotation(up_axis)
+    world_pos_arr = np.array(world_pos, dtype=np.float64)
+
+    def silhouette_at_yaw(yaw_deg: float) -> np.ndarray:
+        """Project the yawed mesh to the cutout frame and build a binary mask."""
+        yaw = np.radians(yaw_deg)
+        c, s = float(np.cos(yaw)), float(np.sin(yaw))
+        rot = centered.copy()
+        rot[:, 0] = c * centered[:, 0] + s * centered[:, 2]
+        rot[:, 2] = -s * centered[:, 0] + c * centered[:, 2]
+        world = (rot @ axis_remap.T) * scale + world_pos_arr
+
+        rel = world - eye
+        z_cam = rel @ fwd
+        x_cam = rel @ right
+        y_cam = rel @ down
+        valid = z_cam > 0.1
+        if not np.any(valid):
+            return np.zeros((crop_h, crop_w), dtype=bool)
+
+        px_full = (x_cam[valid] / z_cam[valid]) * focal + camera_img_size / 2.0
+        py_full = (y_cam[valid] / z_cam[valid]) * focal + camera_img_size / 2.0
+
+        # Map from full-image coords to crop-local coords
+        px_crop = px_full - crop_x0
+        py_crop = py_full - crop_y0
+
+        in_bounds = (
+            (px_crop >= 0) & (px_crop < crop_w) &
+            (py_crop >= 0) & (py_crop < crop_h)
+        )
+        mask = np.zeros((crop_h, crop_w), dtype=bool)
+        if np.any(in_bounds):
+            mask[py_crop[in_bounds].astype(int), px_crop[in_bounds].astype(int)] = True
+
+        # Light dilation to fill gaps between projected vertices
+        dilated = mask.copy()
+        dilated[:-1, :] |= mask[1:, :]
+        dilated[1:, :] |= mask[:-1, :]
+        dilated[:, :-1] |= mask[:, 1:]
+        dilated[:, 1:] |= mask[:, :-1]
+        return dilated
+
+    def _iou(a: np.ndarray, b: np.ndarray) -> float:
+        inter = int((a & b).sum())
+        union = int((a | b).sum())
+        return inter / max(union, 1)
+
+    # Stage 1: coarse scan over the full circle
+    coarse_yaws = np.arange(0.0, 360.0, coarse_step)
+    coarse_scores = [
+        (float(y), _iou(cutout_mask, silhouette_at_yaw(float(y))))
+        for y in coarse_yaws
+    ]
+    coarse_best = max(coarse_scores, key=lambda t: t[1])
+
+    # Stage 2: fine scan around the coarse winner
+    fine_yaws = np.arange(
+        coarse_best[0] - coarse_step, coarse_best[0] + coarse_step + fine_step, fine_step,
+    )
+    fine_scores = [
+        (float(y), _iou(cutout_mask, silhouette_at_yaw(float(y))))
+        for y in fine_yaws
+    ]
+    best_yaw, best_iou = max(fine_scores, key=lambda t: t[1])
+
+    return {
+        "best_yaw": float(best_yaw),
+        "best_iou": float(best_iou),
+        "coarse_scores": [{"yaw": y, "iou": i} for y, i in coarse_scores],
+        "method": "silhouette_iou",
+    }
+
+
+
+def _sample_surface_points(
+    vertices: np.ndarray, faces: np.ndarray, *, target_count: int = 5000,
+) -> np.ndarray:
+    """Uniformly sample points from the mesh surface (area-weighted).
+
+    Used to densify sparse meshes so silhouette projection produces a
+    recognizable shape rather than a handful of isolated pixels.
+    """
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    cross = np.cross(v1 - v0, v2 - v0)
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+    total = float(areas.sum())
+    if total < 1e-12:
+        return vertices
+    probs = areas / total
+    rng = np.random.default_rng(42)  # deterministic for reproducibility
+    tri_idx = rng.choice(len(faces), size=target_count, p=probs)
+    r1 = rng.uniform(0.0, 1.0, target_count)
+    r2 = rng.uniform(0.0, 1.0, target_count)
+    sqrt_r1 = np.sqrt(r1)
+    u = 1.0 - sqrt_r1
+    v = sqrt_r1 * (1.0 - r2)
+    w = sqrt_r1 * r2
+    return (u[:, None] * v0[tri_idx] +
+            v[:, None] * v1[tri_idx] +
+            w[:, None] * v2[tri_idx]).astype(np.float32)
+
+# ---------------------------------------------------------------------------
 # Revit registration (DirectShape via C# script)
 # ---------------------------------------------------------------------------
 

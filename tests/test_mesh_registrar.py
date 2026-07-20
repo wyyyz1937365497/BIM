@@ -23,8 +23,10 @@ from bim_recon.mesh_registrar import (
     _build_yaw_rotation,
     _horizontal_angle_deg,
     _principal_axis,
+    _sample_surface_points,
     compute_placement_transform,
     extract_object_from_render,
+    find_best_yaw_silhouette,
     parse_glb_vertices_faces,
     register_mesh_in_revit,
     serialize_placement_diagnostics,
@@ -470,6 +472,272 @@ class TestPlacementDiagnostics:
         # (i.e., axis-aligned). Allow for any of {0, ±90, 180}.
         remainder = abs(angle) % 90.0
         assert remainder < 1.0 or remainder > 89.0
+
+
+# ---------------------------------------------------------------------------
+# Auto-yaw via silhouette matching
+# ---------------------------------------------------------------------------
+
+class TestFindBestYawSilhouette:
+    """Self-consistency tests: synthesize a silhouette from a known yaw, then
+    verify find_best_yaw_silhouette recovers it."""
+
+    def _build_asymmetric_glb(self, tmp_path: Path) -> Path:
+        """Build an elongated box (2:1:1) so the silhouette changes with yaw."""
+        # 2x1x1 box: clearly elongated along X
+        vertices = np.array([
+            [-1.0, -0.5, -0.5], [1.0, -0.5, -0.5], [1.0, 0.5, -0.5], [-1.0, 0.5, -0.5],
+            [-1.0, -0.5,  0.5], [1.0, -0.5,  0.5], [1.0, 0.5,  0.5], [-1.0, 0.5,  0.5],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0,1,2],[0,2,3], [4,6,5],[4,7,6], [0,5,1],[0,4,5],
+            [2,6,7],[2,7,3], [1,5,6],[1,6,2], [0,3,7],[0,7,4],
+        ], dtype=np.uint16)
+        return self._write_glb(tmp_path / "elong.glb", vertices, faces)
+
+    def _write_glb(self, path: Path, vertices: np.ndarray, faces: np.ndarray) -> Path:
+        """Write a minimal GLB given vertices + faces."""
+        vert_bytes = vertices.astype(np.float32).tobytes()
+        face_bytes = faces.astype(np.uint16).tobytes()
+        buffer = vert_bytes + face_bytes
+        while len(buffer) % 4 != 0:
+            buffer += b'\x00'
+        gltf = {
+            "asset": {"version": "2.0"},
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": len(vertices),
+                 "type": "VEC3", "byteOffset": 0,
+                 "max": vertices.max(0).tolist(), "min": vertices.min(0).tolist()},
+                {"bufferView": 0, "componentType": 5123,
+                 "count": faces.size, "type": "SCALAR", "byteOffset": len(vert_bytes)},
+            ],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": len(buffer)}],
+            "buffers": [{"byteLength": len(buffer)}],
+        }
+        json_bytes = json.dumps(gltf).encode()
+        while len(json_bytes) % 4 != 0:
+            json_bytes += b' '
+        total = 12 + 8 + len(json_bytes) + 8 + len(buffer)
+        with open(path, 'wb') as f:
+            f.write(struct.pack('<III', 0x46546C67, 2, total))
+            f.write(struct.pack('<II', len(json_bytes), 0x4E4F534A))
+            f.write(json_bytes)
+            f.write(struct.pack('<II', len(buffer), 0x004E4942))
+            f.write(buffer)
+        return path
+
+    def _project_silhouette(
+        self, vertices_centered: np.ndarray, yaw_deg: float,
+        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
+        bbox: dict, padding: float = 0.08,
+    ) -> np.ndarray:
+        """Synthesize a silhouette: yaw the mesh, project, rasterize, crop."""
+        up = np.zeros(3); up[up_axis] = 1.0
+        eye, target = np.array(eye, float), np.array(target, float)
+class TestFindBestYawSilhouette:
+    """Self-consistency tests: synthesize a silhouette from a known yaw, then
+    verify find_best_yaw_silhouette recovers it."""
+
+    def _build_asymmetric_glb(self, tmp_path: Path) -> Path:
+        """Build an elongated box (2:1:1) so the silhouette changes with yaw."""
+        vertices = np.array([
+            [-1.0, -0.5, -0.5], [1.0, -0.5, -0.5], [1.0, 0.5, -0.5], [-1.0, 0.5, -0.5],
+            [-1.0, -0.5,  0.5], [1.0, -0.5,  0.5], [1.0, 0.5,  0.5], [-1.0, 0.5,  0.5],
+        ], dtype=np.float32)
+        faces = np.array([
+            [0,1,2],[0,2,3], [4,6,5],[4,7,6], [0,5,1],[0,4,5],
+            [2,6,7],[2,7,3], [1,5,6],[1,6,2], [0,3,7],[0,7,4],
+        ], dtype=np.uint16)
+        return self._write_glb(tmp_path / "elong.glb", vertices, faces)
+
+    def _write_glb(self, path: Path, vertices: np.ndarray, faces: np.ndarray) -> Path:
+        """Write a minimal GLB given vertices + faces."""
+        vert_bytes = vertices.astype(np.float32).tobytes()
+        face_bytes = faces.astype(np.uint16).tobytes()
+        buffer = vert_bytes + face_bytes
+        while len(buffer) % 4 != 0:
+            buffer += b'\x00'
+        gltf = {
+            "asset": {"version": "2.0"},
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": len(vertices),
+                 "type": "VEC3", "byteOffset": 0,
+                 "max": vertices.max(0).tolist(), "min": vertices.min(0).tolist()},
+                {"bufferView": 0, "componentType": 5123,
+                 "count": faces.size, "type": "SCALAR", "byteOffset": len(vert_bytes)},
+            ],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": len(buffer)}],
+            "buffers": [{"byteLength": len(buffer)}],
+        }
+        json_bytes = json.dumps(gltf).encode()
+        while len(json_bytes) % 4 != 0:
+            json_bytes += b' '
+        total = 12 + 8 + len(json_bytes) + 8 + len(buffer)
+        with open(path, 'wb') as f:
+            f.write(struct.pack('<III', 0x46546C67, 2, total))
+            f.write(struct.pack('<II', len(json_bytes), 0x4E4F534A))
+            f.write(json_bytes)
+            f.write(struct.pack('<II', len(buffer), 0x004E4942))
+            f.write(buffer)
+        return path
+
+    def _bbox_from_projection(
+        self, vertices_centered: np.ndarray, yaw_deg: float,
+        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
+        padding: float = 0.15,
+    ) -> dict:
+        """Project the yawed mesh and derive a normalized bbox that encloses it.
+
+        This mirrors what Falcon would detect: a tight bbox around the visible
+        object silhouette, with a small padding margin.
+        """
+        up = np.zeros(3); up[up_axis] = 1.0
+        eye_a = np.array(eye, float); tgt_a = np.array(target, float)
+        fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, up); right /= np.linalg.norm(right)
+        down = np.cross(fwd, right)
+        focal = 0.5 * img_size / np.tan(np.radians(fov) / 2.0)
+
+        yaw = np.radians(yaw_deg)
+        c, s = np.cos(yaw), np.sin(yaw)
+        rot = vertices_centered.copy()
+        rot[:, 0] = c * vertices_centered[:, 0] + s * vertices_centered[:, 2]
+        rot[:, 2] = -s * vertices_centered[:, 0] + c * vertices_centered[:, 2]
+        axis_remap = _build_axis_remap_rotation(up_axis)
+        world = rot @ axis_remap.T
+
+        rel = world - eye_a
+        z = rel @ fwd; x = rel @ right; y = rel @ down
+        v = z > 0.1
+        px = (x[v] / z[v]) * focal + img_size / 2.0
+        py = (y[v] / z[v]) * focal + img_size / 2.0
+
+        x0, x1 = px.min(), px.max()
+        y0, y1 = py.min(), py.max()
+        w = x1 - x0; h = y1 - y0
+        pad_x = w * padding; pad_y = h * padding
+        cx = (x0 + x1) / 2 / img_size
+        cy = (y0 + y1) / 2 / img_size
+        return {
+            "x": float(cx), "y": float(cy),
+            "w": float((w + 2 * pad_x) / img_size),
+            "h": float((h + 2 * pad_y) / img_size),
+        }
+
+    def _project_silhouette(
+        self, vertices_centered: np.ndarray, yaw_deg: float,
+        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
+        bbox: dict, padding: float = 0.08,
+    ) -> np.ndarray:
+        """Synthesize a silhouette: yaw the mesh, project, rasterize, crop."""
+        up = np.zeros(3); up[up_axis] = 1.0
+        eye_a = np.array(eye, float); tgt_a = np.array(target, float)
+        fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
+        right = np.cross(fwd, up); right /= np.linalg.norm(right)
+        down = np.cross(fwd, right)
+        focal = 0.5 * img_size / np.tan(np.radians(fov) / 2.0)
+
+        yaw = np.radians(yaw_deg)
+        c, s = np.cos(yaw), np.sin(yaw)
+        rot = vertices_centered.copy()
+        rot[:, 0] = c * vertices_centered[:, 0] + s * vertices_centered[:, 2]
+        rot[:, 2] = -s * vertices_centered[:, 0] + c * vertices_centered[:, 2]
+        axis_remap = _build_axis_remap_rotation(up_axis)
+        world = rot @ axis_remap.T
+
+        rel = world - eye_a
+        z = rel @ fwd; x = rel @ right; y = rel @ down
+        v = z > 0.1
+        px_full = (x[v] / z[v]) * focal + img_size / 2.0
+        py_full = (y[v] / z[v]) * focal + img_size / 2.0
+
+        bw = bbox["w"] * img_size; bh = bbox["h"] * img_size
+        pad_x = bw * padding; pad_y = bh * padding
+        cx = bbox["x"] * img_size; cy = bbox["y"] * img_size
+        x0 = cx - bw / 2.0 - pad_x; y0 = cy - bh / 2.0 - pad_y
+        crop_w = max(int(bw + 2 * pad_x), 4); crop_h = max(int(bh + 2 * pad_y), 4)
+        px_c = px_full - x0; py_c = py_full - y0
+        ib = (px_c >= 0) & (px_c < crop_w) & (py_c >= 0) & (py_c < crop_h)
+        mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        if ib.any():
+            mask[py_c[ib].astype(int), px_c[ib].astype(int)] = 255
+        return mask
+
+    def test_recovers_known_yaw_front_view(self, tmp_path):
+        """Camera in front of an elongated box → recovered yaw matches GT."""
+        glb = self._build_asymmetric_glb(tmp_path)
+        verts, faces = parse_glb_vertices_faces(glb)
+        # Match the production densification so both sides project the same cloud
+        verts = _sample_surface_points(verts, faces, target_count=5000)
+        centered = verts - verts.mean(0)
+
+        gt_yaw = 60.0
+        cam_eye = (0.0, -3.0, 1.0)
+        cam_target = (0.0, 0.0, 0.0)
+        bbox = self._bbox_from_projection(
+            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+        )
+        gt_alpha = self._project_silhouette(
+            centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+            bbox=bbox,
+        )
+        result = find_best_yaw_silhouette(
+            glb_path=glb, cutout_alpha=gt_alpha, norm_bbox=bbox,
+            camera_eye=cam_eye, camera_target=cam_target,
+            camera_up_axis=2, camera_fov=50, camera_img_size=300,
+            world_pos=(0.0, 0.0, 0.0), element_width_m=2.0, up_axis=2,
+        )
+        diff = min(abs(result["best_yaw"] - gt_yaw), 360 - abs(result["best_yaw"] - gt_yaw))
+        assert diff < 5.0, f"Expected yaw≈{gt_yaw}, got {result['best_yaw']} (IoU={result['best_iou']})"
+        assert result["best_iou"] > 0.2
+
+    def test_recovers_known_yaw_oblique_camera(self, tmp_path):
+        """Camera at an oblique angle → still recovers GT yaw."""
+        glb = self._build_asymmetric_glb(tmp_path)
+        verts, faces = parse_glb_vertices_faces(glb)
+        verts = _sample_surface_points(verts, faces, target_count=5000)
+        centered = verts - verts.mean(0)
+
+        cam_eye = (2.5, -2.0, 1.5)
+        cam_target = (0.0, 0.0, 0.0)
+        for gt_yaw in [30.0, 137.0, 270.0]:
+            bbox = self._bbox_from_projection(
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+            )
+            gt_alpha = self._project_silhouette(
+                centered, gt_yaw, cam_eye, cam_target, up_axis=2, fov=50, img_size=300,
+                bbox=bbox,
+            )
+            result = find_best_yaw_silhouette(
+                glb_path=glb, cutout_alpha=gt_alpha, norm_bbox=bbox,
+                camera_eye=cam_eye, camera_target=cam_target,
+                camera_up_axis=2, camera_fov=50, camera_img_size=300,
+                world_pos=(0.0, 0.0, 0.0), element_width_m=2.0, up_axis=2,
+            )
+            diff = min(abs(result["best_yaw"] - gt_yaw), 360 - abs(result["best_yaw"] - gt_yaw))
+            assert diff < 5.0, (
+                f"GT yaw={gt_yaw}: recovered {result['best_yaw']} "
+                f"(IoU={result['best_iou']})"
+            )
+
+    def test_returns_dict_with_required_keys(self, tmp_path):
+        glb = self._build_asymmetric_glb(tmp_path)
+        bbox = {"x": 0.5, "y": 0.5, "w": 0.8, "h": 0.5}
+        fake_alpha = np.zeros((50, 60), dtype=np.uint8)
+        result = find_best_yaw_silhouette(
+            glb_path=glb, cutout_alpha=fake_alpha, norm_bbox=bbox,
+            camera_eye=(0, -3, 1), camera_target=(0, 0, 0),
+            camera_up_axis=2, camera_fov=50, camera_img_size=300,
+            world_pos=(0, 0, 0), element_width_m=2.0,
+        )
+        assert "best_yaw" in result
+        assert "best_iou" in result
+        assert "method" in result
+        assert result["method"] == "silhouette_iou"
+        assert isinstance(result["coarse_scores"], list)
+        assert len(result["coarse_scores"]) > 0
 
 
 # ---------------------------------------------------------------------------

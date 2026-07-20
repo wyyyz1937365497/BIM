@@ -943,14 +943,55 @@ def build_app() -> gr.Blocks:
                         "element_width_m": round(element_width_m, 3),
                         "element_height_m": round(element_height_m, 3),
                         "depth": round(depth_val, 3),
+                        "camera": {
+                            "eye": [round(float(v), 4) for v in cam["eye"]] if "eye" in cam else None,
+                            "target": [round(float(v), 4) for v in cam["target"]] if "target" in cam else None,
+                            "fov": float(cam.get("fov", 0.0)),
+                            "up_axis": int(cam.get("up_axis", 2)),
+                            "img_size": {"w": int(img_w), "h": int(img_h)},
+                        },
                     }
 
                     # --- Register mesh in Revit ---
                     from bim_recon.mesh_registrar import (
                         MeshPlacement, compute_placement_transform,
+                        find_best_yaw_silhouette,
                         register_mesh_in_revit,
                         serialize_placement_diagnostics,
                     )
+
+                    # --- Auto-yaw via silhouette matching against the cutout ---
+                    # Renders the mesh at candidate yaws through the SAME camera
+                    # that captured the cutout, and picks the yaw whose silhouette
+                    # best matches the Falcon mask. Robust to TRELLIS generating
+                    # cubic objects at arbitrary orientations.
+                    auto_yaw_result: dict | None = None
+                    resolved_yaw = float(yaw_degrees) if yaw_degrees is not None else 90.0
+                    try:
+                        from PIL import Image as _CutoutImg
+                        cutout_arr = np.array(_CutoutImg.open(clean_path).convert("RGBA"))
+                        cutout_alpha = cutout_arr[:, :, 3] if cutout_arr.ndim == 3 else cutout_arr
+                        # Falcon bbox is in normalized coords of the FULL rendering.
+                        # render_state stored the full rendering size.
+                        cam_img_size = max(img_w, img_h)
+                        auto_yaw_result = find_best_yaw_silhouette(
+                            glb_path=Path(mesh_result.glb_path),
+                            cutout_alpha=cutout_alpha,
+                            norm_bbox=norm_bbox,
+                            camera_eye=tuple(float(v) for v in cam["eye"]),
+                            camera_target=tuple(float(v) for v in cam["target"]),
+                            camera_up_axis=up_axis,
+                            camera_fov=float(cam.get("fov", 50.0)),
+                            camera_img_size=int(cam_img_size),
+                            world_pos=(world_x, world_y, world_z),
+                            element_width_m=max(element_width_m, 0.1),
+                            up_axis=up_axis,
+                        )
+                        if auto_yaw_result.get("best_iou", 0.0) >= 0.15:
+                            resolved_yaw = float(auto_yaw_result["best_yaw"])
+                    except Exception as exc:
+                        auto_yaw_result = {"error": str(exc)}
+
                     placement = MeshPlacement(
                         glb_path=Path(mesh_result.glb_path),
                         world_x=world_x,
@@ -960,7 +1001,7 @@ def build_app() -> gr.Blocks:
                         element_width_m=max(element_width_m, 0.1),
                         element_height_m=max(element_height_m, 0.1),
                         up_axis=up_axis,
-                        yaw_degrees=float(yaw_degrees) if yaw_degrees is not None else 90.0,
+                        yaw_degrees=resolved_yaw,
                         category="OST_GenericModel",
                         name=label or name,
                     )
@@ -970,9 +1011,11 @@ def build_app() -> gr.Blocks:
                         revit_cfg = cfg.revit_mcp
                         revit_result = register_mesh_in_revit(placement, transform)
                         placement_info["diagnostics"] = serialize_placement_diagnostics(placement, transform)
+                        if auto_yaw_result is not None:
+                            placement_info["auto_yaw"] = auto_yaw_result
+                            placement_info["resolved_yaw"] = resolved_yaw
                         placement_info["revit"] = revit_result
                         if revit_result.get("status") == "formatted":
-                            # Call the compiled create_directshape_from_mesh MCP tool
                             gateway = StdioMCPGateway(
                                 command=revit_cfg.command,
                                 args=tuple(revit_cfg.args),
