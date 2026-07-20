@@ -80,14 +80,6 @@
 
 ### P3.7：Falcon 权威判定 + Gradio Web UI + 确定性 Workflows
 
-### P4：TRELLIS B类构件 Mesh 生成 + Revit DirectShape
-
-- **TRELLIS**（`TRELLIS/` 子模块，Microsoft image-to-3D 1.2B 模型）：从 VLM 验证图像生成高质量 GLB mesh（家具/管道/楼梯等异形件）。
-- **跨环境 HTTP 桥接**（`trellis_server/server.py`）：trellis conda 环境（torch 2.4 + xformers）常驻 FastAPI 服务（端口 18391），bim-recon 环境通过 `bim_recon/trellis_client.py` HTTP 调用。三环境不可合并。
-- **坐标变换**（`bim_recon/mesh_registrar.py`）：TRELLIS 输出的归一化 Y-up 包围盒 → 3DGS 场景坐标（轴重映射 + 物理尺寸缩放 + 候选位置平移）。GLB 解析支持 trimesh 和最小二进制 glTF 回退。
-- **Revit DirectShape**（`revit_scripts/create_directshape_from_mesh.cs`）：TessellatedShapeBuilder 从顶点+三角面构建 mesh → DirectShape 原生图元（可见但不可参数化编辑）。
-- **管线集成**：`run_pipeline.py` Stage 5c 自动将 VLM 验证的候选图像发送给 TRELLIS → 生成 GLB → 坐标变换 → DirectShape 插入。
-- **xformers Windows patch**：`trellis_server/xformers_windows.patch` + `launch_trellis_server.bat` 自动应用（flash-attn 不可用于 Windows）。
 
 #### Falcon 权威判定（消除假阳性）
 - **问题**：Falcon 在线但未检测到构件时，回退到 depth-probe 产生假阳性（实际不存在的构件被"发现"）。
@@ -96,11 +88,12 @@
 #### Gradio 单页 Web UI（`scripts/gradio_app.py`）
 - **Gradio Web UI**：单页界面（场景准备 → 管线 → 检测结果 → 微调 → Revit 工作流 → B 类构件工作流 → 3D 查看器）
   - ① 场景与数据准备：PLY 上传 → 验证 → SceneSplat 预处理
-  - ② 运行管线：确定性步骤事件实时输出 → 结果下拉列表
+  - ② 运行管线：确定性步骤事件实时输出 → 结果下拉列表；选择 `furniture` 可产生 B 类候选
   - ③ 检测结果：三行图库（雷达图 + VLM验证 + Seg叠加）+ JSON 报告
   - ④ 微调：Mask 绘制（`gr.ImageMask`）+ 视角重分割
   - ⑤ Revit 确定性工作流：按顺序创建标高、楼板、墙和门窗并核验 ElementId
-  - ⑤b B类构件受控工作流：固定视角扫描 → 人工勾选 → TRELLIS → Revit DirectShape
+  - ⑤b B 类物体确定性导入：已确认 B 类检测 → 定向渲染 + Falcon 抠图 + TRELLIS → 编译版 DirectShape
+  - 手动 B 类标签页：查看器视角 + 画笔粗框 + VLM 指代 + Falcon 精确抠图 → TRELLIS → 编译版 DirectShape
   - ⑥ 3D 查看器：nerfview iframe（端口 18081）
 - **Mask 绘制**（`gr.ImageMask`）：用户直接在立面渲染图上用红色画笔涂出门窗区域 → alpha 通道提取紧致 bbox → `mask_to_bbox()` → 墙局部坐标。
 - **相机捕获**（`scripts/viewer_camera_patch.py`）：monkey-patch `viser.ViserServer` → 端口 18082 暴露 `GET /camera-state`（position/look_at/fov/c2w）。用户在 nerfview 中漫游到合适视角后一键捕获。
@@ -116,14 +109,24 @@
 #### 确定性 Workflows（LlamaIndex Workflows + Revit MCP）
 - **A 类重建**：加载场景、坐标系、扫描、墙线、构件检测、VLM 验证和结果保存均为显式步骤。
 - **Revit 创建**：固定执行标高 → 楼板 → 墙 → 门窗 → ElementId 核验；失败事件包含稳定的阶段名。
-- **B 类扫描**：固定视角序列每个视角只渲染一次，Falcon 检测、三维定位、去重和候选持久化由状态机控制。
-- **B 类生成**：只处理人工确认的候选，按对象执行 TRELLIS，随后可选注册为 Revit DirectShape。
+- **B 类扫描与导入**：确认的 B 类候选经过定向 3DGS 渲染、Falcon RLE 抠图、TRELLIS 网格生成和深度反投影定位；`TrellisRevitWorkflow` 通过文件载荷调用编译版 `create_directshape_from_mesh`，不再依赖 `send_code_to_revit` 动态脚本。
 - **流式 UI**：共享的类型化进度、警告、失败和完成事件直接流入 Gradio；无 `smolagents`、自主循环或模型决定的工具顺序。
 
 #### nerfview 相机捕获（`scripts/viewer_camera_patch.py`）
 - **monkey-patch** `viser.ViserServer.__init__` → 启动时自动在端口 18082 开 HTTP 微服务。
 - **API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}` + CORS。
 - **修复**：`import run_viewer` 名称冲突 — 在 import 前从 `sys.path` 移除 `scripts/` 目录。
+
+### P4：TRELLIS B 类构件 Mesh 生成 + Revit DirectShape（已打通）
+
+- **TRELLIS**（`TRELLIS/` 子模块，Microsoft image-to-3D 1.2B 模型）：从 Falcon 抠出的 RGBA 图像生成 GLB mesh，适用于家具、管道、楼梯等无法可靠参数化的 B 类构件。
+- **跨环境 HTTP 桥接**（`trellis_server/server.py`）：trellis conda 环境（torch 2.4 + xformers）常驻 FastAPI 服务（端口 18391），bim-recon 环境通过 `bim_recon/trellis_client.py` 调用；三环境不可合并。
+- **坐标变换与文件载荷**（`bim_recon/mesh_registrar.py`）：将 TRELLIS 的归一化 Y-up 网格旋转、按检测尺寸缩放并平移至 3DGS 世界坐标，再转换为 Revit 内部单位（feet）并写入临时 JSON。文件模式避免大网格经 MCP stdio 内联传输。
+- **编译版 Revit DirectShape 工具**（`create_directshape_from_mesh`）：C# `CreateDirectShapeEventHandler` 使用 `TessellatedShapeBuilder` 构造闭合三角网格，并在 Revit `Transaction` 内创建 `OST_GenericModel` DirectShape。工具接收 `meshFile`（推荐）或内联网格，返回新元素 ID。
+- **端到端链路**：`渲染 + 深度` → `VLM 指代/已确认 B 类标签` → `Falcon RLE 分割` → `RGBA 抠图` → `TRELLIS GLB` → `轴重映射、缩放、深度反投影定位` → `create_directshape_from_mesh` → Revit。已用 8 顶点立方体与 25,647 顶点 / 40,594 三角面的椅子网格验证创建成功。
+- **Gradio 接入**：手动 B 类标签页和 ⑤b 确定性 B 类导入均使用上述编译版工具；后者批量处理管线已确认的 B 类检测结果，并流式展示 Falcon、TRELLIS 与 Revit 状态。
+- **限制**：DirectShape 是原生 Revit 图元，但网格本身不可像墙、门窗族一样参数化编辑；它可选择、删除、分类和重新生成。
+- **xformers Windows patch**：`trellis_server/xformers_windows.patch` + `launch_trellis_server.bat` 自动应用（flash-attn 不可用于 Windows）。
 
 ### SceneSplat Windows 原生推理（commit `8e25991`）
 
@@ -298,71 +301,43 @@ python -m pytest tests/test_workflows.py -q
 
 测试覆盖类型化事件流、A 类重建失败路径、Revit 主体与洞口创建顺序、B 类扫描去重，以及 TRELLIS/Revit 扇出。
 
-### 4. B类构件 Mesh 生成（TRELLIS + DirectShape）
+### 4. B 类构件 Mesh 生成与 DirectShape 导入
 
-B类构件是指**非标准几何形的复杂构件**：家具（桌椅沙发）、管道、楼梯、装饰件等。这些构件无法用参数化 Revit 族表示，需要通过 mesh 生成 + DirectShape 插入。
+B 类构件是非标准几何的复杂构件：家具、管道、楼梯和装饰件等。它们不适合自动映射为参数化 Revit 族，因此使用可重建、可追踪的三角网格 DirectShape；这并不替代 A 类墙、板、门窗的参数化创建。
 
-#### 完整流程（3 步）
+#### 前置服务
 
 ```powershell
-# ── 步骤 1: 启动 TRELLIS HTTP 服务（trellis conda 环境，单独终端）──
+# 终端 1：TRELLIS 服务（trellis conda 环境）
 scripts\launch_trellis_server.bat
-# 或手动:
-conda activate trellis
-cd G:\TJ\BIM
-pip install -r trellis_server/requirements.txt   # 首次运行
-python trellis_server/server.py --port 18391 --model G:/TJ/BIM/TRELLIS/TRELLIS-image-large
-# 等待 "TRELLIS model ready" 日志出现（首次加载需数分钟）
+# 首次运行会安装 trellis_server/requirements.txt；等待 "TRELLIS model ready"
 
-# ── 步骤 2: 启动 Revit + MCP 插件 ──
-# 打开 Revit 2026，确保 mcp-servers-for-revit 插件已加载
-
-# ── 步骤 3a: 随管线一起运行（bim-recon 环境）──
-cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0 --elements door window furniture"
-# Stage 5c 自动: VLM验证图像 → TRELLIS 生成GLB → 坐标变换 → DirectShape格式化
-
-# ── 步骤 3b: 单独生成 mesh（不随管线）──
-python scripts/generate_trellis_mesh.py --image path/to/object.png --output-dir output/meshes/ --name chair_01
-# 输出: GLB + PLY 路径 (JSON)
+# 终端 2：打开 Revit 2026，并确保本地 mcp-servers-for-revit 插件已加载
 ```
 
-#### 坐标变换原理
+TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点。该服务不可用时，A 类检测与建模仍可继续，B 类网格导入将明确报告不可用。
 
-TRELLIS 生成的 GLB 在归一化坐标（[-1,1]，Y 轴朝上）中。`mesh_registrar.py` 将其变换到 3DGS 场景坐标：
+#### 确定性导入流程
 
-1. **轴重映射**：TRELLIS Y-up → 3DGS up_axis（如 Z-up: mesh Y→world Z）
-2. **缩放**：匹配到检测到的物理尺寸（`element_width_m`），高度不超过天花板
-3. **平移**：放置到候选位置 `(world_x, world_y)`，底面在地板高度
+1. 管线输出已确认的 B 类元素，或在手动 B 类标签页从当前 3DGS 视角用画笔粗框选择目标。
+2. Falcon-Perception 依据 VLM 指代或元素标签生成 RLE mask，程序输出具有透明背景的 RGBA cutout；深度图将 mask 中心反投影到 3DGS 世界坐标。
+3. TRELLIS 从 cutout 生成 GLB / PLY。`mesh_registrar.py` 将 TRELLIS 的归一化 Y-up 网格重映射到场景 up-axis，按估计的宽高缩放、平移到世界位置，并转换为 Revit 内部单位（feet）。
+4. `mesh_registrar.py` 写出临时 JSON 文件（`name`、`category`、扁平 `vertices`、扁平三角形 `faces`）。`TrellisRevitWorkflow` 或 Gradio ⑤b 通过 MCP 调用编译版 `create_directshape_from_mesh`，并传递 `meshFile`。
+5. Revit 中的 `CreateDirectShapeEventHandler` 用 `TessellatedShapeBuilder` 构造闭合面集，在事务中创建 `OST_GenericModel` DirectShape 并返回元素 ID。
 
-#### DirectShape 插入 Revit
+文件载荷形式避免把大网格的顶点和三角索引经 MCP stdio 内联传输；仅小型网格才应使用工具的 inline `data` 形式。生成的 DirectShape 可选择、分类、删除和重新生成，但网格本身不可像 Revit 族一样参数化编辑。
 
-生成的 mesh 通过 `revit_scripts/create_directshape_from_mesh.cs` 插入 Revit：
-- `TessellatedShapeBuilder` 从顶点+三角面构建几何体
-- 创建 `DirectShapeType` + `DirectShape`（类别 OST_GenericModel）
-- **原生可见**但**不可参数化编辑**（与原生 Wall/Door 不同）
+#### 使用入口
 
-#### Gradio UI
+- **⑤b B 类物体确定性导入**：对管线已确认的 B 类结果，按上面的完整链路批量执行并流式显示进度。
+- **手动 B 类标签页**：用户先捕获查看器视角并用画笔提供粗框；VLM/Falcon 完成精确实例选择，再生成和导入网格。
+- **单独生成网格（不导入 Revit）**：
 
-Gradio 界面 ⑤b 区域可直接上传图像 → 一键生成 mesh：
-1. 上传构件图像（PNG，建议白色/透明背景）
-2. 输入名称和随机种子
-3. 点击「🔲 生成 Mesh」
-4. 查看生成的 GLB 路径（JSON 输出）
+  ```powershell
+  python scripts/generate_trellis_mesh.py --image path/to/object.png --output-dir output/meshes/ --name chair_01
+  ```
 
-#### config.json 配置
-
-```json
-{
-  "trellis": {
-    "host": "127.0.0.1",
-    "port": 18391,
-    "model": "microsoft/TRELLIS-image-large",
-    "timeout": 1800
-  }
-}
-```
-
-> TRELLIS server 未启动时管线自动跳过 mesh 生成，不影响其他构件检测。
+  命令输出 GLB 和 PLY 的路径。若要导入，请走上面的 Gradio 工作流或调用 `create_directshape_from_mesh`，不要使用 `send_code_to_revit` 动态脚本。
 
 ## 运行测试
 
@@ -370,7 +345,7 @@ Gradio 界面 ⑤b 区域可直接上传图像 → 一键生成 mesh：
 pytest -q
 ```
 
-当前 173 个测试：
+各测试文件的当前通过数应以本地命令输出为准；涉及 gsplat 渲染的测试首次运行需要 MSVC JIT 环境。
 
 | 测试文件 | 覆盖 | 状态 |
 |---|---|---|
@@ -388,7 +363,14 @@ pytest -q
 | `tests/test_config_trellis.py` | TrellisConfig 配置解析 | 2/2 通过 |
 | `tests/test_trellis_cli.py` | TRELLIS CLI 参数解析 | 1/1 通过 |
 | `tests/test_trellis_integration.py` | TRELLIS 集成（真实 HTTPServer mock）| 4/4 通过 |
-| `tests/test_mesh_registrar.py` | 坐标变换/旋转/det/GLB解析/DirectShape payload | 15/15 通过 |
+| `tests/test_mesh_registrar.py` | GLB 解析、坐标变换、Revit-feet 文件载荷和 DirectShape 工具参数 | 见上方回归命令 |
+| `tests/test_workflows.py` | B 类分割、TRELLIS、文件载荷与编译版 DirectShape 工具分派 | 见上方回归命令 |
+
+DirectShape 与 B 类确定性工作流回归：
+
+```powershell
+python -m pytest tests/test_workflows.py tests/test_mesh_registrar.py -q
+```
 
 MCP 工具集成测试（需 MSVC）：
 
@@ -401,19 +383,19 @@ cmd /c "\"...\vcvars64.bat\" && python scripts/test_mcp_gs.py"
 ```
 bim_recon/
 ├── gs_scene.py              # 3DGS 场景加载 + gsplat 渲染 + 语义查询
-├── semantics.py             # SemanticQuerier (feat.pt + SigLIP2 文本嵌入)
+├── semantics.py             # SemanticQuerier（feat.pt + 按需 SigLIP2 开放词汇查询；可选 warm cache）
 ├── mcp_gs.py                # MCP Server (9 工具)
 ├── wall_fitter.py           # WallFitter + FloorPlanGuidedFitter
 ├── floorplan_registration.py # 底图→3DGS 自动配准
 ├── virtual_scanner.py       # 虚拟 2D 激光扫描器
 ├── wall_line_extractor.py   # 栅格化+形态学+轮廓+DP+RANSAC 墙线提取
-├── candidate_extractor.py   # 元素候选提取（门/窗/家具，feat.pt 语义+墙线投影）
+├── candidate_extractor.py   # 元素候选提取（标签集相对的门/窗/家具索引 + 墙线投影）
 ├── vlm_verifier.py          # VLM 验证（极坐标→渲染→Ollama gemma4:12b 确认/排除）
 ├── height_detector.py       # 高度检测（垂直深度探测 + 双信号 sill/header 精修）
 ├── spatial_extractor.py     # Falcon 空间提取（垂直立面渲染 + bbox→墙坐标映射）
 ├── falcon_client.py         # Falcon HTTP 客户端（跨环境桥接）
 ├── trellis_client.py        # TRELLIS HTTP 客户端（跨环境 mesh 生成）
-├── mesh_registrar.py        # B类构件坐标变换 + Revit DirectShape 插入
+├── mesh_registrar.py        # B 类坐标变换 + DirectShape JSON 文件载荷生成
 ├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
@@ -438,17 +420,16 @@ scripts/
 ├── build_deploy_revit.ps1   # Revit MCP 一键构建+部署（C# + TypeScript + Addins）
 ├── generate_walls.py        # 单独提取墙线
 ├── final_radar.py           # 可视化：4 面板管线结果图
-├── encode_bim_labels.py     # SigLIP2 文本嵌入生成器（工具）
+├── encode_bim_labels.py     # 可选 SigLIP2 文本嵌入 warm-cache 生成器
 ├── manual_to_revit_code.py  # 手量底图 → Revit C# 脚本（工具）
 ├── test_mcp_gs.py           # MCP 工具集成测试
 └── train_gs.py              # nerfstudio 训练包装
 
-revit_scripts/               # send_code_to_revit C# 脚本模板库
+revit_scripts/               # 仅供仍需动态脚本的遗留 / 辅助 C# 模板
 ├── query_family_types.cs    # 查询族类型（含尺寸）
 ├── create_custom_door.cs    # 自定义尺寸门（复制类型+设参数）
 ├── create_custom_window.cs  # 自定义尺寸窗
 ├── create_walls_from_json.cs # 批量建墙（JSON 输入）
-├── create_directshape_from_mesh.cs # B类构件 mesh → DirectShape
 └── delete_elements_by_category.cs # 按类别删除
 
 data/                        # SceneSplat .npy 数据 + BIM 词表

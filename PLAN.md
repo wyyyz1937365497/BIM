@@ -1,8 +1,8 @@
 # 3DGS → BIM 自动重建系统 · 项目计划
 
-> **状态**：计划已定稿，待启动
-> **⚠️ 架构变更（2026-06-27）**：**放弃 IFC 交换生态**，改用 **pyRevit + Revit API** 直接在 Revit 中生成/编辑原生图元（原生可编辑、无 IFC 导入兼容性问题）。下文所有 IfcOpenShell/IFC 相关内容（§5、§8、§10.1、§12 等）视为**历史/已弃用**，以本条为准。FloorPlan 契约、3DGS、VLM/MCP 等其余架构不变。
-> **日期**：2026-06-26
+> **状态**：核心重建、A 类原生参数化图元和 B 类 DirectShape 导入均已打通；本计划的旧 IFC 段落仅保留为历史记录。
+> **⚠️ 架构变更（2026-07-20）**：不使用 IFC 交换。A 类（墙、板、门、窗、柱）经编译版 Revit MCP 工具创建为原生参数化图元；B 类（家具、管道、楼梯、异形件）经 Falcon 抠图与 TRELLIS 生成网格，再由编译版 `create_directshape_from_mesh` 创建 `OST_GenericModel` DirectShape。下文 IfcOpenShell/IFC 内容视为历史/已弃用。
+> **日期**：2026-07-20
 > **类型**：大学生创新训练计划（SITP）/ 大创
 > **MVP 周期**：约 24 周（1–2 人）
 > **本文件用途**：团队同步用的唯一事实来源（single source of truth）。实施时以本文件为准。
@@ -17,7 +17,7 @@
 
 ## 1. 项目概述
 
-用**消费级设备**（手机 + 一个 50 元 2D 旋转 LiDAR + 3D 打印支架）采集房间，以 **3D Gaussian Splatting (3DGS)** 作为"信息丰富的中间表示"，让**多模态视觉大模型 (VLM) 借助 MCP** 在 3DGS 场景中自由巡视、分割出符合建筑语义的结构构件，最终由 **pyRevit + Revit API** 直接在 Revit 中生成**可编辑的原生 BIM 图元**（不再走 IFC 交换）。
+用**消费级设备**（手机 + 一个 50 元 2D 旋转 LiDAR + 3D 打印支架）采集房间，以 **3D Gaussian Splatting (3DGS)** 作为信息丰富的中间表示，让**多模态视觉大模型 (VLM) 借助 MCP** 在 3DGS 场景中巡视、分割并定位构件：A 类进入 Revit 原生参数化图元，B 类进入原生 `OST_GenericModel` DirectShape（不走 IFC 交换）。
 
 **目标用户**：设计师（快速现状测绘 + 后期可改图），**不是**施工级 BIM。
 
@@ -29,15 +29,11 @@
 
 ### 2.1 MVP 必须达成
 - **输入**：单房间的手机视频 + 一张水平底图（手量矩形 / 2D LiDAR 扫描，二选一）。
-- **输出**：可在 **Revit 中打开并编辑**的 IFC，包含：
-  - `IfcWall`（墙，SweptSolid 表示）
-  - `IfcSlab`（地板 / 天花板）
-  - `IfcColumn`（柱，若存在）
-  - `IfcOpeningElement` + `IfcDoor` / `IfcWindow`（门窗洞口）
-- **可编辑性**：在 Revit 中能拖动墙厚、移动门窗、删除构件而不报错。
+- **A 类输出**：在 Revit 中创建并可编辑的原生墙、楼板 / 天花板、柱（若存在）及门窗；墙厚、门窗位置和族参数可继续编辑。
+- **B 类输出**：对已确认的家具、管道、楼梯或异形件，生成 TRELLIS 网格并导入为原生 `OST_GenericModel` DirectShape；可在 Revit 中选择、分类、删除和重新生成。
 
-### 2.2 MVP 不包含（写入未来工作）
-- B 类复杂构件（管道、楼梯、异形件）的 mesh 回灌。
+### 2.2 当前边界
+- B 类 DirectShape 是三角网格，不承诺参数化编辑或自动转换为 Revit 族。
 - 多房间 / 多层拼接（仅留接口占位）。
 - 施工级精度。
 
@@ -51,7 +47,7 @@
 | 手机 IMU 用法 | MVP 仅作**重力对齐**，位姿交给 COLMAP |
 | 是否自研 Android App | **不做**；手机自带录像即可（位姿不依赖图像匹配） |
 | GPU | 两张 2080Ti 22G（单房间 3DGS 训练充裕） |
-| **IFC 版本标准** | **IFC4**。原生 `IfcTriangulatedFaceSet` 便于未来 B 类 mesh 回灌（见 §10.1）。3D 不可见的真正根因是 Revit 导入后"Phase Created（创建阶段）"默认为不存在的阶段（改为"现有"即恢复），**与 IFC 版本无关**（见 §12.1） |
+| **Revit 表示** | A 类使用 Revit 原生参数化 API；B 类使用 `TessellatedShapeBuilder` + `DirectShape`。两者均不依赖 IFC 导入；DirectShape 适合不可参数化网格，但不替代可编辑的墙、门窗族。 |
 
 ---
 
@@ -98,9 +94,9 @@
         │
         ▼
 ┌────────────────── Revit MCP 服务器 → Revit 原生图元 ─────────────────┐
-│  mcp-servers-for-revit (git 子模块, C# + TypeScript MCP + WebSocket)         │
-│    → Wall.Create / NewFamilyInstance / execute_revit_code             │
-│    → Revit 中原生可编辑图元（墙/板/门/窗/柱）                         │
+│  mcp-servers-for-revit（C# + TypeScript MCP + WebSocket）             │
+│    → A 类：Wall/Create* 等参数化工具；B 类：create_directshape_from_mesh│
+│    → Revit 原生图元（墙/板/门/窗/柱）+ OST_GenericModel DirectShape   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -153,7 +149,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | 几何处理 | **Open3D** `isl-org/Open3D` | RANSAC 平面、2D ICP 配准 | 复用 |
 | **VLM 工具服务器（3DGS 侧）** | **MCP Python SDK** `modelcontextprotocol/python-sdk` | 暴露 render_from_pose/pick/segment 等 3DGS 工具给 VLM | **自建（薄壳）** |
 | VLM | Claude / GPT-4o / Gemini | 推理循环 | API |
-| **Revit MCP 服务器** | **mcp-servers-for-revit** `mcp-servers-for-revit/mcp-servers-for-revit`（git 子模块） | C# + TypeScript MCP + WebSocket 桥接 Revit API；已实现 26 个工具（`create_line_based_element`/`create_surface_based_element`/`send_code_to_revit` 等）；可添加自定义 BIM-Recon 扩展 | 复用 |
+| **Revit MCP 服务器** | **mcp-servers-for-revit** `mcp-servers-for-revit/mcp-servers-for-revit`（git 子模块） | C# + TypeScript MCP + WebSocket 桥接 Revit API；A 类参数化工具及 `create_directshape_from_mesh` 编译版工具均已接入 | 复用 + BIM-Recon 扩展 |
 | **水平底图 Provider** | Manual（自写）+ LiDAR（ROS2 `/scan`→矢量化） | 去耦底图接口 | **自建** |
 | 2D LiDAR 取墙线 | 现有 **ROS2 driver** + split-and-merge | 扫描→墙线段 | 复用 driver + 小算法 |
 
@@ -193,7 +189,7 @@ VLM 的能力边界是语义判断与推理，**不是**生成精确几何数值
 | 15 | P2 | 编辑性验证（Revit 拖动墙厚/门窗） | — |
 | 16–17 | P3 | ROS2 `/scan`→墙线(split-and-merge)；gsplat 旋转LiDAR光栅仿真扫描 | 平面图能出 |
 | 18–19 | P3 | LiDARProvider；Open3D 2D 配准到 3DGS；有/无 LiDAR 质量对比 | LiDAR 支线通 |
-| 20–21 | P4 | 难例 + 精度报告；多房间占位；B类(PGSR/TRELLIS)写文档 | — |
+| 20–21 | P4 | 难例 + 精度报告；B 类 Falcon → TRELLIS → DirectShape 导入 | **已完成：编译版工具与端到端椅子网格验证** |
 | 22–23 | P4 | 系统集成 demo；Revit 编辑视频；（加分）DrawingProvider | — |
 | 24 | P4 | 论文/报告/Slides | 大创交付 |
 
@@ -380,39 +376,27 @@ ender_from_pose：gsplat 渲染 RGB+深度
 
 ## 10. 未来工作（MVP 之外）
 
-### 10.1 B 类复杂构件 mesh 回灌
+### 10.1 B 类复杂构件 DirectShape 回灌（已完成）
 
-> ⚠️ **已弃用 IFC 路线**：下方原 IfcBuildingElementProxy / IfcShellBasedSurfaceModel 描述为历史记录。pyRevit 架构下，B 类 mesh 用 `doc.Create.NewDirectShape(...)`（Revit DirectShape 承载任意 mesh，原生可见但不可参数化编辑）；A 类用 `Wall.Create`/`Floor.Create` 等原生 API。
+**当前实现（2026-07-20）**：B 类家具、管道、楼梯和异形件不再走 IFC 或动态 C# 脚本。`TrellisRevitWorkflow` 与 Gradio 的确定性 B 类入口将生成网格以文件载荷交给编译版 MCP 工具 `create_directshape_from_mesh`；它在 Revit 事务中以 `TessellatedShapeBuilder` 创建 `OST_GenericModel` DirectShape。
 
-**当前状态（2026-07-08）**：TRELLIS mesh 生成 + 坐标变换 + DirectShape 插入已实现（见 §12.15）。剩余工作：多视角配准精修、精度评估。
+**已完成链路**：
 
-**已完成流程**：VLM 验证候选 → TRELLIS 生成 GLB → `mesh_registrar` 坐标变换（轴重映射 + 缩放 + 平移）→ `send_code_to_revit` DirectShape（TessellatedShapeBuilder）→ Revit 原生可见图元。
+1. 已确认 B 类候选或手动粗框 → 定向 3DGS 渲染；
+2. VLM 指代 / 元素标签 → Falcon RLE 实例分割 → RGBA cutout；
+3. TRELLIS 生成 GLB / PLY；
+4. `mesh_registrar` 进行 TRELLIS Y-up → 3DGS up-axis 重映射、尺寸缩放、世界坐标平移，并转换为 Revit feet；
+5. 临时 JSON (`name`、`category`、`vertices`、`faces`) → `create_directshape_from_mesh(meshFile=...)` → 新 DirectShape ElementId。
 
-**原计划流程**（部分已实现）：区域人工框选 → 多视角(≥3)渲染 RGB+深度+mask → 单物体 mesh 生成器（TRELLIS / InstantMesh / TripoSR）→ **可微渲染配准**(SE(3)+scale) 回灌 → Revit **DirectShape**。
+**已验证**：
 
-**IFC 版本与 mesh 表达策略（关键）**：项目标准为 **IFC4**（见 §2.3），B 类 mesh 直接用原生 `IfcTriangulatedFaceSet` + `IfcCartesianPointList3D`，代码简洁、文件紧凑。
+- 8 顶点立方体的工具契约和编译版 Revit 插入；
+- 25,647 顶点、40,594 三角面的 TRELLIS 椅子网格通过文件载荷创建；
+- 工作流和注册器回归测试覆盖文件载荷、工具分派与无 `send_code_to_revit` 路径。
 
-| 维度 | IFC4（项目采用） | IFC2X3（备选/历史） |
-|---|---|---|
-| 三角网格实体 | ✅ 原生 IfcTriangulatedFaceSet（顶点索引/法线/颜色） | ❌ 无专用实体 |
-| 替代表达 | 一行 `IfcTriangulatedFaceSet`（配合 `IfcCartesianPointList3D` 批量存顶点） | `IfcShellBasedSurfaceModel`+`IfcFaceSurface`+`IfcPolyLoop`+`IfcCartesianPoint`（三层嵌套） |
-| 顶点存储 | `IfcCartesianPointList3D` 批量，紧凑 | 每点单独 IfcCartesianPoint，文件臃肿 |
-| Revit 行为 | 几何保真度高；导入后改"Phase Created=现有"即可正常显示（见 §12.1） | 直接打开可见、可整体移动；不可参数化编辑（哑代理） |
-| 代码复杂度 | 低（一行） | 高（手动三层嵌套） |
+**表示边界**：DirectShape 是原生 Revit 图元，能够选择、分类、删除、隐藏和重新生成；它不是参数化族，不能替代 A 类墙、板、门窗的可编辑 BIM 语义。
 
-**落地建议（分阶段）**：
-- **MVP（P0–P2）**：不涉及 mesh；A 类用 SweptSolid（墙/板/柱/门窗可编辑 ✅）。
-- **P4 难例探索**：IFC4 + `IfcBuildingElementProxy` + `IfcTriangulatedFaceSet`。
-- **若 Revit 直接打开遇阻**：先把导入图元的"Phase Created"改为"现有"；或用"链接→绑定→解组"工作流；必要时 mesh 单独导出做链接补充。
-
-**关键技巧**（无论版本）：
-- 回灌前用 `trimesh.simplify_quadric_decimation` 把面数压到 **5000 以下**，避免 IFC 文件膨胀/解析卡死。
-- 容器用 `IfcBuildingElementProxy`（Revit 归类"常规模型"），**不要**用 `IfcFurnishingElement`（可能被过滤）。
-- 即便是哑代理，仍通过 `IfcRelDefinesByProperties` 挂 Pset（材质/来源/置信度）供查询。
-- 导出用 `.ifczip`（mesh 类 IFC 可压缩 60%+）。
-- **BlenderBIM/Bonsai 预览验证** mesh 表达是否正确，比反复开 Revit 快。
-
-> 说明：IFC4 选型正是为 B 类 mesh 兼容——原生 `IfcTriangulatedFaceSet` 让回灌代码极简；若将来必须用 IFC2X3 交换，退而用 `IfcShellBasedSurfaceModel`（三层嵌套、哑代理）也完全可行，符合 §2.2"不追求毫米级施工精度"的定位。
+**后续优化**：多视角选择 / 配准精修、实例尺度与位置精度评估、网格简化和材质策略。它们是质量提升，不是 B 类导入的阻塞项。
 
 ### 10.2 多房间 / 整层拼接
 通过多点底图 + 3DGS 分区重建，软件层拼接（MVP 仅留接口占位）。
@@ -458,10 +442,10 @@ ender_from_pose：gsplat 渲染 RGB+深度
 
 **Phase 能否在 IFC 创建时指定？** 不能可靠指定——Revit 的 Phase 是 Revit 侧概念，导入时按视图/默认阶段分配，不读 IFC 内容（Revit 导出会写 `Pset_Revit_Phasing`，但导入不读）。手动在 Revit 改 Phase 是可靠路径。
 
-**结论**：
-- 标准**回退 IFC4**（本次 commit）：原生 `IfcTriangulatedFaceSet` 利于未来 B 类 mesh；commit `709482e` 的 IFC4→IFC2X3 误诊切换已撤销。
-- IFC 文件本身经多轮验证（schema/header/guid/placement/boolean/round-trip 全绿）是正确的；3D 可见性属 Revit 导入侧 Phase 设置问题，非文件缺陷。
-- 本条记录避免重复踩坑。
+**结论（历史记录）**：
+- 当时的 IFC4 / IFC2X3 选择和 Phase 修复仅适用于已弃用的 IFC 试验路线；它不再是项目标准，也不用于 B 类 mesh。
+- 当前架构直接调用 Revit API：A 类为参数化原生图元，B 类经 `create_directshape_from_mesh` 创建 `OST_GenericModel` DirectShape，因此不受 IFC 导入阶段设置影响。
+- 保留本条仅为避免在维护历史 IFC 实验时重复误诊；实施决策以本计划顶部的 2026-07-20 架构变更为准。
 
 ### 12.2 [2026-06-27] Revit 默认 IFC 映射表缺 IfcOpeningElement → 门洞不显示
 
