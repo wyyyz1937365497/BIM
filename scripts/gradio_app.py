@@ -9,6 +9,7 @@ The gsplat renderer initializes the Visual Studio compiler environment on demand
 """
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 import sys
@@ -208,73 +209,8 @@ def build_app() -> gr.Blocks:
         revit_build_status = gr.Markdown("等待执行")
         revit_build_result = gr.JSON(label="创建与核验结果")
 
-        # ====== ⑤b B类构件受控工作流 ======
-        gr.Markdown("---\n## ⑤b B类构件受控工作流")
-        gr.Markdown(
-            "自动扫描采用固定视角序列：每个视角只渲染一次，"
-            "按指定标签调用 Falcon，完成三维定位和去重。"
-            "TRELLIS 与 Revit 创建只处理人工勾选的物体。"
-        )
-        bmesh_scene_state = gr.State("")
-        bmesh_cam_data = gr.State({})
-        explorer_results_state = gr.State({})
-
-        with gr.Tab("自动扫描与审批"):
-            with gr.Accordion("扫描参数", open=True):
-                with gr.Row():
-                    explore_cam_btn = gr.Button("从独立查看器获取初始视角")
-                    explore_render_btn = gr.Button(
-                        "📸 渲染初始视角", variant="secondary",
-                    )
-                explore_cam_status = gr.Markdown(
-                    "在独立查看器中漫游到扫描起点后捕获相机。"
-                )
-                explore_initial_view = gr.Image(
-                    label="初始视角渲染图", height=360,
-                )
-                explore_cam_data = gr.State({})
-                explore_labels = gr.Textbox(
-                    label="开放词汇标签（英文逗号分隔）",
-                    value="chair, table, sofa, cabinet, bed, lamp, vase, plant, shelf, desk",
-                )
-                with gr.Row():
-                    explore_num_views = gr.Slider(
-                        label="扫描视角数", minimum=1, maximum=12,
-                        value=8, step=1,
-                    )
-                    explore_turn_degrees = gr.Number(
-                        label="每步旋转角度", value=45.0,
-                    )
-                explore_run_btn = gr.Button("执行自动扫描", variant="primary")
-            explore_progress = gr.Markdown("等待扫描")
-            explore_current_view = gr.Image(label="当前扫描视图", height=360)
-            explore_gallery = gr.Gallery(
-                label="已发现物体", columns=4, height=250,
-                show_label=True, object_fit="contain", preview=True,
-            )
-            explore_select = gr.CheckboxGroup(
-                label="人工确认：选择需要生成 Mesh 的物体",
-                choices=[],
-            )
-            explore_output = gr.JSON(label="扫描结果")
-            with gr.Accordion("TRELLIS 与 Revit 参数", open=True):
-                with gr.Row():
-                    bmesh_width = gr.Number(
-                        label="物体宽度 (m)", value=0.8, minimum=0.05,
-                    )
-                    bmesh_height = gr.Number(
-                        label="物体高度 (m)", value=1.0, minimum=0.05,
-                    )
-                    bmesh_seed = gr.Number(label="种子", value=1, precision=0)
-                bmesh_register_revit = gr.Checkbox(
-                    label="生成后注册到 Revit", value=True,
-                )
-                bmesh_generate_selected_btn = gr.Button(
-                    "生成已确认物体", variant="primary",
-                )
-            bmesh_workflow_status = gr.Markdown("等待人工确认")
-            bmesh_workflow_output = gr.JSON(label="Mesh 与 Revit 结果")
-
+        # ====== ⑤b B类构件手动提取 ======
+        # (自动化扫描与审批已暂时移除，仅保留手动选取流程)
         with gr.Tab("手动选取（视角 + 框选 + 识别）"):
             gr.Markdown(
                 "**步骤：**\n"
@@ -282,7 +218,7 @@ def build_app() -> gr.Blocks:
                 "2. 点击「捕获视角并渲染」\n"
                 "3. 用画笔在渲染图上**粗略框选**目标物体（不必精确）\n"
                 "4. 点击「🔍 VLM识别 + Falcon分割」— VLM 自动识别物体，Falcon 生成精确遮罩\n"
-                "5. 确认抠图后点击「生成 Mesh」"
+                "5. 确认抠图后点击「生成 Mesh + 注册 Revit」"
             )
             bmesh_cam_btn = gr.Button("捕获视角并渲染", variant="secondary")
             bmesh_cam_status = gr.Markdown("需先从独立查看器捕获视角")
@@ -302,7 +238,7 @@ def build_app() -> gr.Blocks:
                     "🔍 VLM识别 + Falcon分割", variant="secondary",
                 )
                 bmesh_gen_manual_btn = gr.Button(
-                    "生成 Mesh", variant="primary",
+                    "生成 Mesh + 注册 Revit", variant="primary",
                 )
             bmesh_identified_label = gr.Textbox(
                 label="VLM 识别结果", interactive=False,
@@ -313,7 +249,10 @@ def build_app() -> gr.Blocks:
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
             bmesh_cutout_state = gr.State(None)
-
+            bmesh_render_state = gr.State(None)
+            bmesh_cam_state = gr.State(None)
+            bmesh_detection_state = gr.State(None)
+            bmesh_scene_state = gr.State("")
         # ====== ⑥ 独立 3D 查看器 ======
         gr.Markdown(
             "---\n## ⑥ 独立 3D 查看器\n\n"
@@ -608,244 +547,25 @@ def build_app() -> gr.Blocks:
             except Exception as e:
                 return {"错误": f"生成失败: {e}"}
 
-        # --- B类 Mesh: deterministic scan and approval ---
-        explore_cam_btn.click(
-            fn=fetch_camera_state,
-            inputs=[viewer_state],
-            outputs=[explore_cam_status, explore_cam_data],
-        )
+        # --- B类 Mesh: 手动选取 Tab ---
 
-        def _on_explore_render(scene_name: str, cam_data: dict):
-            """Render the captured initial viewpoint via scene.render (MCP render_from_pose equivalent)."""
+        def _on_bmesh_capture(scene_name: str, viewer_session: dict):
+            """Capture viewpoint, render at 2048p, and store depth + camera for placement."""
             if not scene_name:
-                return None, "❌ 请先选择场景"
-            if not cam_data or "position" not in cam_data:
-                return None, "⚠️ 请先点击「从独立查看器获取初始视角」捕获相机"
+                return None, None, "❌ 请先选择场景"
+            status, cam_data = fetch_camera_state(viewer_session)
+            if not cam_data:
+                return None, None, status
+
             scene = _get_scene(scene_name)
             if scene is None:
-                return None, f"❌ 无法加载场景 {scene_name}"
+                return None, None, f"❌ 无法加载场景 {scene_name}"
 
             eye = cam_data.get("position", [0, 0, 0])
             target = cam_data.get("look_at", [0, 0, 1])
             fov = cam_data.get("fov_degrees", 60)
             up = cam_data.get("up", [0, 0, 1])
-
-            from bim_recon.gs_scene import look_at_pose
-            pose = look_at_pose(
-                (eye[0], eye[1], eye[2]),
-                (target[0], target[1], target[2]),
-                up=(up[0], up[1], up[2]),
-            )
-            render_result = scene.render(pose, width=2048, height=1536, fov_degrees=fov)
-            render_arr = (render_result.colors * 255).clip(0, 255).astype(np.uint8)
-            return render_arr, f"✅ 初始视角渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
-
-        explore_render_btn.click(
-            fn=_on_explore_render,
-            inputs=[scene_state, explore_cam_data],
-            outputs=[explore_initial_view, explore_cam_status],
-        )
-
-        async def _run_explorer_scan(
-            scene_name: str,
-            camera_data: dict,
-            labels_text: str,
-            num_views: int,
-            turn_degrees: float,
-        ):
-            if not scene_name:
-                yield (
-                    "请先选择场景", None, [], gr.update(choices=[]),
-                    {"error": "missing_scene"}, {},
-                )
-                return
-            if not camera_data or "position" not in camera_data:
-                yield (
-                    "请先从查看器获取初始视角", None, [],
-                    gr.update(choices=[]),
-                    {"error": "missing_camera"}, {},
-                )
-                return
-            labels = tuple(
-                label.strip()
-                for label in labels_text.split(",")
-                if label.strip()
-            )
-            try:
-                ply_path, feat_path = find_scene_files(ROOT / "data" / scene_name)
-                falcon = load_config().falcon
-                position = tuple(float(value) for value in camera_data["position"])
-                look_at = tuple(float(value) for value in camera_data["look_at"])
-                camera = ExplorerCamera(
-                    eye=position,
-                    look_at=look_at,
-                    fov=float(camera_data.get("fov_degrees", 60.0)),
-                )
-                workflow = ExplorerScanWorkflow(ExplorerScanConfig(
-                    ply_path=ply_path,
-                    feat_path=feat_path,
-                    output_root=ROOT / "output" / scene_name / "explore",
-                    camera=camera,
-                    labels=labels,
-                    falcon_host=falcon.host,
-                    falcon_port=falcon.port,
-                    num_views=int(num_views),
-                    turn_degrees=float(turn_degrees),
-                ))
-                lines: list[str] = []
-                current_image = None
-                latest: dict = {}
-                found: list[dict] = []
-                async for update in stream_workflow_gradio(workflow):
-                    lines.append(update.message)
-                    current_image = update.image_path or current_image
-                    latest = update.payload or latest
-                    found = latest.get("found_objects", found)
-                    gallery = [
-                        (obj["best_view"], f'{obj["label"]} ({obj["id"]})')
-                        for obj in found
-                        if obj.get("best_view") and Path(obj["best_view"]).exists()
-                    ]
-                    choices = [
-                        (f'{obj["label"]} ({obj["id"]})', obj["id"])
-                        for obj in found
-                    ]
-                    state = latest if "found_objects" in latest else {
-                        **latest,
-                        "found_objects": found,
-                    }
-                    yield (
-                        "\n\n".join(lines[-30:]),
-                        current_image,
-                        gallery,
-                        gr.update(choices=choices),
-                        latest,
-                        state,
-                    )
-            except Exception as exc:
-                yield (
-                    f"扫描失败: {exc}", None, [], gr.update(choices=[]),
-                    {"error": str(exc)}, {},
-                )
-
-        explore_run_btn.click(
-            fn=_run_explorer_scan,
-            inputs=[
-                scene_state,
-                explore_cam_data,
-                explore_labels,
-                explore_num_views,
-                explore_turn_degrees,
-            ],
-            outputs=[
-                explore_progress,
-                explore_current_view,
-                explore_gallery,
-                explore_select,
-                explore_output,
-                explorer_results_state,
-            ],
-        )
-
-        async def _run_approved_meshes(
-            selected_ids: list[str],
-            explorer_state: dict,
-            width_m: float,
-            height_m: float,
-            seed: int,
-            register_in_revit: bool,
-        ):
-            found = explorer_state.get("found_objects", []) if explorer_state else []
-            selected = [
-                obj for obj in found if obj.get("id") in set(selected_ids or [])
-            ]
-            if not selected:
-                yield "请先勾选至少一个已发现物体。", {"error": "no_approval"}
-                return
-            status = explorer_state.get("status", {})
-            up_axis = status.get("camera", {}).get("up_axis", 2)
-            approved = tuple(
-                ApprovedMeshObject(
-                    object_id=obj["id"],
-                    label=obj["label"],
-                    image_path=Path(obj["best_view"]),
-                    position_3d=tuple(float(value) for value in obj["position_3d"]),
-                    up_axis=int(up_axis),
-                    width_m=float(width_m),
-                    height_m=float(height_m),
-                    seed=int(seed),
-                )
-                for obj in selected
-            )
-            app_config = load_config()
-            trellis_config = app_config.trellis
-            gateway = None
-            if register_in_revit:
-                revit = app_config.revit_mcp
-                gateway = StdioMCPGateway(
-                    command=revit.command,
-                    args=tuple(revit.args),
-                    cwd=str(ROOT),
-                    timeout_seconds=float(revit.timeout),
-                )
-            output_root = Path(
-                explorer_state.get(
-                    "output_dir",
-                    ROOT / "output" / "_trellis_meshes",
-                )
-            ) / "meshes"
-            workflow = TrellisRevitWorkflow(
-                TrellisWorkflowConfig(
-                    objects=approved,
-                    output_dir=output_root,
-                    register_in_revit=bool(register_in_revit),
-                ),
-                client_factory=lambda: TrellisClient(
-                    host=trellis_config.host,
-                    port=trellis_config.port,
-                    timeout=trellis_config.timeout,
-                ),
-                gateway=gateway,
-            )
-            lines: list[str] = []
-            latest: dict = {}
-            async for update in stream_workflow_gradio(workflow):
-                lines.append(update.message)
-                latest = update.payload or latest
-                yield "\n\n".join(lines[-30:]), latest
-
-        bmesh_generate_selected_btn.click(
-            fn=_run_approved_meshes,
-            inputs=[
-                explore_select,
-                explorer_results_state,
-                bmesh_width,
-                bmesh_height,
-                bmesh_seed,
-                bmesh_register_revit,
-            ],
-            outputs=[bmesh_workflow_status, bmesh_workflow_output],
-        )
-
-        # --- B类 Mesh: 手动选取 Tab ---
-
-        def _on_bmesh_capture(scene_name: str, viewer_session: dict):
-            """Capture a camera from the manager-assigned viewer and render it."""
-            if not scene_name:
-                return None, "❌ 请先选择场景"
-            status, cam_data = fetch_camera_state(viewer_session)
-            if not cam_data:
-                return None, status
-
-            scene = _get_scene(scene_name)
-            if scene is None:
-                return None, f"❌ 无法加载场景 {scene_name}"
-
-            cam = cam_data
-            eye = cam.get("position", [0, 0, 0])
-            target = cam.get("look_at", [0, 0, 1])
-            fov = cam.get("fov_degrees", 60)
-            up = cam.get("up", [0, 0, 1])
+            up_axis = cam_data.get("up_axis", 2)
 
             from bim_recon.gs_scene import look_at_pose
             pose = look_at_pose(
@@ -856,19 +576,28 @@ def build_app() -> gr.Blocks:
             render_result = scene.render(pose, width=2048, height=1536, fov_degrees=fov)
             render_arr = (render_result.colors * 255).clip(0, 255).astype(np.uint8)
 
-            return render_arr, f"✅ 渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
+            render_state = {
+                "rgb": render_arr,
+                "depth": render_result.depth,
+                "cam": {"eye": eye, "target": target, "fov": fov, "up": up, "up_axis": up_axis},
+                "scene": scene_name,
+                "width": 2048,
+                "height": 1536,
+            }
+            return render_arr, render_state, f"✅ 渲染完成 ({render_arr.shape[1]}×{render_arr.shape[0]})"
 
         bmesh_cam_btn.click(
             fn=_on_bmesh_capture,
             inputs=[scene_state, viewer_state],
-            outputs=[bmesh_mask_editor, bmesh_cam_status],
+            outputs=[bmesh_mask_editor, bmesh_render_state, bmesh_cam_status],
         )
 
-        def _on_bmesh_identify(mask_editor_val, scene_name: str):
+        def _on_bmesh_identify(mask_editor_val, render_state):
             """Brush-bbox → VLM classify → Falcon segment → clean RGBA cutout."""
             from bim_recon.bmesh_extractor import classify_and_segment_from_mask_editor
             from bim_recon.vlm_verifier import query_vlm
 
+            scene_name = (render_state or {}).get("scene", "default")
             cfg = load_config()
             falcon = _get_falcon()
 
@@ -879,7 +608,7 @@ def build_app() -> gr.Blocks:
                     timeout=30,
                 )
 
-            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
+            out_dir = ROOT / "output" / scene_name / "_trellis_meshes"
             out_dir.mkdir(parents=True, exist_ok=True)
             debug_dir = out_dir / f"debug_{int(time.time())}"
             result = classify_and_segment_from_mask_editor(
@@ -888,29 +617,95 @@ def build_app() -> gr.Blocks:
 
             cutout_path = None
             cutout_preview = None
+            detection_info = None
             if result.cutout is not None:
                 cutout_path = str(debug_dir / "04_cutout.png")
                 cutout_preview = np.array(result.cutout)
+                # Extract Falcon detection metadata for placement
+                from bim_recon.bmesh_extractor import _extract_user_bbox, _select_detection
+                extracted = _extract_user_bbox(mask_editor_val)
+                if extracted:
+                    base_rgb, user_bbox = extracted
+                    h_img, w_img = base_rgb.shape[:2]
+                    if falcon is not None:
+                        from PIL import Image as PILImg
+                        try:
+                            detections = falcon.segment(
+                                PILImg.fromarray(base_rgb), result.label, task="segmentation",
+                            )
+                            selected = _select_detection(detections, user_bbox, w_img, h_img)
+                            if selected:
+                                detection_info = {
+                                    "norm_bbox": selected.mask_bbox or selected.bbox,
+                                    "mask_area_ratio": selected.mask_area_ratio,
+                                }
+                        except Exception:
+                            pass
 
             return (
                 result.label,
                 result.overlay,
                 cutout_preview,
                 cutout_path,
+                detection_info,
                 result.detail,
             )
 
         bmesh_identify_btn.click(
             fn=_on_bmesh_identify,
-            inputs=[bmesh_mask_editor, scene_state],
+            inputs=[bmesh_mask_editor, bmesh_render_state],
             outputs=[
                 bmesh_identified_label, bmesh_segmentation_preview,
-                bmesh_manual_preview, bmesh_cutout_state, bmesh_cam_status,
+                bmesh_manual_preview, bmesh_cutout_state,
+                bmesh_detection_state, bmesh_cam_status,
             ],
         )
 
-        def _on_bmesh_generate(cutout_path: str | None, label: str, scene_name: str, seed: int):
-            """Send the Falcon-segmented cutout to TRELLIS for mesh generation."""
+        def _unproject_pixel_to_world(cam, depth_map, px, py, img_w, img_h):
+            """Unproject a pixel + depth to 3DGS world coordinates.
+
+            Uses the camera look-at convention: forward toward target, up
+            roughly aligned with world up.  Returns (x, y, z) in meters.
+            """
+            eye = np.array(cam["eye"], dtype=np.float64)
+            target = np.array(cam["target"], dtype=np.float64)
+            up_world = np.array(cam.get("up", [0, 0, 1]), dtype=np.float64)
+            vfov_rad = math.radians(cam.get("fov", 60.0))
+
+            iy = max(0, min(img_h - 1, int(py)))
+            ix = max(0, min(img_w - 1, int(px)))
+            d = float(depth_map[iy, ix])
+            if d <= 0.1:
+                # Fallback: median of non-zero depths near the pixel
+                y0 = max(0, iy - 20)
+                y1 = min(img_h, iy + 20)
+                x0 = max(0, ix - 20)
+                x1 = min(img_w, ix + 20)
+                patch = depth_map[y0:y1, x0:x1]
+                valid = patch[patch > 0.1]
+                if len(valid) == 0:
+                    return None
+                d = float(np.median(valid))
+
+            focal_y = 0.5 * img_h / math.tan(vfov_rad / 2.0)
+            focal_x = focal_y  # square pixels
+
+            x_cam = (px - img_w / 2.0) / focal_x * d
+            y_cam = (py - img_h / 2.0) / focal_y * d
+            z_cam = d
+
+            forward = target - eye
+            forward /= np.linalg.norm(forward) + 1e-12
+            right = np.cross(forward, up_world)
+            right /= np.linalg.norm(right) + 1e-12
+            down = np.cross(forward, right)
+
+            world = eye + right * x_cam + down * y_cam + forward * z_cam
+            return world, d
+
+        def _on_bmesh_generate(cutout_path, label, render_state, detection_info,
+                               results, seed):
+            """TRELLIS mesh → world placement → Revit DirectShape."""
             if not cutout_path:
                 return None, {"错误": "请先点击「🔍 VLM识别 + Falcon分割」生成抠图"}
             from PIL import Image as PILImage
@@ -921,30 +716,135 @@ def build_app() -> gr.Blocks:
             if not trellis.health():
                 return preview, {"错误": "TRELLIS 服务不可达"}
 
-            out_dir = ROOT / "output" / (scene_name or "default") / "_trellis_meshes"
+            scene_name = (render_state or {}).get("scene", "default")
+            out_dir = ROOT / "output" / scene_name / "_trellis_meshes"
             out_dir.mkdir(parents=True, exist_ok=True)
             name = f"{label or 'object'}_{int(time.time())}"
             clean_path = out_dir / f"{name}_clean.png"
             PILImage.open(cutout_path).save(str(clean_path))
 
             try:
-                result = trellis.generate_mesh(TrellisMeshRequest(
+                mesh_result = trellis.generate_mesh(TrellisMeshRequest(
                     image_path=clean_path,
                     output_dir=out_dir,
                     name=name,
                     seed=int(seed),
                 ))
-                return preview, {
-                    "状态": "✅ Mesh 生成成功",
-                    "GLB": str(result.glb_path),
-                    "PLY": str(result.gaussian_path) if result.gaussian_path else None,
-                }
             except Exception as e:
                 return preview, {"错误": f"TRELLIS 生成失败: {e}"}
 
+            output = {
+                "状态": "✅ Mesh 生成成功",
+                "GLB": str(mesh_result.glb_path),
+                "PLY": str(mesh_result.gaussian_path) if mesh_result.gaussian_path else None,
+            }
+
+            # --- Compute world placement from depth + Falcon bbox ---
+            cam = (render_state or {}).get("cam")
+            depth_map = (render_state or {}).get("depth")
+            img_w = (render_state or {}).get("width", 2048)
+            img_h = (render_state or {}).get("height", 1536)
+
+            placement_info = {}
+            if cam and depth_map is not None and detection_info:
+                norm_bbox = detection_info.get("norm_bbox") or {}
+                cx_norm = norm_bbox.get("x", 0.5)
+                cy_norm = norm_bbox.get("y", 0.5)
+                w_norm = norm_bbox.get("w", 0.2)
+                h_norm = norm_bbox.get("h", 0.2)
+
+                px_center = cx_norm * img_w
+                py_center = cy_norm * img_h
+                result_unproj = _unproject_pixel_to_world(
+                    cam, depth_map, px_center, py_center, img_w, img_h,
+                )
+                if result_unproj is not None:
+                    world_pos, depth_val = result_unproj
+                    up_axis = cam.get("up_axis", 2)
+                    h_axes = [i for i in range(3) if i != up_axis]
+                    world_x = float(world_pos[h_axes[0]])
+                    world_y = float(world_pos[h_axes[1]])
+                    world_z = float(world_pos[up_axis])
+
+                    # Estimate physical dimensions from bbox + depth + FOV
+                    vfov_rad = math.radians(cam.get("fov", 60.0))
+                    aspect = img_w / img_h
+                    hfov_rad = 2.0 * math.atan(math.tan(vfov_rad / 2.0) * aspect)
+                    element_width_m = float(w_norm * 2.0 * depth_val * math.tan(hfov_rad / 2.0))
+                    element_height_m = float(h_norm * 2.0 * depth_val * math.tan(vfov_rad / 2.0))
+
+                    # Floor/ceiling from pipeline results or defaults
+                    coords = (results.coords if results else {}) or {}
+                    floor_z = float(coords.get("floor_z", 0.0))
+                    ceiling_z = float(coords.get("ceiling_z", 3.0))
+
+                    placement_info = {
+                        "world_x": round(world_x, 3),
+                        "world_y": round(world_y, 3),
+                        "world_z": round(world_z, 3),
+                        "element_width_m": round(element_width_m, 3),
+                        "element_height_m": round(element_height_m, 3),
+                        "depth": round(depth_val, 3),
+                    }
+
+                    # --- Register mesh in Revit ---
+                    from bim_recon.mesh_registrar import (
+                        MeshPlacement, compute_placement_transform,
+                        register_mesh_in_revit,
+                    )
+                    from bim_recon.revit_runner import RevitScriptRunner
+                    placement = MeshPlacement(
+                        glb_path=Path(mesh_result.glb_path),
+                        world_x=world_x,
+                        world_y=world_y,
+                        floor_z=floor_z,
+                        ceiling_z=ceiling_z,
+                        element_width_m=max(element_width_m, 0.1),
+                        element_height_m=max(element_height_m, 0.1),
+                        up_axis=up_axis,
+                        category="OST_GenericModel",
+                        name=label or name,
+                    )
+                    try:
+                        transform = compute_placement_transform(placement)
+                        revit_cfg = cfg.revit_mcp
+                        runner = RevitScriptRunner(mcp_sender=None)
+                        revit_result = register_mesh_in_revit(
+                            placement, transform, runner=runner,
+                        )
+                        placement_info["revit"] = revit_result
+                        if revit_result.get("status") == "formatted":
+                            # Actually dispatch to Revit MCP
+                            from bim_recon.mcp_gateway import StdioMCPGateway
+                            gateway = StdioMCPGateway(
+                                command=revit_cfg.command,
+                                args=tuple(revit_cfg.args),
+                                cwd=str(ROOT),
+                                timeout_seconds=float(revit_cfg.timeout),
+                            )
+                            import asyncio as _aio
+                            resp = _aio.run(gateway.call_tool(
+                                "send_code_to_revit",
+                                {
+                                    "code": runner.load_code("create_directshape_from_mesh"),
+                                    "parameters": [revit_result["payload_json"]],
+                                },
+                            ))
+                            placement_info["revit_response"] = resp
+                            output["Revit"] = "✅ DirectShape 已创建"
+                    except Exception as exc:
+                        output["Revit 错误"] = str(exc)
+
+            output["placement"] = placement_info
+            return preview, output
+
         bmesh_gen_manual_btn.click(
             fn=_on_bmesh_generate,
-            inputs=[bmesh_cutout_state, bmesh_identified_label, scene_state, bmesh_seed_manual],
+            inputs=[
+                bmesh_cutout_state, bmesh_identified_label,
+                bmesh_render_state, bmesh_detection_state,
+                results_state, bmesh_seed_manual,
+            ],
             outputs=[bmesh_manual_preview, bmesh_manual_output],
         )
 
