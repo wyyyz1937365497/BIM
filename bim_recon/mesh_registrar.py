@@ -100,6 +100,19 @@ class MeshTransform:
         translation: 3D offset in meters (3DGS world space).
         vertices_world: (N, 3) transformed vertices in meters.
         faces: (M, 3) triangle index array.
+        mesh_extents: Per-axis extent of the raw TRELLIS-space mesh bounding
+            box, as (x, y, z). Useful for telling which mesh axis is the
+            "long" one before any rotation is applied.
+        mesh_center: Centroid of the TRELLIS-space bounding box (x, y, z).
+        principal_axis_mesh: Unit vector along the mesh's longest extent in
+            TRELLIS space (PCA on centered vertices). For a long sofa this
+            points down the long axis; for a symmetric cube it is arbitrary.
+        principal_axis_world: The same direction after applying ``rotation``,
+            in 3DGS world space. Compare against the scene's known long-axis
+            direction to diagnose yaw errors.
+        principal_axis_angle_deg: Horizontal-plane angle (degrees, CCW from
+            the world's first horizontal axis) of ``principal_axis_world``.
+            The single most diagnostic number for rotation issues.
     """
 
     scale: float
@@ -107,6 +120,11 @@ class MeshTransform:
     translation: np.ndarray  # (3,)
     vertices_world: np.ndarray  # (N, 3) in meters
     faces: np.ndarray  # (M, 3) int32
+    mesh_extents: tuple[float, float, float]
+    mesh_center: tuple[float, float, float]
+    principal_axis_mesh: tuple[float, float, float]
+    principal_axis_world: tuple[float, float, float]
+    principal_axis_angle_deg: float
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +393,9 @@ def compute_placement_transform(placement: MeshPlacement) -> MeshTransform:
       5. Rotation: axis-remap (TRELLIS Y-up → 3DGS up_axis), then yaw around
          the world up axis by ``placement.yaw_degrees`` (positive = clockwise
          from above) to correct the image-space → scene facing offset.
+      6. Diagnostics: PCA on centered vertices yields the mesh's principal
+         axis (longest extent); we report it in both mesh and world space so
+         rotation mismatches can be traced post-hoc.
     """
     vertices, faces = parse_glb_vertices_faces(placement.glb_path)
 
@@ -428,12 +449,28 @@ def compute_placement_transform(placement: MeshPlacement) -> MeshTransform:
 
     vertices_world = scaled + translation
 
+    # Diagnostics: principal axis via PCA. For a long object this is the long
+    # axis; for a symmetric object it is arbitrary. We track it in both mesh
+    # and world space so rotation bugs (e.g. the long axis ending up 45° off
+    # from the scene's real long axis) can be diagnosed from logged data.
+    principal_mesh = _principal_axis(centered)
+    principal_world = rotation @ principal_mesh
+    norm_pw = float(np.linalg.norm(principal_world))
+    if norm_pw > 1e-9:
+        principal_world = principal_world / norm_pw
+    principal_angle = _horizontal_angle_deg(principal_world, placement.up_axis)
+
     return MeshTransform(
         scale=scale,
         rotation=rotation,
         translation=translation,
         vertices_world=vertices_world.astype(np.float32),
         faces=faces,
+        mesh_extents=(float(mesh_extents[0]), float(mesh_extents[1]), float(mesh_extents[2])),
+        mesh_center=(float(mesh_center[0]), float(mesh_center[1]), float(mesh_center[2])),
+        principal_axis_mesh=(float(principal_mesh[0]), float(principal_mesh[1]), float(principal_mesh[2])),
+        principal_axis_world=(float(principal_world[0]), float(principal_world[1]), float(principal_world[2])),
+        principal_axis_angle_deg=float(principal_angle),
     )
 
 
@@ -516,6 +553,100 @@ def _build_yaw_rotation(up_axis: int, yaw_degrees: float) -> np.ndarray:
         ], dtype=np.float32)
     else:
         raise ValueError(f"Invalid up_axis: {up_axis}")
+
+
+# ---------------------------------------------------------------------------
+# Placement diagnostics (mesh PCA + transform summary for logging)
+# ---------------------------------------------------------------------------
+
+def _principal_axis(vertices_centered: np.ndarray) -> np.ndarray:
+    """Return the unit vector along the mesh's longest extent (PCA).
+
+    Computes the 3D covariance of ``vertices_centered`` and returns the
+    eigenvector with the largest eigenvalue. Sign is arbitrary (PCA axes
+    are oriented up to ±1); callers only care about the line direction.
+
+    For <2 vertices or a degenerate (zero covariance) cloud, falls back to
+    +X so downstream math remains well-defined.
+    """
+    if vertices_centered.shape[0] < 2:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    cov = np.cov(vertices_centered, rowvar=False)
+    if cov.shape != (3, 3) or not np.any(np.abs(cov) > 1e-12):
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    try:
+        _, eigvecs = np.linalg.eigh(cov)  # ascending eigenvalues
+    except np.linalg.LinAlgError:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    principal = eigvecs[:, -1]
+    norm = float(np.linalg.norm(principal))
+    if norm < 1e-9:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return (principal / norm).astype(np.float32)
+
+
+def _horizontal_angle_deg(axis_world: np.ndarray, up_axis: int) -> float:
+    """Angle of ``axis_world`` in the horizontal plane, in degrees.
+
+    Returns ``atan2(second_h, first_h)`` where ``first_h``/``second_h`` are
+    the two non-up components, in degrees, in the range (-180, 180]. This is
+    the compass-like direction the axis points in the floor plan.
+    """
+    h_axes = [i for i in range(3) if i != up_axis]
+    x = float(axis_world[h_axes[0]])
+    y = float(axis_world[h_axes[1]])
+    return float(np.degrees(np.arctan2(y, x)))
+
+
+def serialize_placement_diagnostics(
+    placement: MeshPlacement,
+    transform: MeshTransform,
+) -> dict[str, Any]:
+    """Build a JSON-safe diagnostic dict describing one placement.
+
+    Captures every value that influences the final Revit DirectShape pose:
+    the raw placement inputs, the mesh's TRELLIS-space extents and principal
+    axis, and the resulting world-space transform including the world-space
+    principal axis. Designed to be merged into workflow manifests or Gradio
+    output JSON for post-hoc debugging of rotation/position issues.
+    """
+    return {
+        "placement_input": {
+            "world_x": placement.world_x,
+            "world_y": placement.world_y,
+            "floor_z": placement.floor_z,
+            "ceiling_z": placement.ceiling_z,
+            "element_width_m": placement.element_width_m,
+            "element_height_m": placement.element_height_m,
+            "up_axis": placement.up_axis,
+            "yaw_degrees": placement.yaw_degrees,
+            "name": placement.name,
+            "category": placement.category,
+        },
+        "mesh_analysis_trellis_space": {
+            "extents_x_y_z": list(transform.mesh_extents),
+            "centroid_x_y_z": list(transform.mesh_center),
+            "principal_axis_x_y_z": list(transform.principal_axis_mesh),
+            "note": "extents/axis in TRELLIS convention (Y is up)",
+        },
+        "transform_output": {
+            "scale": float(transform.scale),
+            "rotation_matrix_row_major": [
+                float(v) for row in transform.rotation for v in row
+            ],
+            "translation_x_y_z": [float(v) for v in transform.translation],
+            "principal_axis_world_x_y_z": list(transform.principal_axis_world),
+            "principal_axis_world_horizontal_angle_deg": (
+                transform.principal_axis_angle_deg
+            ),
+            "note": (
+                "principal_axis_world_horizontal_angle_deg is the floor-plan "
+                "direction of the mesh's longest extent after transform; "
+                "compare to the scene's actual long-axis direction to find "
+                "yaw corrections."
+            ),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

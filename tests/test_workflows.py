@@ -642,6 +642,10 @@ def test_trellis_workflow_requires_approval_and_registers_selected_mesh(
             "payload_path": str(tmp_path / "payload.json"),
         },
     )
+    monkeypatch.setattr(
+        "bim_recon.trellis_workflow.serialize_placement_diagnostics",
+        lambda _placement, _transform: {"diagnostics": "mocked"},
+    )
     workflow = TrellisRevitWorkflow(
         TrellisWorkflowConfig(
             objects=(ApprovedMeshObject(

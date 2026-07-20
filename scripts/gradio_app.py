@@ -943,6 +943,7 @@ def build_app() -> gr.Blocks:
                     from bim_recon.mesh_registrar import (
                         MeshPlacement, compute_placement_transform,
                         register_mesh_in_revit,
+                        serialize_placement_diagnostics,
                     )
                     placement = MeshPlacement(
                         glb_path=Path(mesh_result.glb_path),
@@ -961,6 +962,7 @@ def build_app() -> gr.Blocks:
                         from bim_recon.mcp_gateway import StdioMCPGateway
                         revit_cfg = cfg.revit_mcp
                         revit_result = register_mesh_in_revit(placement, transform)
+                        placement_info["diagnostics"] = serialize_placement_diagnostics(placement, transform)
                         placement_info["revit"] = revit_result
                         if revit_result.get("status") == "formatted":
                             # Call the compiled create_directshape_from_mesh MCP tool

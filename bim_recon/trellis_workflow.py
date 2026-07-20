@@ -15,6 +15,7 @@ from bim_recon.mesh_registrar import (
     MeshPlacement,
     compute_placement_transform,
     register_mesh_in_revit,
+    serialize_placement_diagnostics,
 )
 from bim_recon.trellis_client import (
     TrellisClient,
@@ -256,6 +257,7 @@ class TrellisRevitWorkflow(Workflow):
         )
         transform = await asyncio.to_thread(compute_placement_transform, placement)
         formatted = register_mesh_in_revit(placement, transform)
+        diagnostics = serialize_placement_diagnostics(placement, transform)
         base = {
             "object_id": obj.object_id,
             "label": obj.label,
@@ -265,6 +267,7 @@ class TrellisRevitWorkflow(Workflow):
             "preview_path": str(mesh.preview_path) if mesh.preview_path else None,
             "vertex_count": formatted["vertex_count"],
             "face_count": formatted["face_count"],
+            "diagnostics": diagnostics,
         }
         if not self.config.register_in_revit:
             return base

@@ -21,10 +21,13 @@ from bim_recon.mesh_registrar import (
     MeshTransform,
     _build_axis_remap_rotation,
     _build_yaw_rotation,
+    _horizontal_angle_deg,
+    _principal_axis,
     compute_placement_transform,
     extract_object_from_render,
     parse_glb_vertices_faces,
     register_mesh_in_revit,
+    serialize_placement_diagnostics,
 )
 
 
@@ -329,6 +332,144 @@ class TestComputePlacementTransform:
         # (the up axis). R @ mesh_up == world_up.
         result = transform.rotation @ np.array([0, 1, 0])
         np.testing.assert_allclose(result, [0, 0, 1], atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Placement diagnostics (PCA + serializer)
+# ---------------------------------------------------------------------------
+
+class TestPrincipalAxis:
+    def test_long_x_returns_unit_x(self):
+        """Vertices spread along mesh X → principal axis ≈ ±X."""
+        verts = np.zeros((100, 3), dtype=np.float32)
+        verts[:, 0] = np.linspace(-1, 1, 100)
+        verts[:, 1] = np.random.uniform(-0.01, 0.01, 100)
+        verts[:, 2] = np.random.uniform(-0.01, 0.01, 100)
+        result = _principal_axis(verts - verts.mean(axis=0))
+        # Sign is arbitrary; the axis line should be X
+        assert abs(result[0]) > 0.99
+        assert abs(result[1]) < 0.05
+        assert abs(result[2]) < 0.05
+        np.testing.assert_allclose(np.linalg.norm(result), 1.0, atol=1e-6)
+
+    def test_diagonal_returns_diagonal(self):
+        """Vertices along the X-Z diagonal → principal axis is diagonal."""
+        verts = np.zeros((100, 3), dtype=np.float32)
+        t = np.linspace(-1, 1, 100)
+        verts[:, 0] = t
+        verts[:, 2] = t
+        result = _principal_axis(verts - verts.mean(axis=0))
+        # Either +diagonal or -diagonal; both should have |x| ≈ |z|
+        assert abs(abs(result[0]) - abs(result[2])) < 0.05
+        assert abs(result[1]) < 0.05
+
+    def test_single_vertex_falls_back_to_x(self):
+        result = _principal_axis(np.zeros((1, 3), dtype=np.float32))
+        np.testing.assert_allclose(result, [1.0, 0.0, 0.0], atol=1e-6)
+
+    def test_zero_covariance_falls_back_to_x(self):
+        # All identical points → zero covariance
+        verts = np.ones((10, 3), dtype=np.float32)
+        result = _principal_axis(verts - verts.mean(axis=0))
+        np.testing.assert_allclose(result, [1.0, 0.0, 0.0], atol=1e-6)
+
+
+class TestHorizontalAngleDeg:
+    def test_east_is_zero(self):
+        assert _horizontal_angle_deg(np.array([1, 0, 0]), up_axis=2) == pytest.approx(0.0)
+
+    def test_north_is_90(self):
+        assert _horizontal_angle_deg(np.array([0, 1, 0]), up_axis=2) == pytest.approx(90.0)
+
+    def test_south_is_minus_90(self):
+        assert _horizontal_angle_deg(np.array([0, -1, 0]), up_axis=2) == pytest.approx(-90.0)
+
+    def test_yup_uses_xz_plane(self):
+        """Y-up: horizontal plane is X-Z; +Z is the 'north' direction."""
+        assert _horizontal_angle_deg(np.array([0, 0, 1]), up_axis=1) == pytest.approx(90.0)
+
+
+class TestPlacementDiagnostics:
+    def test_transform_carries_diagnostic_fields(self, tmp_path):
+        """MeshTransform carries the new diagnostic fields."""
+        glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+        )
+        transform = compute_placement_transform(placement)
+
+        # All new fields populated
+        assert len(transform.mesh_extents) == 3
+        assert len(transform.mesh_center) == 3
+        assert len(transform.principal_axis_mesh) == 3
+        assert len(transform.principal_axis_world) == 3
+        assert isinstance(transform.principal_axis_angle_deg, float)
+        # Principal axes are unit vectors
+        np.testing.assert_allclose(
+            np.linalg.norm(transform.principal_axis_mesh), 1.0, atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.linalg.norm(transform.principal_axis_world), 1.0, atol=1e-5,
+        )
+
+    def test_serializer_returns_json_safe_dict(self, tmp_path):
+        """serialize_placement_diagnostics returns a dict with JSON-safe leaves."""
+        import json as _json
+        glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=1.5, world_y=-0.5,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=0.8, element_height_m=1.0,
+            up_axis=2,
+            yaw_degrees=90.0,
+            name="Test Sofa",
+        )
+        transform = compute_placement_transform(placement)
+
+        result = serialize_placement_diagnostics(placement, transform)
+
+        # Must be JSON-serializable (no numpy arrays)
+        _json.dumps(result)  # raises if not serializable
+
+        # Placement inputs echoed back
+        assert result["placement_input"]["world_x"] == 1.5
+        assert result["placement_input"]["world_y"] == -0.5
+        assert result["placement_input"]["yaw_degrees"] == 90.0
+        assert result["placement_input"]["up_axis"] == 2
+
+        # Mesh analysis populated
+        mesh_ext = result["mesh_analysis_trellis_space"]["extents_x_y_z"]
+        assert len(mesh_ext) == 3
+
+        # Transform output populated with row-major 3x3 rotation
+        rot = result["transform_output"]["rotation_matrix_row_major"]
+        assert len(rot) == 9  # 3x3 = 9 floats
+        assert isinstance(result["transform_output"]["scale"], float)
+        assert "principal_axis_world_horizontal_angle_deg" in result["transform_output"]
+
+    def test_default_yaw_cube_has_axis_aligned_principal(self, tmp_path):
+        """For a unit cube with default yaw, the world principal axis ends up
+        axis-aligned (not diagonal). This is the baseline for comparison when
+        debugging why a long object lands at 45°."""
+        glb_path = TestComputePlacementTransform()._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+            up_axis=2,
+        )
+        transform = compute_placement_transform(placement)
+
+        angle = transform.principal_axis_angle_deg
+        # For a cube with default yaw=90, angle should be a multiple of 90°
+        # (i.e., axis-aligned). Allow for any of {0, ±90, 180}.
+        remainder = abs(angle) % 90.0
+        assert remainder < 1.0 or remainder > 89.0
 
 
 # ---------------------------------------------------------------------------
