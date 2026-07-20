@@ -670,6 +670,7 @@ def find_best_yaw_silhouette(
     cutout_padding: float = 0.08,
     coarse_step: float = 10.0,
     fine_step: float = 1.0,
+    debug_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Find the yaw that best aligns the mesh with the original cutout image.
 
@@ -837,12 +838,100 @@ def find_best_yaw_silhouette(
     ]
     best_yaw, best_iou = max(fine_scores, key=lambda t: t[1])
 
+    if debug_dir is not None:
+        _save_yaw_debug_visualization(
+            debug_dir=debug_dir,
+            cutout_mask=cutout_mask,
+            silhouette_at_yaw=silhouette_at_yaw,
+            best_yaw=best_yaw,
+            coarse_scores=coarse_scores,
+            crop_w=crop_w, crop_h=crop_h,
+            crop_x0=crop_x0, crop_y0=crop_y0,
+            focal_x=focal_x, focal_y=focal_y,
+            center_x=center_x, center_y=center_y,
+            camera_img_w=camera_img_w, camera_img_h=camera_img_h,
+            norm_bbox=norm_bbox,
+        )
+
     return {
         "best_yaw": float(best_yaw),
         "best_iou": float(best_iou),
         "coarse_scores": [{"yaw": y, "iou": i} for y, i in coarse_scores],
         "method": "silhouette_iou",
     }
+
+
+def _save_yaw_debug_visualization(
+    *,
+    debug_dir: Path,
+    cutout_mask: np.ndarray,
+    silhouette_at_yaw,
+    best_yaw: float,
+    coarse_scores: list,
+    crop_w: int, crop_h: int,
+    crop_x0: float, crop_y0: float,
+    focal_x: float, focal_y: float,
+    center_x: float, center_y: float,
+    camera_img_w: int, camera_img_h: int,
+    norm_bbox: dict,
+) -> None:
+    """Save debug images for silhouette-based yaw matching.
+
+    Writes to ``debug_dir``:
+      ``cutout_mask.png``      — the Falcon alpha mask (binary, in crop frame)
+      ``projected_best.png``   — projected mesh silhouette at the best yaw
+      ``overlay_best.png``     — 3-color overlay: green=both, red=cutout only, blue=projected only
+      ``projection_geometry.json`` — crop/focal/bbox numbers for sanity-checking
+    """
+    from PIL import Image as _PIL
+    debug_dir = Path(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Cutout mask (grayscale PNG)
+    _PIL.fromarray((cutout_mask.astype(np.uint8)) * 255, mode="L").save(debug_dir / "cutout_mask.png")
+
+    # 2. Projected silhouette at the best yaw
+    best_sil = silhouette_at_yaw(best_yaw)
+    _PIL.fromarray((best_sil.astype(np.uint8)) * 255, mode="L").save(debug_dir / "projected_best.png")
+
+    # 3. Overlay: 3-color (RGB)
+    h, w = cutout_mask.shape
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    both = cutout_mask & best_sil
+    cutout_only = cutout_mask & ~best_sil
+    proj_only = ~cutout_mask & best_sil
+    overlay[both] = [0, 255, 0]        # green = overlap
+    overlay[cutout_only] = [255, 0, 0]  # red = cutout but not projected
+    overlay[proj_only] = [0, 0, 255]    # blue = projected but not cutout
+    _PIL.fromarray(overlay, mode="RGB").save(debug_dir / "overlay_best.png")
+
+    # 4. Projection geometry for sanity-checking
+    import json as _json
+    geom = {
+        "camera_img_w": camera_img_w,
+        "camera_img_h": camera_img_h,
+        "focal_x": focal_x,
+        "focal_y": focal_y,
+        "center_x": center_x,
+        "center_y": center_y,
+        "norm_bbox": norm_bbox,
+        "crop": {
+            "x0": crop_x0, "y0": crop_y0,
+            "w": crop_w, "h": crop_h,
+        },
+        "cutout_mask": {
+            "shape": [int(cutout_mask.shape[0]), int(cutout_mask.shape[1])],
+            "filled_pixels": int(cutout_mask.sum()),
+        },
+        "best_projected_silhouette": {
+            "filled_pixels": int(best_sil.sum()),
+        },
+        "best_yaw": best_yaw,
+        "coarse_top5": sorted(coarse_scores, key=lambda t: -t[1])[:5],
+    }
+    (debug_dir / "projection_geometry.json").write_text(
+        _json.dumps(geom, indent=2), encoding="utf-8",
+    )
 
 
 

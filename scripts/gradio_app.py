@@ -986,6 +986,7 @@ def build_app() -> gr.Blocks:
                             world_pos=(world_x, world_y, world_z),
                             element_width_m=max(element_width_m, 0.1),
                             up_axis=up_axis,
+                            debug_dir=out_dir / f"{name}_yaw_debug",
                         )
                         if auto_yaw_result.get("best_iou", 0.0) >= 0.15:
                             resolved_yaw = float(auto_yaw_result["best_yaw"])
