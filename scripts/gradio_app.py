@@ -250,6 +250,12 @@ def build_app() -> gr.Blocks:
                 bmesh_seed_manual = gr.Number(
                     label="种子", value=1, precision=0,
                 )
+                bmesh_yaw_manual = gr.Number(
+                    label="偏航角 (°, 正=顺时针)",
+                    value=90.0,
+                    precision=1,
+                    info="绕世界竖直轴的 yaw。正值=从上往下看顺时针。默认 90°；贴墙长物体若方向偏 45° 可调到 45° 或 135°。",
+                )
                 bmesh_identify_btn = gr.Button(
                     "🔍 VLM识别 + Falcon分割", variant="secondary",
                 )
@@ -856,7 +862,7 @@ def build_app() -> gr.Blocks:
             return world, d
 
         def _on_bmesh_generate(cutout_path, label, render_state, detection_info,
-                               results, seed):
+                               results, seed, yaw_degrees):
             """TRELLIS mesh → world placement → Revit DirectShape."""
             if not cutout_path:
                 return None, {"错误": "请先点击「🔍 VLM识别 + Falcon分割」生成抠图"}
@@ -954,6 +960,7 @@ def build_app() -> gr.Blocks:
                         element_width_m=max(element_width_m, 0.1),
                         element_height_m=max(element_height_m, 0.1),
                         up_axis=up_axis,
+                        yaw_degrees=float(yaw_degrees) if yaw_degrees is not None else 90.0,
                         category="OST_GenericModel",
                         name=label or name,
                     )
@@ -989,7 +996,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 bmesh_cutout_state, bmesh_identified_label,
                 bmesh_render_state, bmesh_detection_state,
-                results_state, bmesh_seed_manual,
+                results_state, bmesh_seed_manual, bmesh_yaw_manual,
             ],
             outputs=[bmesh_manual_preview, bmesh_manual_output],
         )

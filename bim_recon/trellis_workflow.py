@@ -40,7 +40,16 @@ class _FinishMeshes(Event):
 
 @dataclass(frozen=True, slots=True)
 class ApprovedMeshObject:
-    """One user-approved explorer object and its physical placement size."""
+    """One user-approved explorer object and its physical placement size.
+
+    Attributes:
+        yaw_degrees: Per-object yaw around the world up axis in degrees,
+            positive = clockwise from above. Lets the user correct the
+            constant-offset assumption when an object is placed diagonally
+            in the scene (detection reports position only, not orientation).
+            Default 90.0 matches the wall-aligned convention; set to 45.0
+            for objects placed at 45° to the walls, etc.
+    """
 
     object_id: str
     label: str
@@ -50,6 +59,7 @@ class ApprovedMeshObject:
     width_m: float = 0.8
     height_m: float = 1.0
     seed: int = 1
+    yaw_degrees: float = 90.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +78,7 @@ def approved_object_from_extraction(
     extraction,
     *,
     seed: int = 1,
+    yaw_degrees: float = 90.0,
 ) -> ApprovedMeshObject:
     """Convert a :class:`~bim_recon.bmesh_pipeline.BClassExtraction` into an
     :class:`ApprovedMeshObject` ready for the TRELLIS workflow.
@@ -81,6 +92,7 @@ def approved_object_from_extraction(
         width_m=extraction.width_m,
         height_m=extraction.height_m,
         seed=seed,
+        yaw_degrees=yaw_degrees,
     )
 
 
@@ -252,6 +264,7 @@ class TrellisRevitWorkflow(Workflow):
             element_width_m=obj.width_m,
             element_height_m=obj.height_m,
             up_axis=obj.up_axis,
+            yaw_degrees=obj.yaw_degrees,
             category=self.config.category,
             name=f"{obj.label} {obj.object_id}",
         )
