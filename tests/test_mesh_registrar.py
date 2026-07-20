@@ -20,6 +20,7 @@ from bim_recon.mesh_registrar import (
     MeshPlacement,
     MeshTransform,
     _build_axis_remap_rotation,
+    _build_yaw_rotation,
     compute_placement_transform,
     extract_object_from_render,
     parse_glb_vertices_faces,
@@ -67,6 +68,54 @@ class TestAxisRemapRotation:
         for up_axis in [0, 1, 2]:
             R = _build_axis_remap_rotation(up_axis)
             assert abs(np.linalg.det(R) - 1.0) < 1e-6
+
+# ---------------------------------------------------------------------------
+# Yaw rotation
+# ---------------------------------------------------------------------------
+
+class TestYawRotation:
+    def test_zup_90_cw_sends_east_to_south(self):
+        """90° CW from above sends world +X (east) → -Y (south) for Z-up."""
+        R = _build_yaw_rotation(up_axis=2, yaw_degrees=90.0)
+        result = R @ np.array([1, 0, 0])
+        np.testing.assert_allclose(result, [0, -1, 0], atol=1e-6)
+
+    def test_zup_preserves_up_axis(self):
+        """Yaw around Z leaves the Z component untouched."""
+        R = _build_yaw_rotation(up_axis=2, yaw_degrees=90.0)
+        result = R @ np.array([0, 0, 1])
+        np.testing.assert_allclose(result, [0, 0, 1], atol=1e-6)
+
+    def test_yup_90_rotates_horizontal_plane(self):
+        """For Y-up, 90° yaw maps +X into the horizontal (XZ) plane.
+
+        ``_build_yaw_rotation`` applies ``-yaw_degrees`` around the right-hand
+        rule +up axis; for Y-up this sends +X to +Z at 90°. The exact
+        horizontal direction is a convention choice; we only assert that the
+        up component stays zero and the result lies in the X-Z plane.
+        """
+        R = _build_yaw_rotation(up_axis=1, yaw_degrees=90.0)
+        result = R @ np.array([1, 0, 0])
+        assert abs(result[1]) < 1e-6  # Y component unchanged (still 0)
+        # Magnitude preserved (pure rotation)
+        np.testing.assert_allclose(np.linalg.norm(result), 1.0, atol=1e-6)
+
+    def test_zero_yaw_is_identity(self):
+        for up_axis in [0, 1, 2]:
+            R = _build_yaw_rotation(up_axis, 0.0)
+            np.testing.assert_allclose(R, np.eye(3), atol=1e-6)
+
+    def test_is_proper_rotation(self):
+        """Yaw matrices are orthonormal with det=+1 for any axis/angle."""
+        for up_axis in [0, 1, 2]:
+            for deg in [0, 30, 90, 180, -90]:
+                R = _build_yaw_rotation(up_axis, deg)
+                np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-6)
+                assert abs(np.linalg.det(R) - 1.0) < 1e-6
+
+    def test_invalid_up_axis_raises(self):
+        with pytest.raises(ValueError):
+            _build_yaw_rotation(up_axis=5, yaw_degrees=90.0)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +281,54 @@ class TestComputePlacementTransform:
         # Scaled mesh height should not exceed room height
         mesh_height = transform.vertices_world[:, 2].max() - transform.vertices_world[:, 2].min()
         assert mesh_height <= 0.5 + 0.01  # tolerance for float
+
+    def test_default_yaw_composes_with_axis_remap(self, tmp_path):
+        """Default yaw_degrees=90 produces rotation = yaw(90) @ axis_remap."""
+        glb_path = self._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+            up_axis=2,
+        )
+        transform = compute_placement_transform(placement)
+
+        expected = _build_yaw_rotation(2, 90.0) @ _build_axis_remap_rotation(2)
+        np.testing.assert_allclose(transform.rotation, expected, atol=1e-6)
+
+    def test_zero_yaw_falls_back_to_axis_remap_only(self, tmp_path):
+        """yaw_degrees=0 reproduces the legacy axis-remap-only transform."""
+        glb_path = self._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+            up_axis=2,
+            yaw_degrees=0.0,
+        )
+        transform = compute_placement_transform(placement)
+
+        expected = _build_axis_remap_rotation(2)
+        np.testing.assert_allclose(transform.rotation, expected, atol=1e-6)
+
+    def test_default_yaw_preserves_world_up_from_mesh_up(self, tmp_path):
+        """Default yaw still maps TRELLIS Y-up to world Z-up (vertical kept)."""
+        glb_path = self._make_test_glb(tmp_path)
+        placement = MeshPlacement(
+            glb_path=glb_path,
+            world_x=0.0, world_y=0.0,
+            floor_z=0.0, ceiling_z=3.0,
+            element_width_m=1.0, element_height_m=1.0,
+            up_axis=2,
+        )
+        transform = compute_placement_transform(placement)
+
+        # Mesh Y-axis [0,1,0] (TRELLIS up) must map to world Z-axis [0,0,1]
+        # (the up axis). R @ mesh_up == world_up.
+        result = transform.rotation @ np.array([0, 1, 0])
+        np.testing.assert_allclose(result, [0, 0, 1], atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

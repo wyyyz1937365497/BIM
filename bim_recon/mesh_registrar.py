@@ -64,6 +64,12 @@ class MeshPlacement:
         element_width_m: Physical width of the object (meters), from detection.
         element_height_m: Physical height of the object (meters), from detection.
         up_axis: Which world axis is vertical (0=x, 1=y, 2=z).
+        yaw_degrees: Yaw around the world up axis, in degrees, with positive
+            values rotating the object **clockwise when viewed from above**
+            (looking down the up axis). Corrects the constant offset between
+            TRELLIS's image-space facing and the 3DGS scene convention; adjust
+            per-placement if a future scene needs a different correction.
+            Default 90.0.
         category: Revit built-in category for DirectShape.
         name: Human-readable name for the DirectShape element.
     """
@@ -76,6 +82,7 @@ class MeshPlacement:
     element_width_m: float
     element_height_m: float
     up_axis: int = 2
+    yaw_degrees: float = 90.0
     category: str = "OST_GenericModel"
     name: str = "B-class Mesh"
 
@@ -365,8 +372,9 @@ def compute_placement_transform(placement: MeshPlacement) -> MeshTransform:
          the detected element width (element_width_m)
       4. Translation: place the mesh centroid at (world_x, world_y, floor_z)
          on the up_axis
-      5. Rotation: identity (TRELLIS front faces +Z by convention;
-         camera alignment is handled by the rendering step)
+      5. Rotation: axis-remap (TRELLIS Y-up → 3DGS up_axis), then yaw around
+         the world up axis by ``placement.yaw_degrees`` (positive = clockwise
+         from above) to correct the image-space → scene facing offset.
     """
     vertices, faces = parse_glb_vertices_faces(placement.glb_path)
 
@@ -397,14 +405,12 @@ def compute_placement_transform(placement: MeshPlacement) -> MeshTransform:
     if room_height > 0 and scaled_height > room_height:
         scale = scale * (room_height / scaled_height)
 
-    # Build rotation matrix: remap TRELLIS (X-right, Y-up, Z-forward) to 3DGS
-    # For 3DGS up_axis=2 (Z-up): mesh X→world X, mesh Y→world Z, mesh Z→world Y(neg)
-    # For 3DGS up_axis=1 (Y-up): mesh X→world X, mesh Y→world Y, mesh Z→world Z(neg)
-    # For 3DGS up_axis=0 (X-up): mesh X→world Y, mesh Y→world X, mesh Z→world Z(neg)
-    #
-    # We use a simple axis-swap rotation (no arbitrary rotation needed since
-    # the camera-facing direction was handled by the VLM image capture).
-    rotation = _build_axis_remap_rotation(placement.up_axis)
+    # Build rotation matrix: axis remap first (TRELLIS Y-up → 3DGS up_axis),
+    # then yaw around the world up axis to correct the constant image-space
+    # facing offset (positive yaw_degrees = clockwise from above).
+    axis_remap = _build_axis_remap_rotation(placement.up_axis)
+    yaw = _build_yaw_rotation(placement.up_axis, placement.yaw_degrees)
+    rotation = yaw @ axis_remap
 
     # Center the mesh at origin in TRELLIS space, then apply rotation + scale
     centered = vertices - mesh_center
@@ -470,6 +476,43 @@ def _build_axis_remap_rotation(up_axis: int) -> np.ndarray:
             [0, 1, 0],
             [0, 0, 1],
             [1, 0, 0],
+        ], dtype=np.float32)
+    else:
+        raise ValueError(f"Invalid up_axis: {up_axis}")
+
+
+def _build_yaw_rotation(up_axis: int, yaw_degrees: float) -> np.ndarray:
+    """Build a yaw rotation matrix around the world up axis.
+
+    Positive ``yaw_degrees`` rotates the object **clockwise when viewed from
+    above** (i.e. looking down the world up axis toward the scene). This is
+    the intuitive top-down-map convention: 90° sends +X (east) → -Y (south)
+    for Z-up scenes.
+
+    Internally that maps to a negative angle around the right-hand-rule
+    +up axis, since positive RH rotation appears counter-clockwise from
+    above.
+    """
+    angle = -np.radians(yaw_degrees)
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    if up_axis == 2:  # Z-up: rotate around Z
+        return np.array([
+            [c, -s, 0],
+            [s,  c, 0],
+            [0,  0, 1],
+        ], dtype=np.float32)
+    elif up_axis == 1:  # Y-up: rotate around Y
+        return np.array([
+            [ c, 0, s],
+            [ 0, 1, 0],
+            [-s, 0, c],
+        ], dtype=np.float32)
+    elif up_axis == 0:  # X-up: rotate around X
+        return np.array([
+            [1,  0,  0],
+            [0,  c, -s],
+            [0,  s,  c],
         ], dtype=np.float32)
     else:
         raise ValueError(f"Invalid up_axis: {up_axis}")
