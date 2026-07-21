@@ -340,6 +340,27 @@ TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点�
 
   命令输出 GLB 和 PLY 的路径。若要导入，请走上面的 Gradio 工作流或调用 `create_directshape_from_mesh`，不要使用 `send_code_to_revit` 动态脚本。
 
+### 5. 独立 TRELLIS Registration Lab
+
+主 Gradio 页面包含完整的 3DGS→BIM→Revit 工作流,不适合作为 B 类数据制作工作台。针对 TRELLIS GLB 生成和 PoseRefiner 标注,使用独立页面:
+
+```powershell
+# 终端 1:启动 TRELLIS 服务
+scripts\launch_trellis_server.bat
+
+# 终端 2:启动独立配准页面
+scripts\launch_trellis_registration.bat
+```
+
+浏览器打开 `http://127.0.0.1:19256`。页面分为两个步骤:
+
+1. `生成 GLB`:上传对象图片或透明背景 cutout,生成 TRELLIS `.glb`/`.ply`;
+2. `自动配准`:上传 GLB 和同一观测图的 cutout,填写相机、物理尺寸、世界位置和 bbox JSON,通过已有的 `mesh_registrar.find_best_yaw_silhouette()` 做分析合成配准,输出 yaw overlay 与 registration manifest。
+
+当前自动配准解决的是可靠的 yaw 初值和确定性尺寸/位置变换,不是万能的 6DoF ICP。对于遮挡严重、深度不准或物体高度方向也明显旋转的样本,仍需把 manifest 带入 Blender Pose Annotation 做最终质量复核;这比从零手动拖拽更快,也保留了可审计的 fallback。
+
+独立页面使用端口 `19256`,不会改变主页面 `19255`。
+
 #### 可选 B 类姿态精修
 
 精修模型使用程序生成的有真值 cuboid RGB-D-mask/mesh 对训练；训练参数化与运行时残差边界一致。合成 benchmark 用于检查 checkpoint、回退策略和数值回归，不等同于真实扫描精度评估。
