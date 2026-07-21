@@ -1194,4 +1194,89 @@ python scripts/generate_trellis_mesh.py --image chair.png --output-dir output/me
 
 ---
 
+## 15. B 类 PoseRefiner 数据集：Blender 人机协同配准（2026-07-21）
+
+### 15.1 当前目标
+
+第一轮不依赖 Replica 对象 mesh 作为核心监督，而是直接建立每个 TRELLIS 变体到对应 3DGS 场景的真值变换：
+
+```text
+同一物体的不同输入视角
+  → 多个具有自然几何/canonical 噪声的 TRELLIS GLB
+  → 在 Blender 中分别与 3DGS 点云人工配准
+  → 导出每个 GLB 独立的 TRELLIS raw → 3DGS raw 真值矩阵
+  → 用 GSScene 和现有 mesh renderer 生成与部署一致的网络输入
+  → 围绕真值施加受控 rotation / translation / uniform-scale 扰动
+  → 训练并先验证小样本过拟合能力
+```
+
+不同视角生成同一对象解决的是 **TRELLIS 几何与 canonical 坐标噪声**；围绕真值变换施加的随机扰动解决的是 **PoseRefiner 姿态残差覆盖**。两类噪声都要保留，不能互相替代。同一对象的全部视角和 TRELLIS 变体必须放在同一个 train/validation/test 分组中，防止对象泄漏。
+
+### 15.2 Blender 的职责边界
+
+Blender 只负责人工空间配准、视角选择、质量状态和真值矩阵导出，不直接生产最终网络 tensor。训练输入继续由项目运行时生成：
+
+- 观测侧：`GSScene` 输出 RGB + expected metric depth，结合实例 mask 构成 5 通道输入；
+- 候选侧：`pose_refiner.render_mesh_channels()` 输出 TRELLIS normal RGB + metric depth + silhouette；
+- 几何侧：原始 GLB 的 surface points + normals；
+- 元数据：相机、bbox、初始 placement 和匹配质量；
+- 标签：初始 placement 到 Blender 真值 placement 的 rotation / translation / log-scale residual。
+
+这样可避免 Blender Z Pass、KIRI 3DGS Geometry Nodes 与线上 gsplat expected-depth 之间产生训练/部署域差异。
+
+### 15.3 坐标契约
+
+Blender 场景中必须标记唯一的 `gs_reference`，并为每个 TRELLIS 变体标记一个 `trellis_gt_proxy`。设：
+
+```text
+M_gs_to_blender       = gs_reference.matrix_world
+M_trellis_to_blender  = trellis_proxy.matrix_world
+M_trellis_to_gs       = inverse(M_gs_to_blender) @ M_trellis_to_blender
+```
+
+导出器同时把 `M_trellis_to_gs` 转换为当前 `MeshTransform` 契约：
+
+```text
+x_gs = scale * rotation @ (x_trellis - mesh_center) + translation
+```
+
+其中 `mesh_center` 是原始 TRELLIS proxy 局部坐标的 bbox 中心，`translation = M_trellis_to_gs @ mesh_center`。标注只允许正 determinant 的刚体旋转 + uniform scale；非统一缩放、shear、镜像、空 proxy 或多于一个 GS reference 都是阻断导出的错误。
+
+为避免 Blender glTF importer 的 Y-up/Z-up 转换、父节点和多 mesh 合并改变原始 GLB 坐标，正式数据应使用项目 GLB parser 生成的 raw-coordinate proxy PLY 做标注；带纹理 GLB 仅作为随 proxy 运动的视觉参考。
+
+### 15.4 Blender 标注工具
+
+插件位于 `blender_addons/bim_pose_annotation/`，支持 Blender 4.3 Extension 格式：
+
+- 标记当前对象为唯一 `gs_reference`；
+- 标记当前 mesh 为 `trellis_gt_proxy`，记录 scene/object/class/variant/source-view/source-GLB；
+- 标记相机为 `observation_camera`，记录 RGB/depth/mask、bbox 和目标 object ID；
+- 设置 `draft / approved / review / rejected` 和标注质量；
+- 校验对象角色、ID、源文件与变换合法性；
+- 导出 schema v1 JSON manifest。
+
+无界面批处理入口：
+
+```powershell
+F:\Blender\Blender4.3\blender.exe --background annotation.blend `
+  --python scripts/export_blender_annotations.py -- `
+  --output output/annotations/room_0.json
+```
+
+Blender 4.3 手册已克隆到本地 `Docs/blender-manual/` 作为离线参考；`Docs/` 按项目规则保持不提交。
+
+### 15.5 第一轮测试循环
+
+1. 选择一个轮廓明确、遮挡较少的 B 类对象；
+2. 从同一对象 2–3 个明显不同视角生成 TRELLIS GLB；
+3. 为每个 GLB 生成 raw-coordinate proxy，并在同一个 3DGS Blender 场景中单独配准；
+4. 每个变体至少配置一个未参与 TRELLIS 生成的 observation camera；
+5. 导出 manifest，并由后续数据集生成器生成受控姿态扰动样本；
+6. 先做 1–3 个对象的小样本过拟合，确认 rotation / translation / scale 训练误差能明显下降；
+7. 再扩展到现有数据集的家具对象。若仍无法收敛，再评估增加 Replica mesh 约束或外部数据源。
+
+标注真值误差应显著小于网络预测范围。当前目标为人工配准后旋转误差约 2–3°、平移约 2–3 cm、尺度约 2–3%；不满足的样本设为 `review` 或 `rejected`，不进入正样本训练。
+
+---
+
 *本计划由需求讨论逐步收敛而成。实施过程中如遇架构变更，请同步更新本文件。*
