@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import bpy
-from bpy.props import EnumProperty, FloatProperty, StringProperty
+from bpy.props import EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, Panel
 
 from .annotation_io import (
@@ -241,7 +241,7 @@ class BIMPOSE_OT_export_manifest(Operator):
     filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
 
     def invoke(self, context, event):
-        default_name = str(context.scene.get("bim_scene_id", "scene")) or "scene"
+        default_name = str(getattr(context.scene, "bim_scene_id", "scene")) or "scene"
         if not self.filepath:
             blend_dir = Path(bpy.data.filepath).parent if bpy.data.filepath else Path.cwd()
             self.filepath = str(blend_dir / f"{default_name}_pose_annotations.json")
@@ -269,8 +269,8 @@ class BIMPOSE_PT_annotation(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        layout.prop(scene, '["bim_scene_id"]', text="Scene ID")
-        layout.prop(scene, '["bim_up_axis"]', text="Up Axis")
+        layout.prop(scene, "bim_scene_id", text="Scene ID")
+        layout.prop(scene, "bim_up_axis", text="Up Axis")
 
         active = _active_object(context)
         box = layout.box()
@@ -298,11 +298,25 @@ class BIMPOSE_PT_annotation(Panel):
 
 
 def _ensure_scene_defaults() -> None:
-    for scene in bpy.data.scenes:
-        if "bim_scene_id" not in scene:
-            scene["bim_scene_id"] = ""
-        if "bim_up_axis" not in scene:
-            scene["bim_up_axis"] = 2
+    bpy.types.Scene.bim_scene_id = StringProperty(
+        name="Scene ID",
+        description="Stable scene identifier used in the dataset manifest",
+        default="",
+    )
+    bpy.types.Scene.bim_up_axis = IntProperty(
+        name="Up Axis",
+        description="3DGS world up axis: 0=X, 1=Y, 2=Z",
+        default=2,
+        min=0,
+        max=2,
+    )
+
+
+def _remove_scene_properties() -> None:
+    if hasattr(bpy.types.Scene, "bim_scene_id"):
+        del bpy.types.Scene.bim_scene_id
+    if hasattr(bpy.types.Scene, "bim_up_axis"):
+        del bpy.types.Scene.bim_up_axis
 
 
 CLASSES = (
@@ -317,14 +331,14 @@ CLASSES = (
 
 
 def register():
+    _ensure_scene_defaults()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    _ensure_scene_defaults()
-
 
 def unregister():
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
+    _remove_scene_properties()
 
 
 if __name__ == "__main__":

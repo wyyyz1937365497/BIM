@@ -35,6 +35,13 @@ def _resolved_path(value: str | None) -> str:
     if not value:
         return ""
     return str(Path(bpy.path.abspath(str(value))).resolve())
+def _scene_value(scene: bpy.types.Scene, key: str, default: Any) -> Any:
+    """Read an RNA property first while preserving old custom-property files."""
+    value = scene.get(key)
+    if value is not None:
+        return value
+    return getattr(scene, key, default)
+
 
 
 def _objects_with_role(scene: bpy.types.Scene, role: str) -> list[bpy.types.Object]:
@@ -157,7 +164,7 @@ def _proxy_payload(
         if str(camera.get("bim_target_object_id", "")) == object_id
     ]
     return {
-        "scene_id": str(scene.get("bim_scene_id", "")),
+        "scene_id": str(_scene_value(scene, "bim_scene_id", "")),
         "object_id": object_id,
         "class_name": str(proxy.get("bim_class_name", "")),
         "trellis": {
@@ -172,7 +179,7 @@ def _proxy_payload(
             "source_ply": _resolved_path(gs_reference.get("bim_source_ply", "")),
             "blender_object": gs_reference.name,
             "raw_to_blender": _matrix_rows(gs_to_blender),
-            "up_axis": int(scene.get("bim_up_axis", 2)),
+            "up_axis": int(_scene_value(scene, "bim_up_axis", 2)),
             "metric_scale_validated": bool(
                 gs_reference.get("bim_metric_scale_validated", False)
             ),
@@ -199,7 +206,7 @@ def validate_scene(scene: bpy.types.Scene) -> tuple[list[str], list[str]]:
     """Return blocking errors and non-blocking warnings for the active scene."""
     errors: list[str] = []
     warnings: list[str] = []
-    scene_id = str(scene.get("bim_scene_id", "")).strip()
+    scene_id = str(_scene_value(scene, "bim_scene_id", "")).strip()
     if not scene_id:
         errors.append("Scene ID is empty")
 
@@ -288,7 +295,7 @@ def build_scene_manifest(scene: bpy.types.Scene, *, strict: bool = True) -> dict
         "schema_version": SCHEMA_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "blend_file": str(Path(bpy.data.filepath).resolve()) if bpy.data.filepath else "",
-        "scene_id": str(scene.get("bim_scene_id", "")),
+        "scene_id": str(_scene_value(scene, "bim_scene_id", "")),
         "validation": {"errors": errors, "warnings": warnings},
         "annotations": annotations,
     }
