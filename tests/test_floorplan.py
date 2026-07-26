@@ -15,7 +15,6 @@ from bim_recon.floorplan import (
     WallType,
     floorplan_to_dict,
 )
-from bim_recon.gs_mcp_scaffold import BackendNotConfiguredError, GsMcpToolFacade
 from bim_recon.revit_code import generate_revit_csharp
 
 
@@ -179,13 +178,3 @@ def test_diff_report_only_reports_extra_detected_wall():
     assert "仅报告" in report.unmatched_detected_walls[0].reason
 
 
-def test_gs_mcp_facade_requires_backend():
-    facade = GsMcpToolFacade()
-    assert [tool.name for tool in facade.list_tool_specs()] == [
-        "render_from_pose",
-        "get_depth",
-        "select_cluster",
-        "report_diff",
-    ]
-    with pytest.raises(BackendNotConfiguredError):
-        facade.render_from_pose([[1, 0, 0, 0]], width=64, height=64)

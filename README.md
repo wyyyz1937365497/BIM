@@ -117,14 +117,14 @@
 - **API**：`GET /camera-state` → `{position, look_at, up, fov, fov_degrees, aspect, c2w}` + CORS。
 - **修复**：`import run_viewer` 名称冲突 — 在 import 前从 `sys.path` 移除 `scripts/` 目录。
 
-### P4：TRELLIS B 类构件 Mesh 生成 + Revit DirectShape（已打通）
+### P4：TRELLIS B 类构件 Mesh 生成 + 渲染-比较配准 + Revit DirectShape（已打通）
 
 - **TRELLIS**（`TRELLIS/` 子模块，Microsoft image-to-3D 1.2B 模型）：从 Falcon 抠出的 RGBA 图像生成 GLB mesh，适用于家具、管道、楼梯等无法可靠参数化的 B 类构件。
 - **跨环境 HTTP 桥接**（`trellis_server/server.py`）：trellis conda 环境（torch 2.4 + xformers）常驻 FastAPI 服务（端口 18391），bim-recon 环境通过 `bim_recon/trellis_client.py` 调用；三环境不可合并。
-- **坐标变换与文件载荷**（`bim_recon/mesh_registrar.py`）：将 TRELLIS 的归一化 Y-up 网格旋转、按检测尺寸缩放并平移至 3DGS 世界坐标，再转换为 Revit 内部单位（feet）并写入临时 JSON。文件模式避免大网格经 MCP stdio 内联传输。
+- **混合配准**（`bim_recon/render_compare.py` + `bim_recon/mesh_registrar.py`）：Phase 1 受约束 2D 渲染-比较（yaw + 尺度 + 平移）+ Phase 2 3D 点对点 ICP（全 6DoF 精修，含 pitch/roll）。将 TRELLIS 归一化 Y-up 网格旋转、缩放、平移至 3DGS 世界坐标，经 ICP 精修后转为 Revit 内部单位（feet）写入临时 JSON。详见 `PLAN.md` §15。
 - **编译版 Revit DirectShape 工具**（`create_directshape_from_mesh`）：C# `CreateDirectShapeEventHandler` 使用 `TessellatedShapeBuilder` 构造闭合三角网格，并在 Revit `Transaction` 内创建 `OST_GenericModel` DirectShape。工具接收 `meshFile`（推荐）或内联网格，返回新元素 ID。
-- **端到端链路**：`渲染 + 深度` → `VLM 指代/已确认 B 类标签` → `Falcon RLE 分割` → `RGBA 抠图` → `TRELLIS GLB` → `轴重映射、缩放、深度反投影定位` → `create_directshape_from_mesh` → Revit。已用 8 顶点立方体与 25,647 顶点 / 40,594 三角面的椅子网格验证创建成功。
-- **Gradio 接入**：手动 B 类标签页和 ⑤b 确定性 B 类导入均使用上述编译版工具；后者批量处理管线已确认的 B 类检测结果，并流式展示 Falcon、TRELLIS 与 Revit 状态。
+- **端到端链路**：`渲染 + 深度` → `Falcon 实例分割` → `RGBA 抠图` → `TRELLIS GLB` → `渲染-比较 yaw 搜索 + 3D ICP 精修` → `create_directshape_from_mesh` → Revit。
+- **Gradio 接入**：手动 B 类标签页支持两步操作：① 生成 Mesh + 配准（非 Revit）、② 导入 Revit。配准进度与质量指标（IoU / depth_mae / ICP fitness / rmse）实时展示，诊断图像（3 面板叠加 + roundtrip.json）输出至 `<name>_render_compare/`。
 - **限制**：DirectShape 是原生 Revit 图元，但网格本身不可像墙、门窗族一样参数化编辑；它可选择、删除、分类和重新生成。
 - **xformers Windows patch**：`trellis_server/xformers_windows.patch` + `launch_trellis_server.bat` 自动应用（flash-attn 不可用于 Windows）。
 
@@ -315,14 +315,14 @@ scripts\launch_trellis_server.bat
 # 终端 2：打开 Revit 2026，并确保本地 mcp-servers-for-revit 插件已加载
 ```
 
-TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点。该服务不可用时，A 类检测与建模仍可继续，B 类网格导入将明确报告不可用。B 类网格到 3DGS 场景的配准采用基于反投影的受约束"渲染-比较"几何优化（见 `PLAN.md` §15），不训练位姿神经网络。
+TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点。该服务不可用时，A 类检测与建模仍可继续，B 类网格导入将明确报告不可用。B 类网格到 3DGS 场景的配准采用两阶段混合方案：Phase 1 受约束 2D 渲染-比较 + Phase 2 3D 点对点 ICP 精修（见 `PLAN.md` §15），不训练位姿神经网络。
 
 #### 确定性导入流程
 
 1. 管线输出已确认的 B 类元素，或在手动 B 类标签页从当前 3DGS 视角用画笔粗框选择目标。
 2. Falcon-Perception 依据 VLM 指代或元素标签生成 RLE mask；程序持久化同一视角、同一像素网格的 RGB、metric depth、full-frame mask、bbox 与相机参数，同时输出透明背景 RGBA cutout 供 TRELLIS 使用。
-3. TRELLIS 从 cutout 生成 GLB / PLY。`mesh_registrar.py` 将 TRELLIS 的归一化 Y-up 网格重映射到场景 up-axis，按估计宽高缩放；定位锚点取 Falcon mask 反投影的稳健 `visible_anchor`（对 mask 点云按相机距离百分位过滤取中位数），朝向由 `find_best_yaw_silhouette` 做轮廓分析合成搜索给出。
-4. `mesh_registrar.py` 将最终 placement 转为 Revit feet 并写出临时 JSON 文件（`name`、`category`、扁平 `vertices`、扁平三角形 `faces`）。`TrellisRevitWorkflow` 或 Gradio ⑤b 通过 MCP 调用编译版 `create_directshape_from_mesh`，并传递 `meshFile`。
+3. TRELLIS 从 cutout 生成 GLB / PLY。`mesh_registrar.py` 将 TRELLIS 归一化 Y-up 网格重映射到场景 up-axis，按估计宽高缩放；定位由 `optimize_placement`（`render_compare.py`）执行：Phase 1 粗到细 yaw + 尺度 + 平移搜索，Phase 2 点对点 ICP 用 mask 反投影 3DGS 点云精修全 6DoF 位姿（含 pitch/roll）。质量指标（IoU / depth_mae / ICP fitness / rmse）写入诊断输出。
+4. `mesh_registrar.py` 将最终 placement 转为 Revit feet 并写出临时 JSON 文件（`name`、`category`、扁平 `vertices`、扁平三角形 `faces`）。`TrellisRevitWorkflow` 或 Gradio 手动 B 类标签页通过 MCP 调用编译版 `create_directshape_from_mesh`，并传递 `meshFile`。
 5. Revit 中的 `CreateDirectShapeEventHandler` 用 `TessellatedShapeBuilder` 构造闭合面集，在事务中创建 `OST_GenericModel` DirectShape 并返回元素 ID。
 
 文件载荷形式避免把大网格的顶点和三角索引经 MCP stdio 内联传输；仅小型网格才应使用工具的 inline `data` 形式。生成的 DirectShape 可选择、分类、删除和重新生成，但网格本身不可像 Revit 族一样参数化编辑。
@@ -354,9 +354,9 @@ scripts\launch_trellis_registration.bat
 浏览器打开 `http://127.0.0.1:19256`。页面分为两个步骤:
 
 1. `生成 GLB`:上传对象图片或透明背景 cutout,生成 TRELLIS `.glb`/`.ply`;
-2. `自动配准`:上传 GLB 和同一观测图的 cutout,填写相机、物理尺寸、世界位置和 bbox JSON,通过已有的 `mesh_registrar.find_best_yaw_silhouette()` 做分析合成配准,输出 yaw overlay 与 registration manifest。
+2. `自动配准`:上传 GLB 和同一观测图的 cutout,填写相机、物理尺寸、世界位置和 bbox JSON,通过 `find_best_yaw_silhouette()` 做分析合成配准,输出 yaw overlay 与 registration manifest。
 
-当前自动配准解决的是可靠的 yaw 初值和确定性尺寸/位置变换,不是万能的 6DoF ICP。对于遮挡严重、深度不准或物体高度方向也明显旋转的样本,下一步将在页面内提供偏航角/尺度/前后位置三滑块的人机协同修正(取代原 Blender 人工复核),保留可审计的 fallback。
+自动配准提供可靠的 yaw 初值和确定性尺寸/位置变换。主 Gradio 页面的手动 B 类标签页进一步集成渲染-比较优化器 + 3D ICP 精修,可处理 pitch/roll 自由度并提供 IoU / depth_mae / ICP fitness 等质量指标。
 
 独立页面使用端口 `19256`,不会改变主页面 `19255`。
 
@@ -386,6 +386,7 @@ pytest -q
 | `tests/test_trellis_integration.py` | TRELLIS 集成（真实 HTTPServer mock）| 4/4 通过 |
 | `tests/test_mesh_registrar.py` | GLB 解析、坐标变换、Revit-feet 文件载荷和 DirectShape 工具参数 | 见上方回归命令 |
 | `tests/test_workflows.py` | B 类分割、TRELLIS、文件载荷与编译版 DirectShape 工具分派 | 见上方回归命令 |
+| `tests/test_render_compare.py` | 渲染-比较光栅化器 + 受约束优化器 + 3D ICP 精修（pitch 恢复 / 稀疏 mask 跳过 / 往返一致性）| 9/9 通过 |
 
 DirectShape 与 B 类确定性工作流回归：
 
@@ -417,6 +418,9 @@ bim_recon/
 ├── falcon_client.py         # Falcon HTTP 客户端（跨环境桥接）
 ├── trellis_client.py        # TRELLIS HTTP 客户端（跨环境 mesh 生成）
 ├── mesh_registrar.py        # B 类坐标变换 + DirectShape JSON 文件载荷生成
+├── render_compare.py        # B 类混合配准：渲染-比较优化器 + 点对点 3D ICP 精修
+├── trellis_registration.py  # Falcon mask 反投影 + 辐射图可视化工具
+├── radar_viz.py             # 共享辐射图渲染（观测反投影 + GLB 注册）
 ├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
@@ -487,6 +491,7 @@ output/                      # feat.pt + 生成的扫描图/墙线（时间戳�
 - ~~高度精修检测~~ ✅ 已完成（P3）
 - ~~Falcon-Perception 分割提取空间位置~~ ✅ 已完成（P3.5）
 - ~~TRELLIS B类构件 mesh 生成 + DirectShape~~ ✅ 已完成（P4）
+- ~~B 类混合配准：渲染-比较 + 3D ICP 精修~~ ✅ 已完成（详见 PLAN.md §15）
 - 多房间拼接
 - 精度评估报告
 

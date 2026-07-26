@@ -976,9 +976,9 @@ class FloorPlanProvider:
 | **P2.5** | Gradio Web UI（单页界面 + Mask 编辑 + 相机捕获 + 视角重分割） | ✅ 已完成 | 100% |
 | **P2.6** | 确定性 Workflows（A/B 类编排 + Revit MCP + Gradio 事件流） | ✅ 已完成 | 100% |
 | **~~P3~~** | ~~LiDAR Provider（ROS2 /scan + gsplat 旋转 LiDAR 仿真）~~ | ✅ **已被取代** | 100% |
-| **P4** | 精度报告 + 多房间 + B 类 mesh + Demo | 🔄 部分 | 40% |
+| **P4** | 精度报告 + 多房间 + B 类 mesh 生成与渲染-比较+ICP 配准 + Demo | 🔄 部分 | 60% |
 
-**总体完成度：约 93%**（P0-P2.6 + P3 全部完成，P4 B类mesh已完成，剩余精度报告/多房间/Demo）
+**总体完成度：约 95%**（P0-P2.6 + P3 + P4 B类mesh生成+配准全部完成，剩余精度报告/多房间/Demo）
 
 > **P3 已被 P1 取代**：原计划的物理 LiDAR（ROS2 `/scan` → split-and-merge 墙线）已被 §12.8 的**虚拟激光扫描器**（`bim_recon/virtual_scanner.py`）完全取代——从 3DGS 深度渲染模拟 2D 激光扫描，多高度 × 多视角拼接 360° 极坐标扫描，每个扫描点携带 feat.pt 语义标签。无需任何物理硬件，且语义信息更丰富（真实 LiDAR 只有距离，无语义）。原 P3 的 gsplat 旋转 LiDAR 光栅化也已通过 gsplat 深度渲染实现。
 
@@ -1194,95 +1194,84 @@ python scripts/generate_trellis_mesh.py --image chair.png --output-dir output/me
 
 ---
 
-## 15. B 类配准：基于 RGB-D 反投影与分析合成的场景约束网格注册（2026-07-23 重规划）
+## 15. B 类配准：受约束渲染-比较 + 3D ICP 精修（已实现）
 
-> **2026-07-23 重规划**：依据附件分析（项目创新性已足够支撑上海市级 SITP），弃用原 §15 的
-> PoseRefiner 神经网络与 Blender 人工真值标注方案。B 类物体（家具、管道、楼梯、异形件）的
-> TRELLIS 网格到 3DGS 场景的 Sim(3) 配准改用**确定性、可解释、可复现的受约束"渲染-比较"
-> （render-and-compare / analysis-by-synthesis）几何优化**，不再训练网络。
+> **2026-07-26 已实现**：B 类物体配准采用两阶段混合方案：
+> 1. **Phase 1**（`bim_recon/render_compare.py`）：2D 受约束渲染-比较优化 yaw + 尺度 + 平面平移。
+> 2. **Phase 2**（`refine_with_icp`）：点对点 3D ICP 用 mask 反投影 3DGS 点云与网格表面点云，
+>    精修全 6DoF 位姿（含 pitch/roll，这是单视角 2D 渲染-比较无法约束的自由度）。
+>
+> 弃用原 PoseRefiner 神经网络与 Blender 人工真值标注方案（理由见 §15.8）。
 
-### 15.1 问题重定义
+### 15.1 架构
 
-原方案试图用网络学习"TRELLIS GLB ↔ 3DGS 观测"的位姿残差。重规划后，问题收紧为：
+```
+Falcon mask + 3DGS 深度
+       │
+       ▼
+  _unproject_mask_points  →  物体可见表面 3D 点云（世界坐标）
+       │
+       ▼
+  ┌─────────────────────────────────────────────────┐
+  │  optimize_placement (render_compare.py)         │
+  │  Phase 1: 粗到细坐标下降                        │
+  │    • yaw 粗扫 5° → 多起点细扫 0.5°              │
+  │    • scale ±20%                                 │
+  │    • 平移坐标下降 ±0.3m                          │
+  │  Energy: λ_m·(1-IoU) + λ_d·depth_mae            │
+  │  (λ_m=1.0, λ_d=3.0, 原始 MAE 非 Huber)          │
+  │  光栅化: Open3D RaycastingScene                  │
+  │                                                 │
+  │  Phase 2: refine_with_icp                       │
+  │    • 源点云: _sample_surface_points(mesh)       │
+  │    • 目标点云: _unproject_mask_points(obs)      │
+  │    • 点对点 ICP (max_distance=0.20m)             │
+  │    • 精修 6DoF 旋转 + 平移                       │
+  │    • 将精修后的旋转写入 rotation_override         │
+  │    • 重新评分 (IoU + depth_mae)                  │
+  └─────────────────────────────────────────────────┘
+       │
+       ▼
+  MeshPlacement(rotation_override=...) → compute_placement_transform
+       │
+       ▼
+  register_mesh_in_revit → OST_GenericModel DirectShape
+```
 
-> 已知相机位姿、楼板高 `floor_z`、重力方向（`up_axis`），以及 Falcon 实例 mask 反投影得到
-> 的物体**可见表面**点云，求一个受约束的相似变换 `T`，把 TRELLIS 网格局部坐标系对齐到
-> 3DGS 世界坐标系，使其在该相机下的渲染轮廓与深度与观测一致。
+### 15.2 关键设计决策
 
-自由度从 7（全 6DoF 刚体 + 尺度）缩减为 4–5：`ξ = (θ, s, t_x, t_y, δz)`——绕重力轴的偏航角、
-统一尺度、平面平移、以及可固定为 0 的垂直微调。约束：重力方向已知、底面贴 `floor_z`、
-不需要任意 roll/pitch。这是几何配准问题，不是模式识别问题，确定性求解器即可。
+| 决策 | 原因 |
+|---|---|
+| 点对点 ICP（非点对平面） | 单视角反投影法线退化，导致点对平面发散至数百米偏移。点对点可靠，合成测试中恢复 pitch 误差 < 0.33° |
+| `rotation_override` 绕过 yaw + axis_remap | ICP 给出完整 3×3 旋转（包含 pitch/roll），直接用 `rotation_override` 传递给 `compute_placement_transform`（L442–449），无需分解为 yaw |
+| 尺度不精修 | 点对点 ICP 是刚体变换，尺度从 Phase 1 保留 |
+| 地面接触在 ICP 后重应用 | `preserve_floor_contact=True` + `compute_placement_transform` 调整垂直平移，保证网格底部接触 `floor_z` |
+| FOV 约定为水平 | 所有相机/焦距代码均使用 `0.5*width/tan(fov/2)`，与 `gs_scene.fov_to_intrinsics` 一致 |
+| 使用实际 `camera["up"]` | 与 `gs_scene.look_at_pose` 匹配，非 `up_axis` basis 重建 |
+| `floor_z` 从 mask 点云导出 | 不信任 pipeline 的 `floor_z=0`（场景原点偏移时网格会落在相机上方，不可见） |
 
-### 15.2 已确认缺陷与已落地修复（本次重规划第一阶段）
+### 15.3 质量门控
 
-核查发现确定性核心存在三处缺陷，第一类已修复，作为优化器落地前的地基：
-
-| 缺陷 | 根因 | 状态 |
+| 指标 | 阈值 | 含义 |
 |---|---|---|
-| **可见表面锚点被当作网格质心** | `backproject_observation` 已用 `_unproject_mask_points` 算出精确 mask 三维点，却只塞进诊断字段；最终定位仍用 bbox 中心 + bbox 内中值深度，易混入背景/椅腿空隙 | **已修复**：新增 `_robust_anchor_from_points`（mask 点按相机距离 [10,70] 百分位过滤取中位数），`backproject_observation` 输出 `visible_anchor`，`register_observation` 的偏航搜索与 placement 基准改用 `visible_anchor`（无 mask 时回退 `backprojected_center`）。实测（object_001 沙发）：锚点落在 mask 点云凸包内，与 bbox 中心水平偏差 0.14 m |
-| **偏航角搜索与 placement 旋转约定不一致** | `find_best_yaw_silhouette` 手写绕 mesh +Y 的 `+yaw`，`compute_placement_transform` 用绕世界 up 的 `-yaw`（`_build_yaw_rotation`），轴同符号反、组合顺序亦不同；`best_yaw` 原值透传 → 非对称物体朝向反向 | **已修复**：`silhouette_at_yaw` 改为复用 `_build_yaw_rotation(up_axis, yaw) @ axis_remap`，与 placement 完全一致。新增约定一致性测试 `test_yaw_search_matches_placement_convention`（全 up_axis × 多 yaw） |
-| **轮廓用点投影而非三角面光栅化** | 当前用顶点/表面采样点投影 + 1px 膨胀近似轮廓，无 z-buffer，稀疏网格、自遮挡、凹陷处失真 | **延后**：下一步用 `open3d.t.geometry.RaycastingScene` 做真实三角面光栅化（见 §15.6） |
+| silhouette IoU | > 0.20 | 网格轮廓与 Falcon mask 重叠 |
+| mask 内深度 MAE | < 0.10 m | 网格表面与 3DGS 深度吻合 |
+| 覆盖率 | — | 观测中有网格深度的像素占比 |
+| ICP fitness | > 0.1 | ICP 目标点是否有 ≥ 10% 在上述 max_distance 范围内 |
 
-诚实说明：`visible_anchor` 仍是**表面锚点**，把网格包围盒中心放在表面锚点仍会向相机方向
-偏移约半个物体深度；该偏移的根本消除依赖 §15.3 的渲染-比较优化器（在重叠区用网格表面深度
-对齐 3DGS 深度，自动把网格中心推到表面后方）。本次锚点修复仅去除背景/空隙深度污染，
-是优化器的更优参考点，前向兼容。
+### 15.4 诊断输出
 
-### 15.3 方法：受约束 4–5 自由度"渲染-比较"优化（下一步实施规格）
+`<name>_render_compare/` 目录：
+- `roundtrip.json`：相机参数 + mask 质心反投影 → 重投影的往返检查
+- `render_compare_debug.png`：3 面板（观测 mask / 渲染轮廓 / 叠加）
+- `RenderCompareResult.diagnostics()` 包含 `icp_fitness`、`icp_rmse`、`has_rotation_override`
 
-对每个候选位姿 `T`，把 TRELLIS 网格按 `T` 变换到世界坐标，用与观测相同的相机渲染得到
-轮廓 `M_mesh` 与深度 `D_mesh`，与观测的 Falcon mask `M_obs` 和原始 3DGS 深度 `D_3DGS` 比较：
+### 15.5 评估方案
 
-$$ E(T) = \lambda_m \bigl(1 - \mathrm{IoU}(M_{mesh}, M_{obs})\bigr) + \lambda_d \cdot \mathrm{Huber}\bigl(D_{mesh} - D_{3DGS};\ \text{仅在 } M_{obs} \text{ 内}\bigr) + \lambda_f \cdot E_{floor} $$
+约 15–30 个 B 类物体（不同类别、遮挡、尺度）。每物体报告：水平/垂直位置误差(cm)、偏航/俯仰/滚转误差(°)、
+尺度误差(%)、silhouette IoU、深度 MAE(cm)、ICP fitness/rmse、Phase 1→Phase 2 改善量、Revit 导入成功率(%)。
 
-- `M_obs`：Falcon 实例 mask（已反投影为 `visible_anchor`）；
-- `M_mesh` / `D_mesh`：候选位姿下渲染的网格轮廓 / 深度（§15.6 光栅化）；
-- `D_3DGS`：捕获观测时的原始 3DGS 深度图；
-- `E_floor`：网格最低点偏离 `floor_z` 的惩罚（底面接触约束）。
-
-参数 `ξ = (θ, s, t_x, t_y, δz)`：偏航角、统一尺度、平面平移、垂直微调（常固定为 0）。
-尺度初值由 mask 高度 + 反投影深度估计（`_estimate_dimensions`），平移初值取 `visible_anchor`，
-最低点贴 `floor_z`，偏航角由现有 `find_best_yaw_silhouette` 给出粗值。
-
-### 15.4 优化过程（粗到细，无梯度）
-
-1. **初值**：轴重映射（TRELLIS Y-up → 世界 up_axis）、`visible_anchor` 稳健中心、底面贴
-   `floor_z`、`find_best_yaw_silhouette` 粗偏航、`_estimate_dimensions` 估尺度。
-2. **逐偏航渲染**：每个候选偏航角下渲染完整轮廓 + 深度，计算 `E(T)`。
-3. **粗到细搜索**：偏航粗步 5° / 细步 0.5°、尺度 ±20%、平移 ±0.3 m；用 Powell / Nelder-Mead /
-   坐标下降（4–5 参数无需梯度，对噪声鲁棒）。每个候选只调一次光栅化。
-4. **质量门控**：见 §15.5。
-
-### 15.5 质量门控与人机协同
-
-| 指标 | 阈值参考 | 含义 |
-|---|---|---|
-| silhouette IoU | > 0.3 | 网格轮廓与 mask 重叠 |
-| mask 内深度 MAE | < 8 cm | 网格表面与 3DGS 深度吻合 |
-| 有效深度覆盖率 | > 0.5 | `M_obs` 内有网格深度的像素占比 |
-| 地板接触误差 | < 3 cm | 底面是否贴 `floor_z` |
-| 尺寸合理性 | ±25% | 估尺度是否在物理合理范围 |
-| 第一/二候选偏航分数差 | > 0.05 | 偏航是否无歧义 |
-
-低置信度时（多指标不达标），下一步在 Gradio 配准页面内弹出 **偏航角 / 尺度 / 前后位置** 三滑块的
-人机协同修正（取代原 Blender 人工复核）。滑块约束在上述物理范围内，人机结果回写 manifest。
-
-### 15.6 光栅化选择
-
-首选 `open3d.t.geometry.RaycastingScene`（已是仓库依赖，见 `bim_recon/wall_fitter.py`）：
-CPU、`cast_rays` 一次给出 `t_hit`（深度）与 `geometry_ids`（轮廓），无需可微性，Windows /
-torch 2.7 无安装风险，适合无梯度优化器。性能后备：nvdiffrast（GPU）。`trimesh.Scene.save_image`
-作软件后备。
-
-### 15.7 多视角联合评分（延后）
-
-$$ E_{multi}(T) = \sum_i \bigl[\lambda_m(1 - \mathrm{IoU}_i) + \lambda_d \cdot E_{depth,i}\bigr] $$
-
-视角选择：原始生成视角 + 左右偏 20–40° + 略高视角。用反投影物体三维区域投影到其它视角生成
-提示框，再调 Falcon 得到多视角 mask 与深度。多视角能消除单视角的偏航/尺度歧义，作为单视角
-基线稳定后的扩展。
-
-### 15.8 为何不训练神经网络
+### 15.6 为何不训练神经网络
 
 附件判定 NN 为高风险，理由经核查成立：
 
@@ -1293,22 +1282,6 @@ $$ E_{multi}(T) = \sum_i \bigl[\lambda_m(1 - \mathrm{IoU}_i) + \lambda_d \cdot E
 - **合成-真实域差异**：训练用合成扰动，部署面对真实 3DGS 渲染，域差异需额外弥合。
 
 参考文献（render-and-compare / 分析合成范式）：MegaPose [Labbé RAL/CVPR]、RePOSE [ICCV 2021]、
-GISR [arXiv:2405.04890]、STI-Pose [ICCV 2024]；对比基线 NOCS [arXiv:1901.02970]、
-FoundationPose [CVPR 2024]。**仅在**确定性基线完整、积累 ≥30–50 个独立物体、有
-train/val/test 划分、可报告旋转/平移/尺度误差且**显著优于**几何优化时，才重新评估 NN。
-
-### 15.9 评估方案
-
-约 15–30 个 B 类物体（不同类别、遮挡、尺度）。每物体报告：水平/垂直位置误差(cm)、偏航误差(°)、
-尺度误差(%)、silhouette IoU、深度 MAE(cm)、自动注册成功率(%)、Revit 导入成功率(%)。方法对比：
-
-| 方法 | 说明 |
-|---|---|
-| 固定偏航 + 中心反投影 | 旧基线（缺陷修复前） |
-| 轮廓偏航搜索 | 当前（`find_best_yaw_silhouette`，约定已统一） |
-| 轮廓 + 深度联合优化 | §15.3 渲染-比较优化器（下一步实施） |
-| 多视角联合优化 | §15.7（更后） |
-
----
-
-*本计划由需求讨论逐步收敛而成。实施过程中如遇架构变更，请同步更新本文件。*
+GISR [arXiv:2405.04890]、STI-Pose [ICCV 2024]；GaussReg [ECCV 2024]（3DGS 高斯中心配准）；
+LAM3D [NeurIPS 2024]（生成 mesh→点云对齐）。**仅在**确定性基线完整、积累 ≥30–50 个独立物体、
+有 train/val/test 划分、可报告旋转/平移/尺度误差且**显著优于**几何优化时，才重新评估 NN。

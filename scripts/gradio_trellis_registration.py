@@ -3,7 +3,7 @@
 Launch with ``scripts/launch_trellis_registration.bat``. This deliberately
 keeps the main BIM pipeline untouched: it generates GLB assets and solves the
 first registration pass through the project's existing silhouette-search mesh
-registrar. Blender annotation export remains a later dataset step.
+registrar. Use the main Gradio page for full render-compare + ICP refinement.
 """
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def _register_observed(glb_path, cutout_path, label, render_state, detection_inf
         manifest = register_observation(glb_path, cutout_path, render_state, detection_info, out_dir, name=registration_name or label or "object", label=label or "object", floor_z=float(floor_z), ceiling_z=float(ceiling_z), yaw_override=None if yaw_override is None else float(yaw_override))
         score = manifest["registration"]["yaw_search"]["best_iou"]
         debug_path = out_dir / "yaw_debug" / "overlay_best.png"
-        return f"配准完成：自动 yaw {manifest['registration']['resolved_yaw_degrees']:.1f}°，silhouette IoU {score:.3f}。建议在 Blender 中复核。", manifest["manifest_path"], str(debug_path) if debug_path.is_file() else None, manifest
+        return f"配准完成：自动 yaw {manifest['registration']['resolved_yaw_degrees']:.1f}°，silhouette IoU {score:.3f}。使用主 Gradio 页面进行渲染-比较 + ICP 精修。", manifest["manifest_path"], str(debug_path) if debug_path.is_file() else None, manifest
     except Exception as exc:
         return f"配准失败：{exc}", None, None, {"error": str(exc)}
 
@@ -402,7 +402,7 @@ def build_app() -> gr.Blocks:
         registration_status = gr.Markdown("等待配准")
         registration_manifest = gr.File(label="Registration manifest")
         registration_debug = gr.Image(label="Yaw overlay：红观测 / 蓝投影 / 绿重叠")
-        registration_json = gr.JSON(label="Placement + Blender annotation seed")
+        registration_json = gr.JSON(label="Placement manifest")
         gr.Markdown("### 05 · 两阶段空间雷达对照")
         with gr.Row():
             observation_radar = gr.Image(

@@ -40,7 +40,7 @@ class _FinishMeshes(Event):
 
 @dataclass(frozen=True, slots=True)
 class ApprovedMeshObject:
-    """One user-approved explorer object and its physical placement size.
+    """One user-approved B-class object and its physical placement size.
 
     Attributes:
         yaw_degrees: Per-object yaw around the world up axis in degrees,
@@ -143,7 +143,7 @@ class TrellisRevitWorkflow(Workflow):
         self, ctx: Context, ev: StartEvent,
     ) -> _GenerateObject | StopEvent:
         if not self.config.objects:
-            message = "Select at least one approved explorer object"
+            message = "Select at least one approved B-class object"
             ctx.write_event_to_stream(WorkflowFailed(
                 workflow=self.workflow_name,
                 stage="approval",
