@@ -42,9 +42,12 @@ from bim_recon.pipeline_api import PipelineResults
 from bim_recon.mcp_gateway import StdioMCPGateway
 from bim_recon.revit_workflow import RevitBuildOptions, RevitBuildWorkflow
 from bim_recon.workflow_runtime import stream_workflow_gradio
-from bim_recon.explorer_controller import ExplorerCamera
-from bim_recon.explorer_workflow import ExplorerScanConfig, ExplorerScanWorkflow
 from bim_recon.pipeline_runner import find_scene_files
+from bim_recon.radar_viz import (
+    draw_spatial_context as _draw_spatial_context,
+    observation_radar as _observation_radar,
+    registration_radar as _registration_radar,
+)
 from bim_recon.trellis_workflow import (
     ApprovedMeshObject,
     TrellisRevitWorkflow,
@@ -216,12 +219,9 @@ def build_app() -> gr.Blocks:
             "TRELLIS 生成 mesh、并通过编译版 `create_directshape_from_mesh` 注册到 Revit。"
             "需要 Falcon 服务（端口 18390）、TRELLIS 服务（端口 18391）和 Revit MCP 同时在线。"
         )
-        with gr.Row():
-            bclass_seed = gr.Number(label="TRELLIS 种子", value=1, precision=0)
-            bclass_debug = gr.Checkbox(label="保存分割调试图", value=False)
-            bclass_run_btn = gr.Button(
-                "执行 B 类物体确定性导入", variant="primary",
-            )
+        bclass_run_btn = gr.Button(
+            "执行 B 类物体确定性导入", variant="primary",
+        )
         bclass_status = gr.Markdown("等待执行")
         bclass_result = gr.JSON(label="B 类物体导入结果")
 
@@ -250,17 +250,14 @@ def build_app() -> gr.Blocks:
                 bmesh_seed_manual = gr.Number(
                     label="种子", value=1, precision=0,
                 )
-                bmesh_yaw_manual = gr.Number(
-                    label="偏航角 (°, 正=顺时针)",
-                    value=90.0,
-                    precision=1,
-                    info="绕世界竖直轴的 yaw。正值=从上往下看顺时针。默认 90°；贴墙长物体若方向偏 45° 可调到 45° 或 135°。",
-                )
                 bmesh_identify_btn = gr.Button(
                     "🔍 VLM识别 + Falcon分割", variant="secondary",
                 )
-                bmesh_gen_manual_btn = gr.Button(
-                    "生成 Mesh + 注册 Revit", variant="primary",
+                bmesh_gen_btn = gr.Button(
+                    "① 生成 Mesh + 配准", variant="primary",
+                )
+                bmesh_import_btn = gr.Button(
+                    "② 导入 Revit", variant="secondary",
                 )
             bmesh_identified_label = gr.Textbox(
                 label="VLM 识别结果", interactive=False,
@@ -270,11 +267,21 @@ def build_app() -> gr.Blocks:
             )
             bmesh_manual_preview = gr.Image(label="抠图预览", height=300)
             bmesh_manual_output = gr.JSON(label="生成结果")
+            bmesh_import_status = gr.Markdown("")
+            gr.Markdown("### B 类空间雷达（分割反投影 / GLB 配准）")
+            with gr.Row():
+                bmesh_observation_radar = gr.Image(
+                    label="分割照片反投影雷达图", height=520, interactive=False,
+                )
+                bmesh_glb_radar = gr.Image(
+                    label="GLB 配准后场景雷达图", height=520, interactive=False,
+                )
             bmesh_cutout_state = gr.State(None)
             bmesh_render_state = gr.State(None)
             bmesh_cam_state = gr.State(None)
             bmesh_detection_state = gr.State(None)
             bmesh_scene_state = gr.State("")
+            bmesh_ready_state = gr.State(None)
         # ====== ⑥ 独立 3D 查看器 ======
         gr.Markdown(
             "---\n## ⑥ 独立 3D 查看器\n\n"
@@ -547,8 +554,6 @@ def build_app() -> gr.Blocks:
         async def _run_bclass_workflow(
             results: PipelineResults | None,
             scene_name: str,
-            seed: int,
-            debug: bool,
         ):
             if results is None:
                 yield "请先加载一次管线结果。", {"error": "missing_pipeline_results"}
@@ -610,7 +615,7 @@ def build_app() -> gr.Blocks:
                         scan_center=scan_center,
                         floor_z=floor_z, ceiling_z=ceiling_z,
                         up_axis=up_axis,
-                        debug=bool(debug),
+                        debug=False,
                     )
                 except Exception as exc:
                     lines.append(f"  ⚠️ 提取失败: {exc}")
@@ -636,8 +641,6 @@ def build_app() -> gr.Blocks:
 
             cfg = load_config()
             trellis_cfg = cfg.trellis
-            from bim_recon.pose_refiner import create_pose_refiner
-            pose_refiner = create_pose_refiner(cfg.pose_refiner)
             client_factory = lambda: TrellisClient(
                 host=trellis_cfg.host, port=trellis_cfg.port,
                 timeout=trellis_cfg.timeout,
@@ -650,7 +653,7 @@ def build_app() -> gr.Blocks:
                 timeout_seconds=float(revit_cfg.timeout),
             )
             objects = tuple(
-                approved_object_from_extraction(ex, seed=int(seed))
+                approved_object_from_extraction(ex)
                 for ex in extractions
             )
             workflow = TrellisRevitWorkflow(
@@ -658,7 +661,6 @@ def build_app() -> gr.Blocks:
                     objects=objects,
                     output_dir=out_dir,
                     register_in_revit=True,
-                    pose_refiner=pose_refiner,
                 ),
                 client_factory=client_factory,
                 gateway=gateway,
@@ -679,7 +681,7 @@ def build_app() -> gr.Blocks:
 
         bclass_run_btn.click(
             fn=_run_bclass_workflow,
-            inputs=[results_state, scene_state, bclass_seed, bclass_debug],
+            inputs=[results_state, scene_state],
             outputs=[bclass_status, bclass_result],
         )
         # --- TRELLIS mesh generation ---
@@ -800,6 +802,17 @@ def build_app() -> gr.Blocks:
                                     "norm_bbox": selected.mask_bbox or selected.bbox,
                                     "mask_area_ratio": selected.mask_area_ratio,
                                 }
+                                # Persist the full-frame Falcon mask for the
+                                # render-compare optimizer (M_obs).
+                                try:
+                                    from bim_recon.bmesh_pipeline import _full_frame_mask
+                                    full_mask = _full_frame_mask(selected, h_img, w_img)
+                                    if full_mask is not None:
+                                        mask_path = debug_dir / "03_falcon_mask.png"
+                                        PILImg.fromarray(full_mask, mode="L").save(mask_path)
+                                        detection_info["mask_path"] = str(mask_path)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
@@ -812,7 +825,51 @@ def build_app() -> gr.Blocks:
                 result.detail,
             )
 
-        bmesh_identify_btn.click(
+        def _bmesh_context_from_results(results):
+            """Build the A-class room context (walls + scan center) for the radars.
+
+            A-class walls are saved center-relative, so the scan center (read
+            from wall_lines.json scan_info) must be subtracted from the B-class
+            absolute world positions to align them in the same radar frame."""
+            if not results or not getattr(results, "walls", None):
+                return None
+            center = [0.0, 0.0]
+            try:
+                raw = json.loads((results.out_dir / "wall_lines.json").read_text("utf-8"))
+                c = raw.get("scan_info", {}).get("center")
+                if c and len(c) >= 2:
+                    center = [float(c[0]), float(c[1])]
+            except Exception:
+                pass
+            elements = [
+                {"element_class": e.element_class,
+                 "world_x": e.world_x, "world_y": e.world_y}
+                for e in getattr(results, "elements", [])
+                if getattr(e, "confirmed", False) and e.element_class in ("door", "window")
+            ]
+            return {"walls": list(results.walls), "elements": elements, "center_offset": center}
+
+        def _bmesh_observation_radar(render_state, detection_info, results):
+            return _observation_radar(
+                render_state, detection_info, _bmesh_context_from_results(results),
+            )
+
+        def _bmesh_registration_radar(output, results):
+            context = _bmesh_context_from_results(results)
+            if not context:
+                return None
+            output = output or {}
+            placement = output.get("placement") or {}
+            diagnostics = placement.get("diagnostics")
+            if not diagnostics:
+                return _draw_spatial_context(context)
+            manifest = {
+                "assets": {"glb": output.get("GLB")},
+                "registration": {"placement": diagnostics},
+            }
+            return _registration_radar(manifest, context)
+
+        identify_event = bmesh_identify_btn.click(
             fn=_on_bmesh_identify,
             inputs=[bmesh_mask_editor, bmesh_render_state],
             outputs=[
@@ -821,61 +878,25 @@ def build_app() -> gr.Blocks:
                 bmesh_detection_state, bmesh_cam_status,
             ],
         )
+        identify_event.then(
+            _bmesh_observation_radar,
+            inputs=[bmesh_render_state, bmesh_detection_state, results_state],
+            outputs=bmesh_observation_radar,
+        )
 
-        def _unproject_pixel_to_world(cam, depth_map, px, py, img_w, img_h):
-            """Unproject a pixel + depth to 3DGS world coordinates.
-
-            Uses the camera look-at convention: forward toward target, up
-            roughly aligned with world up.  Returns (x, y, z) in meters.
-            """
-            eye = np.array(cam["eye"], dtype=np.float64)
-            target = np.array(cam["target"], dtype=np.float64)
-            up_world = np.array(cam.get("up", [0, 0, 1]), dtype=np.float64)
-            vfov_rad = math.radians(cam.get("fov", 60.0))
-
-            iy = max(0, min(img_h - 1, int(py)))
-            ix = max(0, min(img_w - 1, int(px)))
-            d = float(depth_map[iy, ix])
-            if d <= 0.1:
-                # Fallback: median of non-zero depths near the pixel
-                y0 = max(0, iy - 20)
-                y1 = min(img_h, iy + 20)
-                x0 = max(0, ix - 20)
-                x1 = min(img_w, ix + 20)
-                patch = depth_map[y0:y1, x0:x1]
-                valid = patch[patch > 0.1]
-                if len(valid) == 0:
-                    return None
-                d = float(np.median(valid))
-
-            focal_y = 0.5 * img_h / math.tan(vfov_rad / 2.0)
-            focal_x = focal_y  # square pixels
-
-            x_cam = (px - img_w / 2.0) / focal_x * d
-            y_cam = (py - img_h / 2.0) / focal_y * d
-            z_cam = d
-
-            forward = target - eye
-            forward /= np.linalg.norm(forward) + 1e-12
-            right = np.cross(forward, up_world)
-            right /= np.linalg.norm(right) + 1e-12
-            down = np.cross(forward, right)
-
-            world = eye + right * x_cam + down * y_cam + forward * z_cam
-            return world, d
 
         def _on_bmesh_generate(cutout_path, label, render_state, detection_info,
-                               results, seed, yaw_degrees):
-            """TRELLIS mesh → world placement → Revit DirectShape."""
+                               results, seed):
+            """TRELLIS mesh → render-compare alignment → formatted Revit payload (no import)."""
             if not cutout_path:
-                return None, {"错误": "请先点击「🔍 VLM识别 + Falcon分割」生成抠图"}
+                return None, {"错误": "请先点击「🔍 VLM识别 + Falcon分割」生成抠图"}, None
             from PIL import Image as PILImage
 
             preview = np.array(PILImage.open(cutout_path).convert("RGBA"))
             cfg = load_config()
             trellis = TrellisClient(host=cfg.trellis.host, port=cfg.trellis.port, timeout=cfg.trellis.timeout)
             if not trellis.health():
-                return preview, {"错误": "TRELLIS 服务不可达"}
+                return preview, {"错误": "TRELLIS 服务不可达"}, None
 
             scene_name = (render_state or {}).get("scene", "default")
             out_dir = ROOT / "output" / scene_name / "_trellis_meshes"
@@ -892,7 +913,7 @@ def build_app() -> gr.Blocks:
                     seed=int(seed),
                 ))
             except Exception as e:
-                return preview, {"错误": f"TRELLIS 生成失败: {e}"}
+                return preview, {"错误": f"TRELLIS 生成失败: {e}"}, None
 
             output = {
                 "状态": "✅ Mesh 生成成功",
@@ -909,185 +930,151 @@ def build_app() -> gr.Blocks:
             placement_info = {}
             if cam and depth_map is not None and detection_info:
                 norm_bbox = detection_info.get("norm_bbox") or {}
-                cx_norm = norm_bbox.get("x", 0.5)
-                cy_norm = norm_bbox.get("y", 0.5)
-                w_norm = norm_bbox.get("w", 0.2)
-                h_norm = norm_bbox.get("h", 0.2)
+                mask_path = detection_info.get("mask_path")
+                up_axis = int(cam.get("up_axis", 2))
+                coords = (results.coords if results else {}) or {}
+                floor_z = float(coords.get("floor_z", 0.0))
+                ceiling_z = float(coords.get("ceiling_z", 3.0))
+                depth_arr = np.asarray(depth_map, dtype=np.float32)
 
-                px_center = cx_norm * img_w
-                py_center = cy_norm * img_h
-                result_unproj = _unproject_pixel_to_world(
-                    cam, depth_map, px_center, py_center, img_w, img_h,
-                )
-                if result_unproj is not None:
-                    world_pos, depth_val = result_unproj
-                    up_axis = cam.get("up_axis", 2)
-                    h_axes = [i for i in range(3) if i != up_axis]
-                    world_x = float(world_pos[h_axes[0]])
-                    world_y = float(world_pos[h_axes[1]])
-                    world_z = float(world_pos[up_axis])
+                # Rough physical-size init from bbox + depth + FOV; the optimizer
+                # refines scale around it.
+                cx_norm = float(norm_bbox.get("x", 0.5))
+                cy_norm = float(norm_bbox.get("y", 0.5))
+                w_norm = float(norm_bbox.get("w", 0.2))
+                h_norm = float(norm_bbox.get("h", 0.2))
+                px_c = int(min(max(cx_norm * img_w, 0), img_w - 1))
+                py_c = int(min(max(cy_norm * img_h, 0), img_h - 1))
+                d_init = float(depth_arr[py_c, px_c]) if np.isfinite(depth_arr[py_c, px_c]) else 1.5
+                vfov_rad = math.radians(cam.get("fov", 60.0))
+                aspect = img_w / img_h
+                hfov_rad = 2.0 * math.atan(math.tan(vfov_rad / 2.0) * aspect)
+                element_width_m = max(float(w_norm * 2.0 * d_init * math.tan(hfov_rad / 2.0)), 0.1)
+                element_height_m = max(float(h_norm * 2.0 * d_init * math.tan(vfov_rad / 2.0)), 0.1)
 
-                    # Estimate physical dimensions from bbox + depth + FOV
-                    vfov_rad = math.radians(cam.get("fov", 60.0))
-                    aspect = img_w / img_h
-                    hfov_rad = 2.0 * math.atan(math.tan(vfov_rad / 2.0) * aspect)
-                    element_width_m = float(w_norm * 2.0 * depth_val * math.tan(hfov_rad / 2.0))
-                    element_height_m = float(h_norm * 2.0 * depth_val * math.tan(vfov_rad / 2.0))
+                # --- Constrained render-compare alignment (attachment-1 §四) ---
+                # Matches the backprojected observation (Falcon mask + 3DGS depth)
+                # against the TRELLIS mesh via triangle rasterization, optimizing
+                # yaw + scale + planar translation with floor contact. Replaces the
+                # old bbox-center anchor + point-projection yaw search.
+                rc_result = None
+                obs_mask = None
+                if mask_path and Path(mask_path).is_file():
+                    try:
+                        from PIL import Image as _MaskImg
+                        obs_mask = np.asarray(_MaskImg.open(mask_path).convert("L")) > 0
+                    except Exception:
+                        obs_mask = None
+                if obs_mask is not None and obs_mask.shape == depth_arr.shape:
+                    try:
+                        from bim_recon.render_compare import optimize_placement
+                        rc_result = optimize_placement(
+                            mesh_result.glb_path,
+                            {"camera": cam, "depth": depth_arr,
+                             "mask": obs_mask, "norm_bbox": norm_bbox},
+                            floor_z=floor_z, ceiling_z=ceiling_z, up_axis=up_axis,
+                            element_width_m=element_width_m,
+                            element_height_m=element_height_m,
+                            debug_dir=out_dir / f"{name}_render_compare",
+                        )
+                    except Exception as exc:
+                        placement_info["render_compare_error"] = str(exc)
 
-                    # Floor/ceiling from pipeline results or defaults
-                    coords = (results.coords if results else {}) or {}
-                    floor_z = float(coords.get("floor_z", 0.0))
-                    ceiling_z = float(coords.get("ceiling_z", 3.0))
-
-                    placement_info = {
-                        "world_x": round(world_x, 3),
-                        "world_y": round(world_y, 3),
-                        "world_z": round(world_z, 3),
-                        "element_width_m": round(element_width_m, 3),
-                        "element_height_m": round(element_height_m, 3),
-                        "depth": round(depth_val, 3),
-                        "camera": {
-                            "eye": [round(float(v), 4) for v in cam["eye"]] if "eye" in cam else None,
-                            "target": [round(float(v), 4) for v in cam["target"]] if "target" in cam else None,
-                            "fov": float(cam.get("fov", 0.0)),
-                            "up_axis": int(cam.get("up_axis", 2)),
-                            "img_size": {"w": int(img_w), "h": int(img_h)},
-                        },
-                    }
-
-                    # --- Register mesh in Revit ---
+                ready = None
+                if rc_result is not None:
                     from bim_recon.mesh_registrar import (
                         MeshPlacement, compute_placement_transform,
-                        find_best_yaw_silhouette,
-                        register_mesh_in_revit,
-                        serialize_placement_diagnostics,
+                        register_mesh_in_revit, serialize_placement_diagnostics,
                     )
-
-                    # --- Auto-yaw via silhouette matching against the cutout ---
-                    # Renders the mesh at candidate yaws through the SAME camera
-                    # that captured the cutout, and picks the yaw whose silhouette
-                    # best matches the Falcon mask. Robust to TRELLIS generating
-                    # cubic objects at arbitrary orientations.
-                    auto_yaw_result: dict | None = None
-                    resolved_yaw = float(yaw_degrees) if yaw_degrees is not None else 90.0
-                    try:
-                        from PIL import Image as _CutoutImg
-                        cutout_arr = np.array(_CutoutImg.open(clean_path).convert("RGBA"))
-                        cutout_alpha = cutout_arr[:, :, 3] if cutout_arr.ndim == 3 else cutout_arr
-                        # Falcon bbox is in normalized coords of the FULL rendering.
-                        # render_state stored the full rendering size.
-                        auto_yaw_result = find_best_yaw_silhouette(
-                            glb_path=Path(mesh_result.glb_path),
-                            cutout_alpha=cutout_alpha,
-                            norm_bbox=norm_bbox,
-                            camera_eye=tuple(float(v) for v in cam["eye"]),
-                            camera_target=tuple(float(v) for v in cam["target"]),
-                            camera_up_axis=up_axis,
-                            camera_fov=float(cam.get("fov", 50.0)),
-                            camera_img_w=int(img_w),
-                            camera_img_h=int(img_h),
-                            world_pos=(world_x, world_y, world_z),
-                            element_width_m=max(element_width_m, 0.1),
-                            up_axis=up_axis,
-                            debug_dir=out_dir / f"{name}_yaw_debug",
-                        )
-                        if auto_yaw_result.get("best_iou", 0.0) >= 0.15:
-                            resolved_yaw = float(auto_yaw_result["best_yaw"])
-                    except Exception as exc:
-                        auto_yaw_result = {"error": str(exc)}
-
-                    placement = MeshPlacement(
+                    wx, wy = rc_result.world_xy
+                    placement_kwargs = dict(
                         glb_path=Path(mesh_result.glb_path),
-                        world_x=world_x,
-                        world_y=world_y,
-                        floor_z=floor_z,
-                        ceiling_z=ceiling_z,
-                        element_width_m=max(element_width_m, 0.1),
-                        element_height_m=max(element_height_m, 0.1),
+                        world_x=float(wx), world_y=float(wy),
+                        floor_z=floor_z, ceiling_z=ceiling_z,
+                        element_width_m=element_width_m,
+                        element_height_m=element_height_m,
                         up_axis=up_axis,
-                        yaw_degrees=resolved_yaw,
-                        category="OST_GenericModel",
-                        name=label or name,
+                        scale_multiplier=rc_result.scale_multiplier,
+                        preserve_floor_contact=True,
+                        category="OST_GenericModel", name=label or name,
                     )
-                    pose_refinement = None
-                    try:
-                        from bim_recon.pose_refiner import (
-                            PoseObservation,
-                            create_pose_refiner,
-                        )
-                        pose_refiner = create_pose_refiner(cfg.pose_refiner)
-                        if pose_refiner is not None:
-                            render_rgb = np.asarray((render_state or {}).get("rgb"))
-                            if render_rgb.shape[:2] != np.asarray(depth_map).shape:
-                                raise ValueError("manual RGB/depth observation shapes differ")
-                            full_mask = np.zeros(np.asarray(depth_map).shape, dtype=np.float32)
-                            x0 = max(0, int((cx_norm - w_norm / 2 - 0.08) * img_w))
-                            y0 = max(0, int((cy_norm - h_norm / 2 - 0.08) * img_h))
-                            x1 = min(img_w, int((cx_norm + w_norm / 2 + 0.08) * img_w))
-                            y1 = min(img_h, int((cy_norm + h_norm / 2 + 0.08) * img_h))
-                            full_mask[y0:y1, x0:x1] = 1.0
-                            observation = PoseObservation(
-                                rgb=render_rgb,
-                                depth=np.asarray(depth_map, dtype=np.float32),
-                                mask=full_mask,
-                                norm_bbox=(cx_norm, cy_norm, w_norm, h_norm),
-                                camera_eye=tuple(float(v) for v in cam["eye"]),
-                                camera_target=tuple(float(v) for v in cam["target"]),
-                                camera_up=tuple(float(v) for v in cam.get("up", [0, 0, 1])),
-                                camera_fov=float(cam.get("fov", 50.0)),
-                                camera_image_size=(int(img_w), int(img_h)),
-                                up_axis=up_axis,
-                            )
-                            pose_refinement = pose_refiner.refine_placement(
-                                placement, observation,
-                            )
-                            if pose_refinement.accepted:
-                                placement = pose_refinement.placement
-                    except Exception as exc:
-                        pose_refinement = {"error": str(exc)}
+                    if rc_result.rotation_override is not None:
+                        placement_kwargs["rotation_override"] = rc_result.rotation_override
+                    else:
+                        placement_kwargs["yaw_degrees"] = rc_result.yaw_degrees
+                    placement = MeshPlacement(**placement_kwargs)
+                    placement_info.update({
+                        "world_x": round(float(wx), 3),
+                        "world_y": round(float(wy), 3),
+                        "yaw_degrees": round(rc_result.yaw_degrees, 2),
+                        "scale_multiplier": round(rc_result.scale_multiplier, 4),
+                        "render_compare": rc_result.diagnostics(),
+                    })
                     try:
                         transform = compute_placement_transform(placement)
-                        from bim_recon.mcp_gateway import StdioMCPGateway
-                        revit_cfg = cfg.revit_mcp
                         revit_result = register_mesh_in_revit(placement, transform)
                         placement_info["diagnostics"] = serialize_placement_diagnostics(placement, transform)
-                        if auto_yaw_result is not None:
-                            placement_info["auto_yaw"] = auto_yaw_result
-                            placement_info["resolved_yaw"] = resolved_yaw
-                        if pose_refinement is not None:
-                            placement_info["pose_refinement"] = (
-                                pose_refinement.diagnostics()
-                                if hasattr(pose_refinement, "diagnostics")
-                                else pose_refinement
-                            )
-                        placement_info["revit"] = revit_result
+                        placement_info["revit_payload"] = revit_result
                         if revit_result.get("status") == "formatted":
-                            gateway = StdioMCPGateway(
-                                command=revit_cfg.command,
-                                args=tuple(revit_cfg.args),
-                                cwd=str(ROOT),
-                                timeout_seconds=float(revit_cfg.timeout),
-                            )
-                            resp = asyncio.run(gateway.call_tool(
-                                "create_directshape_from_mesh",
-                                {"meshFile": revit_result["payload_path"]},
-                            ))
-                            placement_info["revit_response"] = resp
-                            output["Revit"] = "✅ DirectShape 已创建"
+                            output["状态"] = "✅ 生成 + 配准完成（待导入 Revit）"
+                            ready = {
+                                "payload_path": revit_result.get("payload_path"),
+                                "name": label or name,
+                                "iou": rc_result.iou,
+                                "depth_mae_m": rc_result.depth_mae_m,
+                            }
+                        else:
+                            output["状态"] = "⚠️ Revit 载荷格式化失败，请检查 mesh"
                     except Exception as exc:
-                        output["Revit 错误"] = str(exc)
+                        output["配准错误"] = str(exc)
 
             output["placement"] = placement_info
-            return preview, output
+            return preview, output, ready
 
-        bmesh_gen_manual_btn.click(
+        gen_event = bmesh_gen_btn.click(
             fn=_on_bmesh_generate,
             inputs=[
                 bmesh_cutout_state, bmesh_identified_label,
                 bmesh_render_state, bmesh_detection_state,
-                results_state, bmesh_seed_manual, bmesh_yaw_manual,
+                results_state, bmesh_seed_manual,
             ],
-            outputs=[bmesh_manual_preview, bmesh_manual_output],
+            outputs=[bmesh_manual_preview, bmesh_manual_output, bmesh_ready_state],
+        )
+        gen_event.then(
+            _bmesh_registration_radar,
+            inputs=[bmesh_manual_output, results_state],
+            outputs=bmesh_glb_radar,
+        )
+
+        def _on_bmesh_import(ready):
+            """Import the generated + aligned mesh into Revit as a DirectShape."""
+            if not ready or not ready.get("payload_path"):
+                return "⚠️ 请先点击「① 生成 Mesh + 配准」生成可用网格"
+            try:
+                from bim_recon.mcp_gateway import StdioMCPGateway
+                cfg = load_config()
+                revit_cfg = cfg.revit_mcp
+                gateway = StdioMCPGateway(
+                    command=revit_cfg.command,
+                    args=tuple(revit_cfg.args),
+                    cwd=str(ROOT),
+                    timeout_seconds=float(revit_cfg.timeout),
+                )
+                asyncio.run(gateway.call_tool(
+                    "create_directshape_from_mesh",
+                    {"meshFile": ready["payload_path"]},
+                ))
+                iou = ready.get("iou", 0.0)
+                dmae = ready.get("depth_mae_m", 0.0)
+                return (f"✅ 已导入 Revit：{ready.get('name', '')} "
+                        f"(IoU={iou:.2f}, depth_mae={dmae*100:.1f}cm)")
+            except Exception as exc:
+                return f"❌ 导入失败：{exc}"
+
+        bmesh_import_btn.click(
+            fn=_on_bmesh_import,
+            inputs=[bmesh_ready_state],
+            outputs=[bmesh_import_status],
         )
 
     return app

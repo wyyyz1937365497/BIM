@@ -122,6 +122,32 @@ class TestYawRotation:
         with pytest.raises(ValueError):
             _build_yaw_rotation(up_axis=5, yaw_degrees=90.0)
 
+    def test_yaw_search_matches_placement_convention(self, tmp_path):
+        """The yaw rotation shared by ``find_best_yaw_silhouette`` and
+        ``compute_placement_transform`` must agree for every up_axis.
+
+        Regression guard: ``silhouette_at_yaw`` previously hand-rolled an
+        opposite-sign, opposite-composition-order rotation, so a recovered
+        ``best_yaw`` was applied with the wrong facing by placement. Both now
+        build rotation as ``_build_yaw_rotation(up_axis, yaw) @ axis_remap``;
+        the behavioral coupling (cutout synthesized via this convention is
+        recovered at the GT yaw) is covered by TestFindBestYawSilhouette."""
+        glb = TestFindBestYawSilhouette()._build_asymmetric_glb(tmp_path)
+        for up_axis in (0, 1, 2):
+            for yaw_deg in (0.0, 45.0, 90.0, 137.0, 200.0, 270.0):
+                placement = MeshPlacement(
+                    glb_path=glb, world_x=0.0, world_y=0.0,
+                    floor_z=0.0, ceiling_z=10.0,
+                    element_width_m=2.0, element_height_m=1.0,
+                    up_axis=up_axis, yaw_degrees=yaw_deg,
+                )
+                transform = compute_placement_transform(placement)
+                canonical = _build_yaw_rotation(up_axis, yaw_deg) @ _build_axis_remap_rotation(up_axis)
+                np.testing.assert_allclose(
+                    transform.rotation, canonical, atol=1e-6,
+                    err_msg=f"convention mismatch at up_axis={up_axis}, yaw={yaw_deg}",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Placement transform
@@ -527,71 +553,25 @@ class TestFindBestYawSilhouette:
     verify find_best_yaw_silhouette recovers it."""
 
     def _build_asymmetric_glb(self, tmp_path: Path) -> Path:
-        """Build an elongated box (2:1:1) so the silhouette changes with yaw."""
-        # 2x1x1 box: clearly elongated along X
+        """Build a genuinely asymmetric L-shape (two cuboids) whose silhouette
+        changes distinctly with yaw and is NOT invariant under 180° rotation.
+
+        A plain elongated box is centrally symmetric, so yaw and yaw+180°
+        project to the same silhouette — the search can only resolve them by
+        coarse-grid luck. The L-shape removes that ambiguity: the long arm
+        extends +X while a short arm on the -X side extends +Z, so every yaw
+        has a unique silhouette. Horizontal extent stays 2.0 (scale ≈ 1.0)."""
         vertices = np.array([
-            [-1.0, -0.5, -0.5], [1.0, -0.5, -0.5], [1.0, 0.5, -0.5], [-1.0, 0.5, -0.5],
-            [-1.0, -0.5,  0.5], [1.0, -0.5,  0.5], [1.0, 0.5,  0.5], [-1.0, 0.5,  0.5],
+            [-1.0, -0.5, -0.25], [1.0, -0.5, -0.25], [1.0, 0.5, -0.25], [-1.0, 0.5, -0.25],
+            [-1.0, -0.5,  0.25], [1.0, -0.5,  0.25], [1.0, 0.5,  0.25], [-1.0, 0.5,  0.25],
+            [-0.75, -0.5, 0.25], [-0.25, -0.5, 0.25], [-0.25, 0.5, 0.25], [-0.75, 0.5, 0.25],
+            [-0.75, -0.5, 1.0], [-0.25, -0.5, 1.0], [-0.25, 0.5, 1.0], [-0.75, 0.5, 1.0],
         ], dtype=np.float32)
         faces = np.array([
             [0,1,2],[0,2,3], [4,6,5],[4,7,6], [0,5,1],[0,4,5],
             [2,6,7],[2,7,3], [1,5,6],[1,6,2], [0,3,7],[0,7,4],
-        ], dtype=np.uint16)
-        return self._write_glb(tmp_path / "elong.glb", vertices, faces)
-
-    def _write_glb(self, path: Path, vertices: np.ndarray, faces: np.ndarray) -> Path:
-        """Write a minimal GLB given vertices + faces."""
-        vert_bytes = vertices.astype(np.float32).tobytes()
-        face_bytes = faces.astype(np.uint16).tobytes()
-        buffer = vert_bytes + face_bytes
-        while len(buffer) % 4 != 0:
-            buffer += b'\x00'
-        gltf = {
-            "asset": {"version": "2.0"},
-            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
-            "accessors": [
-                {"bufferView": 0, "componentType": 5126, "count": len(vertices),
-                 "type": "VEC3", "byteOffset": 0,
-                 "max": vertices.max(0).tolist(), "min": vertices.min(0).tolist()},
-                {"bufferView": 0, "componentType": 5123,
-                 "count": faces.size, "type": "SCALAR", "byteOffset": len(vert_bytes)},
-            ],
-            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": len(buffer)}],
-            "buffers": [{"byteLength": len(buffer)}],
-        }
-        json_bytes = json.dumps(gltf).encode()
-        while len(json_bytes) % 4 != 0:
-            json_bytes += b' '
-        total = 12 + 8 + len(json_bytes) + 8 + len(buffer)
-        with open(path, 'wb') as f:
-            f.write(struct.pack('<III', 0x46546C67, 2, total))
-            f.write(struct.pack('<II', len(json_bytes), 0x4E4F534A))
-            f.write(json_bytes)
-            f.write(struct.pack('<II', len(buffer), 0x004E4942))
-            f.write(buffer)
-        return path
-
-    def _project_silhouette(
-        self, vertices_centered: np.ndarray, yaw_deg: float,
-        eye: tuple, target: tuple, up_axis: int, fov: float, img_size: int,
-        bbox: dict, padding: float = 0.08,
-    ) -> np.ndarray:
-        """Synthesize a silhouette: yaw the mesh, project, rasterize, crop."""
-        up = np.zeros(3); up[up_axis] = 1.0
-        eye, target = np.array(eye, float), np.array(target, float)
-class TestFindBestYawSilhouette:
-    """Self-consistency tests: synthesize a silhouette from a known yaw, then
-    verify find_best_yaw_silhouette recovers it."""
-
-    def _build_asymmetric_glb(self, tmp_path: Path) -> Path:
-        """Build an elongated box (2:1:1) so the silhouette changes with yaw."""
-        vertices = np.array([
-            [-1.0, -0.5, -0.5], [1.0, -0.5, -0.5], [1.0, 0.5, -0.5], [-1.0, 0.5, -0.5],
-            [-1.0, -0.5,  0.5], [1.0, -0.5,  0.5], [1.0, 0.5,  0.5], [-1.0, 0.5,  0.5],
-        ], dtype=np.float32)
-        faces = np.array([
-            [0,1,2],[0,2,3], [4,6,5],[4,7,6], [0,5,1],[0,4,5],
-            [2,6,7],[2,7,3], [1,5,6],[1,6,2], [0,3,7],[0,7,4],
+            [8,9,10],[8,10,11], [12,14,13],[12,15,14], [8,13,9],[8,12,13],
+            [10,14,15],[10,15,11], [9,13,14],[9,14,10], [8,11,15],[8,15,12],
         ], dtype=np.uint16)
         return self._write_glb(tmp_path / "elong.glb", vertices, faces)
 
@@ -644,16 +624,12 @@ class TestFindBestYawSilhouette:
         fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
         right = np.cross(fwd, up); right /= np.linalg.norm(right)
         down = np.cross(fwd, right)
-        focal_y = 0.5 * img_h / np.tan(np.radians(fov) / 2.0)
-        focal_x = focal_y  # square pixels
+        focal_x = 0.5 * img_w / np.tan(np.radians(fov) / 2.0)  # FOV horizontal
+        focal_y = focal_x
 
-        yaw = np.radians(yaw_deg)
-        c, s = np.cos(yaw), np.sin(yaw)
-        rot = vertices_centered.copy()
-        rot[:, 0] = c * vertices_centered[:, 0] + s * vertices_centered[:, 2]
-        rot[:, 2] = -s * vertices_centered[:, 0] + c * vertices_centered[:, 2]
         axis_remap = _build_axis_remap_rotation(up_axis)
-        world = rot @ axis_remap.T
+        rotation = _build_yaw_rotation(up_axis, yaw_deg) @ axis_remap
+        world = vertices_centered @ rotation.T
 
         rel = world - eye_a
         z = rel @ fwd; x = rel @ right; y = rel @ down
@@ -686,16 +662,12 @@ class TestFindBestYawSilhouette:
         fwd = tgt_a - eye_a; fwd /= np.linalg.norm(fwd)
         right = np.cross(fwd, up); right /= np.linalg.norm(right)
         down = np.cross(fwd, right)
-        focal_y = 0.5 * img_h / np.tan(np.radians(fov) / 2.0)
-        focal_x = focal_y
+        focal_x = 0.5 * img_w / np.tan(np.radians(fov) / 2.0)  # FOV horizontal
+        focal_y = focal_x
 
-        yaw = np.radians(yaw_deg)
-        c, s = np.cos(yaw), np.sin(yaw)
-        rot = vertices_centered.copy()
-        rot[:, 0] = c * vertices_centered[:, 0] + s * vertices_centered[:, 2]
-        rot[:, 2] = -s * vertices_centered[:, 0] + c * vertices_centered[:, 2]
         axis_remap = _build_axis_remap_rotation(up_axis)
-        world = rot @ axis_remap.T
+        rotation = _build_yaw_rotation(up_axis, yaw_deg) @ axis_remap
+        world = vertices_centered @ rotation.T
 
         rel = world - eye_a
         z = rel @ fwd; x = rel @ right; y = rel @ down

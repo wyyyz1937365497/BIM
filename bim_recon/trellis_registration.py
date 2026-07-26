@@ -8,7 +8,7 @@ The implementation intentionally mirrors the proven main-page path:
 → deterministic mesh placement → auditable dataset manifest.
 
 No Revit calls are made here. The output is the registration foundation for
-PoseRefiner/Blender annotation, with every intermediate asset retained.
+the constrained render-compare alignment, with every intermediate asset retained.
 """
 from __future__ import annotations
 
@@ -99,9 +99,13 @@ def _unproject_center(
     height, width = depth.shape[:2]
     eye = np.asarray(camera["eye"], dtype=np.float64)
     target = np.asarray(camera["target"], dtype=np.float64)
-    up_axis = int(camera.get("up_axis", 2))
-    up = np.zeros(3, dtype=np.float64)
-    up[up_axis] = 1.0
+    up_raw = camera.get("up")
+    if up_raw is not None:
+        up = np.asarray(up_raw, dtype=np.float64)
+    else:
+        up_axis = int(camera.get("up_axis", 2))
+        up = np.zeros(3, dtype=np.float64)
+        up[up_axis] = 1.0
     x = float(bbox["x"]) * width
     y = float(bbox["y"]) * height
     x0 = max(0, min(width - 1, int((bbox["x"] - bbox["w"] / 2) * width)))
@@ -122,9 +126,10 @@ def _unproject_center(
     right = np.cross(forward, up)
     right /= np.linalg.norm(right) + 1e-12
     down = np.cross(forward, right)
-    vertical_fov = math.radians(float(camera.get("fov_degrees", camera.get("fov", 45.0))))
-    focal_y = 0.5 * height / math.tan(vertical_fov / 2.0)
-    focal_x = focal_y
+    hfov = math.radians(float(camera.get("fov_degrees", camera.get("fov", 45.0))))
+    # FOV is horizontal (matches gs_scene.fov_to_intrinsics): focal from width.
+    focal_x = 0.5 * width / math.tan(hfov / 2.0)
+    focal_y = focal_x
     x_cam = (x - width / 2.0) / focal_x * distance
     y_cam = (y - height / 2.0) / focal_y * distance
     world = eye + right * x_cam + down * y_cam + forward * distance
@@ -139,9 +144,9 @@ def _estimate_dimensions(
 ) -> tuple[float, float]:
     """Convert normalized mask extent and metric depth into meters."""
     width, height = image_size
-    vfov = math.radians(float(fov_deg))
+    hfov = math.radians(float(fov_deg))
     aspect = width / max(height, 1)
-    hfov = 2.0 * math.atan(math.tan(vfov / 2.0) * aspect)
+    vfov = 2.0 * math.atan(math.tan(hfov / 2.0) / aspect)
     physical_width = float(bbox["w"]) * 2.0 * distance * math.tan(hfov / 2.0)
     physical_height = float(bbox["h"]) * 2.0 * distance * math.tan(vfov / 2.0)
     return max(physical_width, 0.1), max(physical_height, 0.1)
@@ -169,19 +174,24 @@ def _unproject_mask_points(
     height, width = depth.shape
     eye = np.asarray(camera["eye"], dtype=np.float64)
     target = np.asarray(camera["target"], dtype=np.float64)
-    up_axis = int(camera.get("up_axis", 2))
-    up = np.zeros(3, dtype=np.float64)
-    up[up_axis] = 1.0
+    up_raw = camera.get("up")
+    if up_raw is not None:
+        up = np.asarray(up_raw, dtype=np.float64)
+    else:
+        up_axis = int(camera.get("up_axis", 2))
+        up = np.zeros(3, dtype=np.float64)
+        up[up_axis] = 1.0
     forward = target - eye
     forward /= np.linalg.norm(forward) + 1e-12
     right = np.cross(forward, up)
     right /= np.linalg.norm(right) + 1e-12
     down = np.cross(forward, right)
-    vertical_fov = math.radians(
+    hfov = math.radians(
         float(camera.get("fov_degrees", camera.get("fov", 45.0)))
     )
-    focal_y = 0.5 * height / math.tan(vertical_fov / 2.0)
-    focal_x = focal_y
+    # FOV is horizontal (matches gs_scene.fov_to_intrinsics): focal from width.
+    focal_x = 0.5 * width / math.tan(hfov / 2.0)
+    focal_y = focal_x
     x_camera = (cols.astype(np.float64) - width / 2.0) / focal_x * distances
     y_camera = (rows.astype(np.float64) - height / 2.0) / focal_y * distances
     return (
@@ -190,6 +200,41 @@ def _unproject_mask_points(
         + down[None, :] * y_camera[:, None]
         + forward[None, :] * distances[:, None]
     )
+
+
+def _robust_anchor_from_points(
+    world_points: np.ndarray, eye: np.ndarray
+) -> np.ndarray | None:
+    """Robust visible-surface anchor: median of the [10, 70] camera-distance
+    percentile band of mask surface points.
+
+    Unlike the bbox-center + median-depth anchor, this rejects background bleed
+    and leg/seat gaps that contaminate the bbox median, yielding a stable point
+    on the object's visible surface. Returns ``None`` when no points survive.
+    """
+    if world_points.size == 0:
+        return None
+    distances = np.linalg.norm(world_points - eye[None, :], axis=1)
+    lo, hi = np.percentile(distances, [10.0, 70.0])
+    keep = (distances >= lo) & (distances <= hi)
+    if not np.any(keep):
+        keep = distances <= hi
+    if not np.any(keep):
+        return None
+    return np.asarray(np.median(world_points[keep], axis=0), dtype=np.float64)
+
+
+def robust_mask_anchor(
+    depth: np.ndarray, mask: np.ndarray, camera: dict[str, Any]
+) -> np.ndarray | None:
+    """Public robust visible-surface anchor from a Falcon mask + 3DGS depth.
+
+    Unprojects the mask pixels and takes the median of the [10, 70] camera-
+    distance percentile band. Shared by the registration lab and the
+    render-compare optimizer. Returns ``None`` when the mask is empty."""
+    world_points = _unproject_mask_points(depth, mask, camera)
+    eye = np.asarray(camera["eye"], dtype=np.float64)
+    return _robust_anchor_from_points(world_points, eye)
 
 
 def backproject_observation(
@@ -225,6 +270,7 @@ def backproject_observation(
     up_axis = int(camera.get("up_axis", 2))
     horizontal_axes = [axis for axis in range(3) if axis != up_axis]
     mask_points_xy: list[list[float]] = []
+    visible_anchor: np.ndarray | None = None
     mask_path_value = detection_info.get("mask_path") or render_state.get("mask_path")
     if mask_path_value:
         mask_path = Path(mask_path_value)
@@ -234,14 +280,18 @@ def backproject_observation(
             world_points = _unproject_mask_points(depth, mask, camera)
             if world_points.size:
                 mask_points_xy = world_points[:, horizontal_axes].tolist()
+                visible_anchor = _robust_anchor_from_points(world_points, camera_eye)
+    radar_anchor = (visible_anchor if visible_anchor is not None
+                    else np.asarray(world_position, dtype=np.float64))
     return {
         "camera": camera,
         "image_size": list(image_size),
         "norm_bbox": bbox,
         "backprojected_center": list(world_position),
+        "visible_anchor": list(visible_anchor) if visible_anchor is not None else list(world_position),
         "horizontal_position": [
-            float(world_position[horizontal_axes[0]]),
-            float(world_position[horizontal_axes[1]]),
+            float(radar_anchor[horizontal_axes[0]]),
+            float(radar_anchor[horizontal_axes[1]]),
         ],
         "camera_horizontal_position": [
             float(camera_eye[horizontal_axes[0]]),
@@ -374,7 +424,8 @@ def register_observation(
     camera = observation["camera"]
     bbox = observation["norm_bbox"]
     image_size = tuple(observation["image_size"])
-    world_position = tuple(observation["backprojected_center"])
+    backprojected_center = tuple(observation["backprojected_center"])
+    world_position = tuple(observation.get("visible_anchor") or observation["backprojected_center"])
     distance = float(observation["distance_m"])
     element_width_m = float(observation["estimated_dimensions_m"]["width"])
     element_height_m = float(observation["estimated_dimensions_m"]["height"])
@@ -426,7 +477,8 @@ def register_observation(
             "camera": camera,
             "image_size": list(image_size),
             "norm_bbox": bbox,
-            "backprojected_center": list(world_position),
+            "backprojected_center": list(backprojected_center),
+            "visible_anchor": list(world_position),
             "distance_m": distance,
             "estimated_dimensions_m": {
                 "width": element_width_m,
@@ -438,13 +490,6 @@ def register_observation(
             "yaw_search": yaw_result,
             "resolved_yaw_degrees": resolved_yaw,
             "placement": serialize_placement_diagnostics(placement, transform),
-        },
-        "blender_annotation_seed": {
-            "object_id": safe_stem(name),
-            "class_name": label,
-            "variant_id": safe_stem(name),
-            "source_glb": str(glb.resolve()),
-            "status": "review",
         },
     }
     manifest_path = destination / f"{safe_stem(name, 'registration')}_registration.json"

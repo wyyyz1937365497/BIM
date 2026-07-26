@@ -779,10 +779,10 @@ def find_best_yaw_silhouette(
     right = np.cross(fwd, up_vec)
     right /= np.linalg.norm(right) + 1e-12
     down = np.cross(fwd, right)
-    # Focal length: FOV is vertical → derive from img_h. Square pixels →
-    # focal_x == focal_y. x-centering uses img_w, y-centering uses img_h.
-    focal_y = 0.5 * camera_img_h / np.tan(np.radians(camera_fov) / 2.0)
-    focal_x = focal_y  # square pixels
+    # Focal length: FOV is horizontal (matches gs_scene.fov_to_intrinsics) →
+    # derive from img_w. Square pixels → focal_x == focal_y.
+    focal_x = 0.5 * camera_img_w / np.tan(np.radians(camera_fov) / 2.0)
+    focal_y = focal_x  # square pixels
     center_x = camera_img_w / 2.0
     center_y = camera_img_h / 2.0
 
@@ -812,12 +812,8 @@ def find_best_yaw_silhouette(
 
     def silhouette_at_yaw(yaw_deg: float) -> np.ndarray:
         """Project the yawed mesh to the cutout frame and build a binary mask."""
-        yaw = np.radians(yaw_deg)
-        c, s = float(np.cos(yaw)), float(np.sin(yaw))
-        rot = centered.copy()
-        rot[:, 0] = c * centered[:, 0] + s * centered[:, 2]
-        rot[:, 2] = -s * centered[:, 0] + c * centered[:, 2]
-        world = (rot @ axis_remap.T) * scale + world_pos_arr
+        rotation = _build_yaw_rotation(up_axis, yaw_deg) @ axis_remap
+        world = (centered @ rotation.T) * scale + world_pos_arr
 
         rel = world - eye
         z_cam = rel @ fwd

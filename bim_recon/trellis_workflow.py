@@ -78,7 +78,6 @@ class TrellisWorkflowConfig:
     register_in_revit: bool = True
     category: str = "OST_GenericModel"
     generation_retries: int = 1
-    pose_refiner: Any | None = None
 
 
 TrellisFactory = Callable[[], TrellisClient]
@@ -292,24 +291,6 @@ class TrellisRevitWorkflow(Workflow):
             category=self.config.category,
             name=f"{obj.label} {obj.object_id}",
         )
-        refinement = None
-        if self.config.pose_refiner is not None and self._has_observation(obj):
-            try:
-                refinement = await asyncio.to_thread(
-                    self.config.pose_refiner.refine_placement,
-                    placement,
-                    self._observation_for(obj),
-                )
-                if refinement.accepted:
-                    placement = refinement.placement
-            except Exception as exc:
-                refinement = self._fallback_refinement(
-                    placement, f"inference_error:{type(exc).__name__}: {exc}",
-                )
-        elif self.config.pose_refiner is not None:
-            refinement = self._fallback_refinement(
-                placement, "missing_observation",
-            )
         transform = await asyncio.to_thread(compute_placement_transform, placement)
         formatted = register_mesh_in_revit(placement, transform)
         diagnostics = serialize_placement_diagnostics(placement, transform)
@@ -324,8 +305,6 @@ class TrellisRevitWorkflow(Workflow):
             "face_count": formatted["face_count"],
             "diagnostics": diagnostics,
         }
-        if refinement is not None:
-            base["pose_refinement"] = refinement.diagnostics()
         if not self.config.register_in_revit:
             return base
         assert self.gateway is not None
@@ -334,49 +313,6 @@ class TrellisRevitWorkflow(Workflow):
             {"meshFile": formatted["payload_path"]},
         )
         return {**base, "revit_response": response}
-
-    @staticmethod
-    def _has_observation(obj: ApprovedMeshObject) -> bool:
-        return bool(
-            obj.observation_rgb_path and obj.observation_rgb_path.is_file()
-            and obj.depth_path and obj.depth_path.is_file()
-            and obj.mask_path and obj.mask_path.is_file()
-            and obj.norm_bbox and obj.camera_eye and obj.camera_target and obj.camera_up
-        )
-
-    @staticmethod
-    def _fallback_refinement(placement: MeshPlacement, reason: str):
-        from bim_recon.pose_refiner import PoseQuality, PoseRefinementResult
-
-        empty_quality = PoseQuality(0.0, 0.0, 0.0)
-        return PoseRefinementResult(
-            placement=placement,
-            accepted=False,
-            confidence=0.0,
-            iterations=0,
-            initial_quality=empty_quality,
-            refined_quality=empty_quality,
-            fallback_reason=reason,
-        )
-
-    @staticmethod
-    def _observation_for(obj: ApprovedMeshObject):
-        from bim_recon.pose_refiner import load_pose_observation
-
-        if not TrellisRevitWorkflow._has_observation(obj):
-            raise ValueError("incomplete pose observation")
-        return load_pose_observation(
-            obj.observation_rgb_path,
-            obj.depth_path,
-            obj.mask_path,
-            obj.norm_bbox,
-            obj.camera_eye,
-            obj.camera_target,
-            obj.camera_up,
-            obj.camera_fov,
-            obj.camera_image_size,
-            obj.up_axis,
-        )
 
     def _write_manifest(self) -> Path:
         path = self.config.output_dir / "trellis_workflow.json"

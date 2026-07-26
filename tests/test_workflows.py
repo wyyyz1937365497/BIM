@@ -11,8 +11,6 @@ import pytest
 from workflows import Context, Workflow, step
 from workflows.events import StartEvent, StopEvent
 
-from bim_recon.explorer_controller import ExplorerCamera
-from bim_recon.explorer_workflow import ExplorerScanConfig, ExplorerScanWorkflow
 from bim_recon.pipeline_api import ElementResult, PipelineResults, load_results
 from bim_recon.pipeline_runner import (
     PipelineConfig,
@@ -530,82 +528,6 @@ def test_revit_floor_profile_removes_near_duplicate_crossing_vertices(tmp_path):
     assert len(segments) == 5
     assert min(lengths_mm) >= 10.0
     assert len(wall_args["data"]) == 5
-
-
-class _FakeExplorerController:
-    def __init__(self, output_dir: Path):
-        self.output_dir = output_dir
-        self.found: list[dict] = []
-        self.turns: list[float] = []
-        self.scan_count = 0
-
-    def initialize(self, camera):
-        path = self.output_dir / "initial.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"png")
-        return str(path)
-
-    def scan_current(self, labels):
-        self.scan_count += 1
-        path = self.output_dir / f"scan-{self.scan_count}.png"
-        path.write_bytes(b"png")
-        tagged = []
-        if self.scan_count == 1:
-            obj = {
-                "id": "obj_001",
-                "label": labels[0],
-                "position_3d": [1.0, 2.0, 0.5],
-                "best_view": str(path),
-                "trellis_status": "pending_approval",
-            }
-            self.found.append(obj)
-            tagged.append(obj)
-        return {
-            "view_path": str(path),
-            "detections": [{"label": labels[0]}],
-            "tagged": tagged,
-            "duplicates": [],
-        }
-
-    def turn(self, degrees):
-        self.turns.append(degrees)
-
-    def persist(self):
-        path = self.output_dir / "found_objects.json"
-        path.write_text("[]", encoding="utf-8")
-        return path
-
-    def status(self):
-        return {"camera": {"up_axis": 2}, "found_count": len(self.found)}
-
-
-def test_explorer_workflow_scans_bounded_views_without_agent_loop(tmp_path):
-    controllers: list[_FakeExplorerController] = []
-
-    def factory(_config, output_dir):
-        controller = _FakeExplorerController(output_dir)
-        controllers.append(controller)
-        return controller
-
-    workflow = ExplorerScanWorkflow(
-        ExplorerScanConfig(
-            ply_path=tmp_path / "scene.ply",
-            feat_path=None,
-            output_root=tmp_path / "explore",
-            camera=ExplorerCamera((0.0, 0.0, 1.0)),
-            labels=("chair", "table"),
-            num_views=3,
-            turn_degrees=120.0,
-        ),
-        controller_factory=factory,
-    )
-
-    events = list(stream_workflow_sync(workflow))
-
-    completed = next(event for event in events if isinstance(event, WorkflowCompleted))
-    assert controllers[0].scan_count == 3
-    assert controllers[0].turns == [120.0, 120.0]
-    assert completed.result["found_objects"][0]["label"] == "chair"
 
 
 class _FakeTrellisClient:

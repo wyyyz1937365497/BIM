@@ -315,16 +315,15 @@ scripts\launch_trellis_server.bat
 # 终端 2：打开 Revit 2026，并确保本地 mcp-servers-for-revit 插件已加载
 ```
 
-TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点。该服务不可用时，A 类检测与建模仍可继续，B 类网格导入将明确报告不可用。学习式姿态精修默认关闭，仅在 `pose_refiner.enabled=true` 且 checkpoint 可加载时启用。
+TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点。该服务不可用时，A 类检测与建模仍可继续，B 类网格导入将明确报告不可用。B 类网格到 3DGS 场景的配准采用基于反投影的受约束"渲染-比较"几何优化（见 `PLAN.md` §15），不训练位姿神经网络。
 
 #### 确定性导入流程
 
 1. 管线输出已确认的 B 类元素，或在手动 B 类标签页从当前 3DGS 视角用画笔粗框选择目标。
 2. Falcon-Perception 依据 VLM 指代或元素标签生成 RLE mask；程序持久化同一视角、同一像素网格的 RGB、metric depth、full-frame mask、bbox 与相机参数，同时输出透明背景 RGBA cutout 供 TRELLIS 使用。
-3. TRELLIS 从 cutout 生成 GLB / PLY。`mesh_registrar.py` 将 TRELLIS 的归一化 Y-up 网格重映射到场景 up-axis，按估计宽高缩放并以深度反投影位置生成确定性初始 placement。
-4. 若启用 `pose_refiner`，模型比较观测 RGB-D-mask、初始 placement 的软件渲染、mesh 点/法线与相机元数据，预测受限的旋转、平移和统一尺度残差。只有置信度、几何质量和非退化检查全部通过时才采用结果；缺失观测、推理异常、低置信度或质量回退都保留第 3 步的确定性 placement，并写入 manifest 诊断。
-5. `mesh_registrar.py` 将最终 placement 转为 Revit feet 并写出临时 JSON 文件（`name`、`category`、扁平 `vertices`、扁平三角形 `faces`）。`TrellisRevitWorkflow` 或 Gradio ⑤b 通过 MCP 调用编译版 `create_directshape_from_mesh`，并传递 `meshFile`。
-6. Revit 中的 `CreateDirectShapeEventHandler` 用 `TessellatedShapeBuilder` 构造闭合面集，在事务中创建 `OST_GenericModel` DirectShape 并返回元素 ID。
+3. TRELLIS 从 cutout 生成 GLB / PLY。`mesh_registrar.py` 将 TRELLIS 的归一化 Y-up 网格重映射到场景 up-axis，按估计宽高缩放；定位锚点取 Falcon mask 反投影的稳健 `visible_anchor`（对 mask 点云按相机距离百分位过滤取中位数），朝向由 `find_best_yaw_silhouette` 做轮廓分析合成搜索给出。
+4. `mesh_registrar.py` 将最终 placement 转为 Revit feet 并写出临时 JSON 文件（`name`、`category`、扁平 `vertices`、扁平三角形 `faces`）。`TrellisRevitWorkflow` 或 Gradio ⑤b 通过 MCP 调用编译版 `create_directshape_from_mesh`，并传递 `meshFile`。
+5. Revit 中的 `CreateDirectShapeEventHandler` 用 `TessellatedShapeBuilder` 构造闭合面集，在事务中创建 `OST_GenericModel` DirectShape 并返回元素 ID。
 
 文件载荷形式避免把大网格的顶点和三角索引经 MCP stdio 内联传输；仅小型网格才应使用工具的 inline `data` 形式。生成的 DirectShape 可选择、分类、删除和重新生成，但网格本身不可像 Revit 族一样参数化编辑。
 
@@ -342,7 +341,7 @@ TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点�
 
 ### 5. 独立 TRELLIS Registration Lab
 
-主 Gradio 页面包含完整的 3DGS→BIM→Revit 工作流,不适合作为 B 类数据制作工作台。针对 TRELLIS GLB 生成和 PoseRefiner 标注,使用独立页面:
+主 Gradio 页面包含完整的 3DGS→BIM→Revit 工作流,不适合作为 B 类配准工作台。针对 TRELLIS GLB 生成和基于反投影的渲染-比较配准,使用独立页面:
 
 ```powershell
 # 终端 1:启动 TRELLIS 服务
@@ -357,36 +356,9 @@ scripts\launch_trellis_registration.bat
 1. `生成 GLB`:上传对象图片或透明背景 cutout,生成 TRELLIS `.glb`/`.ply`;
 2. `自动配准`:上传 GLB 和同一观测图的 cutout,填写相机、物理尺寸、世界位置和 bbox JSON,通过已有的 `mesh_registrar.find_best_yaw_silhouette()` 做分析合成配准,输出 yaw overlay 与 registration manifest。
 
-当前自动配准解决的是可靠的 yaw 初值和确定性尺寸/位置变换,不是万能的 6DoF ICP。对于遮挡严重、深度不准或物体高度方向也明显旋转的样本,仍需把 manifest 带入 Blender Pose Annotation 做最终质量复核;这比从零手动拖拽更快,也保留了可审计的 fallback。
+当前自动配准解决的是可靠的 yaw 初值和确定性尺寸/位置变换,不是万能的 6DoF ICP。对于遮挡严重、深度不准或物体高度方向也明显旋转的样本,下一步将在页面内提供偏航角/尺度/前后位置三滑块的人机协同修正(取代原 Blender 人工复核),保留可审计的 fallback。
 
 独立页面使用端口 `19256`,不会改变主页面 `19255`。
-
-#### 可选 B 类姿态精修
-
-精修模型使用程序生成的有真值 cuboid RGB-D-mask/mesh 对训练；训练参数化与运行时残差边界一致。合成 benchmark 用于检查 checkpoint、回退策略和数值回归，不等同于真实扫描精度评估。
-
-```powershell
-G:\Miniconda3\envs\bim-recon\python.exe scripts\train_pose_refiner.py --device cuda --output output\pose_refiner.pt
-G:\Miniconda3\envs\bim-recon\python.exe scripts\benchmark_pose_refiner.py --device cuda --checkpoint output\pose_refiner.pt --output output\pose_refiner.benchmark.json
-```
-
-训练完成后，在 `config.json` 中启用并指向 checkpoint；其余阈值和残差边界参见 `config.example.json`：
-
-```json
-{
-  "pose_refiner": {
-    "enabled": true,
-    "checkpoint": "output/pose_refiner.pt",
-    "device": "cuda",
-    "confidence_threshold": 0.65,
-    "min_quality_score": 0.20,
-    "gravity_locked": true,
-    "floor_contact": true
-  }
-}
-```
-
-未配置 checkpoint 时保持默认关闭；启用后 checkpoint 缺失会在工作流启动时失败，而单个对象的观测缺失或推理失败会安全回退并记录原因。
 
 ## 运行测试
 
@@ -414,12 +386,11 @@ pytest -q
 | `tests/test_trellis_integration.py` | TRELLIS 集成（真实 HTTPServer mock）| 4/4 通过 |
 | `tests/test_mesh_registrar.py` | GLB 解析、坐标变换、Revit-feet 文件载荷和 DirectShape 工具参数 | 见上方回归命令 |
 | `tests/test_workflows.py` | B 类分割、TRELLIS、文件载荷与编译版 DirectShape 工具分派 | 见上方回归命令 |
-| `tests/test_pose_refiner.py` | 合成张量/损失、checkpoint 加载、GLB 软件渲染、接受/拒绝/异常回退与 workflow manifest | 见下方回归命令 |
 
-DirectShape、B 类确定性工作流与可选姿态精修回归：
+DirectShape 与 B 类确定性工作流回归：
 
 ```powershell
-python -m pytest tests/test_pose_refiner.py tests/test_workflows.py tests/test_mesh_registrar.py -q
+python -m pytest tests/test_workflows.py tests/test_mesh_registrar.py -q
 ```
 
 MCP 工具集成测试（需 MSVC）：
@@ -446,8 +417,6 @@ bim_recon/
 ├── falcon_client.py         # Falcon HTTP 客户端（跨环境桥接）
 ├── trellis_client.py        # TRELLIS HTTP 客户端（跨环境 mesh 生成）
 ├── mesh_registrar.py        # B 类坐标变换 + DirectShape JSON 文件载荷生成
-├── pose_refiner.py          # B 类 RGB-D-mask + mesh 残差姿态精修与安全回退
-├── pose_refiner_synthetic.py # 程序化训练/评估数据与指标
 ├── element_config.py        # 元素类型配置注册表（door/window/column/furniture）
 ├── floorplan.py             # FloorPlan 契约 + ManualProvider
 ├── revit_code.py            # FloorPlan → Revit C# 代码生成
@@ -475,8 +444,6 @@ scripts/
 ├── encode_bim_labels.py     # 可选 SigLIP2 文本嵌入 warm-cache 生成器
 ├── manual_to_revit_code.py  # 手量底图 → Revit C# 脚本（工具）
 ├── test_mcp_gs.py           # MCP 工具集成测试
-├── train_pose_refiner.py    # 合成数据姿态精修训练 CLI
-├── benchmark_pose_refiner.py # checkpoint 确定性基准 CLI
 └── train_gs.py              # nerfstudio 训练包装
 
 revit_scripts/               # 仅供仍需动态脚本的遗留 / 辅助 C# 模板

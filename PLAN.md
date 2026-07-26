@@ -1194,88 +1194,120 @@ python scripts/generate_trellis_mesh.py --image chair.png --output-dir output/me
 
 ---
 
-## 15. B 类 PoseRefiner 数据集：Blender 人机协同配准（2026-07-21）
+## 15. B 类配准：基于 RGB-D 反投影与分析合成的场景约束网格注册（2026-07-23 重规划）
 
-### 15.1 当前目标
+> **2026-07-23 重规划**：依据附件分析（项目创新性已足够支撑上海市级 SITP），弃用原 §15 的
+> PoseRefiner 神经网络与 Blender 人工真值标注方案。B 类物体（家具、管道、楼梯、异形件）的
+> TRELLIS 网格到 3DGS 场景的 Sim(3) 配准改用**确定性、可解释、可复现的受约束"渲染-比较"
+> （render-and-compare / analysis-by-synthesis）几何优化**，不再训练网络。
 
-第一轮不依赖 Replica 对象 mesh 作为核心监督，而是直接建立每个 TRELLIS 变体到对应 3DGS 场景的真值变换：
+### 15.1 问题重定义
 
-```text
-同一物体的不同输入视角
-  → 多个具有自然几何/canonical 噪声的 TRELLIS GLB
-  → 在 Blender 中分别与 3DGS 点云人工配准
-  → 导出每个 GLB 独立的 TRELLIS raw → 3DGS raw 真值矩阵
-  → 用 GSScene 和现有 mesh renderer 生成与部署一致的网络输入
-  → 围绕真值施加受控 rotation / translation / uniform-scale 扰动
-  → 训练并先验证小样本过拟合能力
-```
+原方案试图用网络学习"TRELLIS GLB ↔ 3DGS 观测"的位姿残差。重规划后，问题收紧为：
 
-不同视角生成同一对象解决的是 **TRELLIS 几何与 canonical 坐标噪声**；围绕真值变换施加的随机扰动解决的是 **PoseRefiner 姿态残差覆盖**。两类噪声都要保留，不能互相替代。同一对象的全部视角和 TRELLIS 变体必须放在同一个 train/validation/test 分组中，防止对象泄漏。
+> 已知相机位姿、楼板高 `floor_z`、重力方向（`up_axis`），以及 Falcon 实例 mask 反投影得到
+> 的物体**可见表面**点云，求一个受约束的相似变换 `T`，把 TRELLIS 网格局部坐标系对齐到
+> 3DGS 世界坐标系，使其在该相机下的渲染轮廓与深度与观测一致。
 
-### 15.2 Blender 的职责边界
+自由度从 7（全 6DoF 刚体 + 尺度）缩减为 4–5：`ξ = (θ, s, t_x, t_y, δz)`——绕重力轴的偏航角、
+统一尺度、平面平移、以及可固定为 0 的垂直微调。约束：重力方向已知、底面贴 `floor_z`、
+不需要任意 roll/pitch。这是几何配准问题，不是模式识别问题，确定性求解器即可。
 
-Blender 只负责人工空间配准、视角选择、质量状态和真值矩阵导出，不直接生产最终网络 tensor。训练输入继续由项目运行时生成：
+### 15.2 已确认缺陷与已落地修复（本次重规划第一阶段）
 
-- 观测侧：`GSScene` 输出 RGB + expected metric depth，结合实例 mask 构成 5 通道输入；
-- 候选侧：`pose_refiner.render_mesh_channels()` 输出 TRELLIS normal RGB + metric depth + silhouette；
-- 几何侧：原始 GLB 的 surface points + normals；
-- 元数据：相机、bbox、初始 placement 和匹配质量；
-- 标签：初始 placement 到 Blender 真值 placement 的 rotation / translation / log-scale residual。
+核查发现确定性核心存在三处缺陷，第一类已修复，作为优化器落地前的地基：
 
-这样可避免 Blender Z Pass、KIRI 3DGS Geometry Nodes 与线上 gsplat expected-depth 之间产生训练/部署域差异。
+| 缺陷 | 根因 | 状态 |
+|---|---|---|
+| **可见表面锚点被当作网格质心** | `backproject_observation` 已用 `_unproject_mask_points` 算出精确 mask 三维点，却只塞进诊断字段；最终定位仍用 bbox 中心 + bbox 内中值深度，易混入背景/椅腿空隙 | **已修复**：新增 `_robust_anchor_from_points`（mask 点按相机距离 [10,70] 百分位过滤取中位数），`backproject_observation` 输出 `visible_anchor`，`register_observation` 的偏航搜索与 placement 基准改用 `visible_anchor`（无 mask 时回退 `backprojected_center`）。实测（object_001 沙发）：锚点落在 mask 点云凸包内，与 bbox 中心水平偏差 0.14 m |
+| **偏航角搜索与 placement 旋转约定不一致** | `find_best_yaw_silhouette` 手写绕 mesh +Y 的 `+yaw`，`compute_placement_transform` 用绕世界 up 的 `-yaw`（`_build_yaw_rotation`），轴同符号反、组合顺序亦不同；`best_yaw` 原值透传 → 非对称物体朝向反向 | **已修复**：`silhouette_at_yaw` 改为复用 `_build_yaw_rotation(up_axis, yaw) @ axis_remap`，与 placement 完全一致。新增约定一致性测试 `test_yaw_search_matches_placement_convention`（全 up_axis × 多 yaw） |
+| **轮廓用点投影而非三角面光栅化** | 当前用顶点/表面采样点投影 + 1px 膨胀近似轮廓，无 z-buffer，稀疏网格、自遮挡、凹陷处失真 | **延后**：下一步用 `open3d.t.geometry.RaycastingScene` 做真实三角面光栅化（见 §15.6） |
 
-### 15.3 坐标契约
+诚实说明：`visible_anchor` 仍是**表面锚点**，把网格包围盒中心放在表面锚点仍会向相机方向
+偏移约半个物体深度；该偏移的根本消除依赖 §15.3 的渲染-比较优化器（在重叠区用网格表面深度
+对齐 3DGS 深度，自动把网格中心推到表面后方）。本次锚点修复仅去除背景/空隙深度污染，
+是优化器的更优参考点，前向兼容。
 
-Blender 场景中必须标记唯一的 `gs_reference`，并为每个 TRELLIS 变体标记一个 `trellis_gt_proxy`。设：
+### 15.3 方法：受约束 4–5 自由度"渲染-比较"优化（下一步实施规格）
 
-```text
-M_gs_to_blender       = gs_reference.matrix_world
-M_trellis_to_blender  = trellis_proxy.matrix_world
-M_trellis_to_gs       = inverse(M_gs_to_blender) @ M_trellis_to_blender
-```
+对每个候选位姿 `T`，把 TRELLIS 网格按 `T` 变换到世界坐标，用与观测相同的相机渲染得到
+轮廓 `M_mesh` 与深度 `D_mesh`，与观测的 Falcon mask `M_obs` 和原始 3DGS 深度 `D_3DGS` 比较：
 
-导出器同时把 `M_trellis_to_gs` 转换为当前 `MeshTransform` 契约：
+$$ E(T) = \lambda_m \bigl(1 - \mathrm{IoU}(M_{mesh}, M_{obs})\bigr) + \lambda_d \cdot \mathrm{Huber}\bigl(D_{mesh} - D_{3DGS};\ \text{仅在 } M_{obs} \text{ 内}\bigr) + \lambda_f \cdot E_{floor} $$
 
-```text
-x_gs = scale * rotation @ (x_trellis - mesh_center) + translation
-```
+- `M_obs`：Falcon 实例 mask（已反投影为 `visible_anchor`）；
+- `M_mesh` / `D_mesh`：候选位姿下渲染的网格轮廓 / 深度（§15.6 光栅化）；
+- `D_3DGS`：捕获观测时的原始 3DGS 深度图；
+- `E_floor`：网格最低点偏离 `floor_z` 的惩罚（底面接触约束）。
 
-其中 `mesh_center` 是原始 TRELLIS proxy 局部坐标的 bbox 中心，`translation = M_trellis_to_gs @ mesh_center`。标注只允许正 determinant 的刚体旋转 + uniform scale；非统一缩放、shear、镜像、空 proxy 或多于一个 GS reference 都是阻断导出的错误。
+参数 `ξ = (θ, s, t_x, t_y, δz)`：偏航角、统一尺度、平面平移、垂直微调（常固定为 0）。
+尺度初值由 mask 高度 + 反投影深度估计（`_estimate_dimensions`），平移初值取 `visible_anchor`，
+最低点贴 `floor_z`，偏航角由现有 `find_best_yaw_silhouette` 给出粗值。
 
-为避免 Blender glTF importer 的 Y-up/Z-up 转换、父节点和多 mesh 合并改变原始 GLB 坐标，正式数据应使用项目 GLB parser 生成的 raw-coordinate proxy PLY 做标注；带纹理 GLB 仅作为随 proxy 运动的视觉参考。
+### 15.4 优化过程（粗到细，无梯度）
 
-### 15.4 Blender 标注工具
+1. **初值**：轴重映射（TRELLIS Y-up → 世界 up_axis）、`visible_anchor` 稳健中心、底面贴
+   `floor_z`、`find_best_yaw_silhouette` 粗偏航、`_estimate_dimensions` 估尺度。
+2. **逐偏航渲染**：每个候选偏航角下渲染完整轮廓 + 深度，计算 `E(T)`。
+3. **粗到细搜索**：偏航粗步 5° / 细步 0.5°、尺度 ±20%、平移 ±0.3 m；用 Powell / Nelder-Mead /
+   坐标下降（4–5 参数无需梯度，对噪声鲁棒）。每个候选只调一次光栅化。
+4. **质量门控**：见 §15.5。
 
-插件位于 `blender_addons/bim_pose_annotation/`，支持 Blender 4.3 Extension 格式：
+### 15.5 质量门控与人机协同
 
-- 标记当前对象为唯一 `gs_reference`；
-- 标记当前 mesh 为 `trellis_gt_proxy`，记录 scene/object/class/variant/source-view/source-GLB；
-- 标记相机为 `observation_camera`，记录 RGB/depth/mask、bbox 和目标 object ID；
-- 设置 `draft / approved / review / rejected` 和标注质量；
-- 校验对象角色、ID、源文件与变换合法性；
-- 导出 schema v1 JSON manifest。
+| 指标 | 阈值参考 | 含义 |
+|---|---|---|
+| silhouette IoU | > 0.3 | 网格轮廓与 mask 重叠 |
+| mask 内深度 MAE | < 8 cm | 网格表面与 3DGS 深度吻合 |
+| 有效深度覆盖率 | > 0.5 | `M_obs` 内有网格深度的像素占比 |
+| 地板接触误差 | < 3 cm | 底面是否贴 `floor_z` |
+| 尺寸合理性 | ±25% | 估尺度是否在物理合理范围 |
+| 第一/二候选偏航分数差 | > 0.05 | 偏航是否无歧义 |
 
-无界面批处理入口：
+低置信度时（多指标不达标），下一步在 Gradio 配准页面内弹出 **偏航角 / 尺度 / 前后位置** 三滑块的
+人机协同修正（取代原 Blender 人工复核）。滑块约束在上述物理范围内，人机结果回写 manifest。
 
-```powershell
-F:\Blender\Blender4.3\blender.exe --background annotation.blend `
-  --python scripts/export_blender_annotations.py -- `
-  --output output/annotations/room_0.json
-```
+### 15.6 光栅化选择
 
-Blender 4.3 手册已克隆到本地 `Docs/blender-manual/` 作为离线参考；`Docs/` 按项目规则保持不提交。
+首选 `open3d.t.geometry.RaycastingScene`（已是仓库依赖，见 `bim_recon/wall_fitter.py`）：
+CPU、`cast_rays` 一次给出 `t_hit`（深度）与 `geometry_ids`（轮廓），无需可微性，Windows /
+torch 2.7 无安装风险，适合无梯度优化器。性能后备：nvdiffrast（GPU）。`trimesh.Scene.save_image`
+作软件后备。
 
-### 15.5 第一轮测试循环
+### 15.7 多视角联合评分（延后）
 
-1. 选择一个轮廓明确、遮挡较少的 B 类对象；
-2. 从同一对象 2–3 个明显不同视角生成 TRELLIS GLB；
-3. 为每个 GLB 生成 raw-coordinate proxy，并在同一个 3DGS Blender 场景中单独配准；
-4. 每个变体至少配置一个未参与 TRELLIS 生成的 observation camera；
-5. 导出 manifest，并由后续数据集生成器生成受控姿态扰动样本；
-6. 先做 1–3 个对象的小样本过拟合，确认 rotation / translation / scale 训练误差能明显下降；
-7. 再扩展到现有数据集的家具对象。若仍无法收敛，再评估增加 Replica mesh 约束或外部数据源。
+$$ E_{multi}(T) = \sum_i \bigl[\lambda_m(1 - \mathrm{IoU}_i) + \lambda_d \cdot E_{depth,i}\bigr] $$
 
-标注真值误差应显著小于网络预测范围。当前目标为人工配准后旋转误差约 2–3°、平移约 2–3 cm、尺度约 2–3%；不满足的样本设为 `review` 或 `rejected`，不进入正样本训练。
+视角选择：原始生成视角 + 左右偏 20–40° + 略高视角。用反投影物体三维区域投影到其它视角生成
+提示框，再调 Falcon 得到多视角 mask 与深度。多视角能消除单视角的偏航/尺度歧义，作为单视角
+基线稳定后的扩展。
+
+### 15.8 为何不训练神经网络
+
+附件判定 NN 为高风险，理由经核查成立：
+
+- **真实标注成本高**：需要每个物体的真实 TRELLIS→3DGS 变换，人工配准误差（旋转 2–3°、
+  平移 2–3 cm）未必小于网络预测范围，监督信号本身不可靠；
+- **模型误差 ≠ 姿态误差**：TRELLIS 网格与真实物体非严格同形（生成模型固有误差），网络难以
+  分辨"形状不对"与"位姿不对"；
+- **合成-真实域差异**：训练用合成扰动，部署面对真实 3DGS 渲染，域差异需额外弥合。
+
+参考文献（render-and-compare / 分析合成范式）：MegaPose [Labbé RAL/CVPR]、RePOSE [ICCV 2021]、
+GISR [arXiv:2405.04890]、STI-Pose [ICCV 2024]；对比基线 NOCS [arXiv:1901.02970]、
+FoundationPose [CVPR 2024]。**仅在**确定性基线完整、积累 ≥30–50 个独立物体、有
+train/val/test 划分、可报告旋转/平移/尺度误差且**显著优于**几何优化时，才重新评估 NN。
+
+### 15.9 评估方案
+
+约 15–30 个 B 类物体（不同类别、遮挡、尺度）。每物体报告：水平/垂直位置误差(cm)、偏航误差(°)、
+尺度误差(%)、silhouette IoU、深度 MAE(cm)、自动注册成功率(%)、Revit 导入成功率(%)。方法对比：
+
+| 方法 | 说明 |
+|---|---|
+| 固定偏航 + 中心反投影 | 旧基线（缺陷修复前） |
+| 轮廓偏航搜索 | 当前（`find_best_yaw_silhouette`，约定已统一） |
+| 轮廓 + 深度联合优化 | §15.3 渲染-比较优化器（下一步实施） |
+| 多视角联合优化 | §15.7（更后） |
 
 ---
 

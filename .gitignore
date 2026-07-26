@@ -12,6 +12,9 @@ config.json
 .omo/
 .opencode/
 
+# Large binary data files
+*.blend
+
 # Generated artifacts
 output/
 outputs/
