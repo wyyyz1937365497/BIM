@@ -126,7 +126,7 @@
 - **端到端链路**：`渲染 + 深度` → `Falcon 实例分割` → `RGBA 抠图` → `TRELLIS GLB` → `渲染-比较 yaw 搜索 + 3D ICP 精修` → `create_directshape_from_mesh` → Revit。
 - **Gradio 接入**：手动 B 类标签页支持两步操作：① 生成 Mesh + 配准（非 Revit）、② 导入 Revit。配准进度与质量指标（IoU / depth_mae / ICP fitness / rmse）实时展示，诊断图像（3 面板叠加 + roundtrip.json）输出至 `<name>_render_compare/`。
 - **限制**：DirectShape 是原生 Revit 图元，但网格本身不可像墙、门窗族一样参数化编辑；它可选择、删除、分类和重新生成。
-- **xformers Windows patch**：`trellis_server/xformers_windows.patch` + `launch_trellis_server.bat` 自动应用（flash-attn 不可用于 Windows）。
+- **xformers Windows patch**：`trellis_server/xformers_windows.patch`，启动 TRELLIS 服务前需手动 `git apply`（flash-attn 不可用于 Windows）。
 
 ### SceneSplat Windows 原生推理（commit `8e25991`）
 
@@ -213,8 +213,22 @@ python -m scripts.pca_colorize_features `
 - OpenAI 兼容 VLM API（如 智谱 GLM-4V）或 Ollama gemma4:12b
 - **Windows** + Visual Studio 2022（gsplat JIT 编译需要 vcvars64）
 - Revit + `mcp-servers-for-revit`（可选，用于 Revit 图元创建）
-- **Falcon-Perception**（可选，conda 环境 `transformerv`）：空间位置精修。权重在 `Falcon-Perception/weight/Falcon-Perception/`。
-- **TRELLIS**（可选，conda 环境 `trellis`）：B类构件 mesh 生成。
+- **Falcon-Perception**（可选，conda 环境 `transformerv`）：空间位置精修
+- **TRELLIS**（可选，conda 环境 `trellis`）：B类构件 mesh 生成
+
+**运行前准备**：
+```powershell
+# 1. 激活 bim-recon 环境
+conda activate bim-recon
+
+# 2. 加载 MSVC 编译环境（gsplat JIT 需要）
+#    每次打开新终端执行以下命令，或从 vcvars64 快捷方式启动：
+cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat\" && cmd"
+
+# 3. 其他 conda 环境按需激活：
+#    conda activate trellis       （TRELLIS mesh 生成服务）
+#    conda activate transformerv  （Falcon-Perception 分割服务）
+```
 
 ### 1. 一键运行完整管线（推荐）
 
@@ -256,10 +270,25 @@ cmd /c "\"...\vcvars64.bat\" && python scripts/run_pipeline.py --name room0 --sk
 python scripts/run_pipeline.py --name room0 --elements door window column
 ```
 
-### 2. Gradio Web UI（推荐交互方式）
+### 2. 独立 3DGS 查看器
+
+Gradio Web UI 内嵌的 3DGS 查看器由一个 **FastAPI Viewer Manager** 管理，它负责按需启动/停止 nerfview 进程并暴露相机状态。需在启动 Gradio 前先运行：
 
 ```powershell
-scripts\launch_gradio.bat
+python -m bim_recon.viewer_service
+```
+
+默认端口 `18083`（可在 `config.json` → `viewer_service.port` 修改）。Gradio 通过 `POST /viewer` 按场景名自动启动对应 nerfview 实例（`18081`），`GET /camera-state` 获取当前相机位姿供 Falcon 分割、B 类抠图等下游使用。
+
+
+
+### 3. Gradio Web UI（推荐交互方式）
+
+> 需要先启动 [Viewer Manager](#2-独立-3dgs-查看器)，否则 3D 查看器和相机捕获功能不可用。
+
+```powershell
+# 需要 MSVC 环境用于 gsplat JIT 编译，在 vcvars64 shell 中执行：
+python scripts/gradio_app.py
 ```
 
 打开浏览器访问 `http://127.0.0.1:19255`。单页界面包含：
@@ -287,13 +316,14 @@ scripts\launch_gradio.bat
     "command": "node",
     "args": ["mcp-servers-for-revit/server/build/index.js"],
     "timeout": 120
+  },
+  "viewer_service": {
+    "host": "127.0.0.1",
+    "port": 18083,
+    "viewer_port": 18081
   }
 }
 ```
-
-工作流实现不读取 LLM 配置。VLM 只在管线图像验证步骤中调用。
-
-### 3. Workflow 回归测试
 
 ```powershell
 python -m pytest tests/test_workflows.py -q
@@ -301,7 +331,7 @@ python -m pytest tests/test_workflows.py -q
 
 测试覆盖类型化事件流、A 类重建失败路径、Revit 主体与洞口创建顺序、B 类扫描去重，以及 TRELLIS/Revit 扇出。
 
-### 4. B 类构件 Mesh 生成与 DirectShape 导入
+### 5. B 类构件 Mesh 生成与 DirectShape 导入
 
 B 类构件是非标准几何的复杂构件：家具、管道、楼梯和装饰件等。它们不适合自动映射为参数化 Revit 族，因此使用可重建、可追踪的三角网格 DirectShape；这并不替代 A 类墙、板、门窗的参数化创建。
 
@@ -309,7 +339,10 @@ B 类构件是非标准几何的复杂构件：家具、管道、楼梯和装饰
 
 ```powershell
 # 终端 1：TRELLIS 服务（trellis conda 环境）
-scripts\launch_trellis_server.bat
+# 先激活 trellis 环境，确保 xformers Windows 补丁已应用：
+#   git apply trellis_server/xformers_windows.patch
+set TRELLIS_MODEL=G:/TJ/BIM/TRELLIS/TRELLIS-image-large
+python trellis_server/server.py --host 127.0.0.1 --port 18391 --model %TRELLIS_MODEL%
 # 首次运行会安装 trellis_server/requirements.txt；等待 "TRELLIS model ready"
 
 # 终端 2：打开 Revit 2026，并确保本地 mcp-servers-for-revit 插件已加载
@@ -339,16 +372,16 @@ TRELLIS 使用端口 `18391`；配置位于 `config.json` 的 `trellis` 节点�
 
   命令输出 GLB 和 PLY 的路径。若要导入，请走上面的 Gradio 工作流或调用 `create_directshape_from_mesh`，不要使用 `send_code_to_revit` 动态脚本。
 
-### 5. 独立 TRELLIS Registration Lab
+### 6. 独立 TRELLIS Registration Lab
 
 主 Gradio 页面包含完整的 3DGS→BIM→Revit 工作流,不适合作为 B 类配准工作台。针对 TRELLIS GLB 生成和基于反投影的渲染-比较配准,使用独立页面:
-
 ```powershell
-# 终端 1:启动 TRELLIS 服务
-scripts\launch_trellis_server.bat
+# 终端 1：启动 TRELLIS 服务（trellis conda 环境）
+set TRELLIS_MODEL=G:/TJ/BIM/TRELLIS/TRELLIS-image-large
+python trellis_server/server.py --host 127.0.0.1 --port 18391 --model %TRELLIS_MODEL%
 
-# 终端 2:启动独立配准页面
-scripts\launch_trellis_registration.bat
+# 终端 2：启动独立配准页面（bim-recon 环境，需 MSVC vcvars64）
+python scripts/gradio_trellis_registration.py
 ```
 
 浏览器打开 `http://127.0.0.1:19256`。页面分为两个步骤:
