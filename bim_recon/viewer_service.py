@@ -201,4 +201,10 @@ def create_app(config: ViewerServiceConfig | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+if __name__ == "__main__":
+    cfg = load_config().viewer_service
+    app = create_app(cfg)
+    import uvicorn
+    uvicorn.run(app, host=cfg.host, port=cfg.port)
+else:
+    app = create_app()

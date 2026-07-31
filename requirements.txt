@@ -1,0 +1,44 @@
+# 3DGS → BIM 自动重建系统 — 运行时依赖 (Python 3.11+, Windows)
+#
+# 主环境 (bim-recon / bim_main): gsplat 渲染 + 语义查询 + 墙线提取 + VLM 验证
+# 安装顺序:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+# gsplat 首次运行需 MSVC (vcvars64) 编译 CUDA 扩展。
+
+# ---- 3DGS 渲染 ----
+gsplat==1.4.0         # 3DGS rasterizer (RGB+ED); pin 1.4.0 for MSVC build compat
+
+# ---- 图像处理 ----
+pillow
+opencv-python-headless
+
+# ---- 科学计算 / 几何 ----
+numpy
+scipy
+scikit-learn          # DBSCAN clustering for wall-line extraction
+shapely               # FloorPlan 契约 + 底图配准
+trimesh               # GLB 解析 / B 类 mesh 处理
+open3d                # 点云 ICP 配准
+
+# ---- 可视化 ----
+matplotlib
+
+# ---- 语义 / VLM ----
+transformers          # SigLIP2 文本嵌入
+openai                # OpenAI 兼容 VLM API 客户端 (智谱 GLM-4V)
+
+# ---- 分割 (Falcon B 类抠图) ----
+pycocotools           # RLE mask 解码
+
+# ---- Web UI / API ----
+gradio>=5.0           # Gradio 单页 Web UI (4.x 有 schema 解析 bug)
+fastapi               # Viewer Manager API
+uvicorn               # ASGI server for FastAPI
+viser                 # nerfview 3D 查看器后端
+websockets            # nerfview 实时通信
+
+# ---- MCP / Workflows ----
+mcp                   # Model Context Protocol SDK (Revit MCP 桥接)
+llama-index-workflows # 确定性 Workflow 引擎 (provides `workflows` module)
+pydantic              # 配置 / 事件类型校验
