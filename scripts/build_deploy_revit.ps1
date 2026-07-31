@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build and deploy mcp-servers-for-revit to Revit 2026 Addins folder.
+    Build and deploy mcp-servers-for-revit to a local Revit Addins folder.
 
 .DESCRIPTION
     This script automates the full build → deploy cycle for the
@@ -10,11 +10,17 @@
       3. Copies the output to the Revit Addins folder
       4. Optionally relaunches Revit
 
-    Only Revit 2026 (R26, .NET 8) is supported on this machine.
+    The Revit year (R20-R26, i.e. 2020-2026) is auto-detected from the
+    -RevitPath exe version. The csproj maps R25/R26 to .NET 8, R20-R24 to .NET 4.8.
 
 .PARAMETER Configuration
-    Build configuration: "Debug R26" (default, with .pdb + auto-deploy)
-    or "Release R26" (optimized, requires manual copy).
+    Build configuration: "Debug" (default, with .pdb + auto-deploy)
+    or "Release" (optimized). The R-code (e.g. R26) is appended automatically
+    based on the detected Revit version.
+
+.PARAMETER RevitPath
+    Path to Revit.exe. The version is read from the exe to derive the Revit
+    year and build configuration. Defaults to Revit 2026 on this machine.
 
 .PARAMETER SkipKillRevit
     Skip the "kill Revit" step. Use if Revit is not running.
@@ -30,8 +36,12 @@
     # Debug build + deploy + relaunch Revit
 
 .EXAMPLE
-    .\scripts\build_deploy_revit.ps1 -Configuration "Release R26"
-    # Release build + deploy
+    .\scripts\build_deploy_revit.ps1 -Configuration Release
+    # Release build + deploy (Revit year auto-detected from -RevitPath)
+
+.EXAMPLE
+    .\scripts\build_deploy_revit.ps1 -RevitPath "D:\Autodesk\Revit 2024\Revit.exe"
+    # Deploy to a different Revit version (auto-derives R24 + .NET 4.8)
 
 .EXAMPLE
     .\scripts\build_deploy_revit.ps1 -Clean
@@ -39,10 +49,11 @@
 #>
 
 param(
-    [string]$Configuration = "Debug R26",
+    [ValidateSet("Debug","Release")][string]$Configuration = "Debug",
     [switch]$SkipKillRevit,
     [switch]$SkipLaunch,
-    [switch]$Clean
+    [switch]$Clean,
+    [string]$RevitPath = "F:\Software\AutoDesk\Revit 2026\Revit.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,21 +62,58 @@ $ErrorActionPreference = "Stop"
 # Constants
 # ---------------------------------------------------------------------------
 
-$RevitYear   = "2026"
-$RevitPath   = "F:\Software\AutoDesk\Revit 2026\Revit.exe"
+# Derive Revit version from the exe (csproj supports R20-R26).
+# ProductVersion may be a build-date string (e.g. "20260629_1515(x64)") on
+# some installs, so prefer *MajorPart fields which give the real major version.
+if (-not (Test-Path $RevitPath)) {
+    Write-Error "Revit.exe not found: $RevitPath"
+    exit 1
+}
+$verInfo = (Get-Item $RevitPath).VersionInfo
+$revitMajor = $null
+
+# 1) MajorPart fields (most reliable: FileMajorPart=26 for Revit 2026)
+if ($verInfo.FileMajorPart)   { $revitMajor = [string]$verInfo.FileMajorPart }
+elseif ($verInfo.ProductMajorPart) { $revitMajor = [string]$verInfo.ProductMajorPart }
+
+# 2) FileVersion first segment ("26.4.20.9" -> 26)
+if (-not $revitMajor -and $verInfo.FileVersion) {
+    $fv = $verInfo.FileVersion.Split('.')[0]
+    if ($fv -match '^\d+$') { $revitMajor = $fv }
+}
+
+# 3) Path year fallback ("Revit 2026" -> 26)
+if (-not $revitMajor -and $RevitPath -match '20(2\d)') {
+    $revitMajor = [string]([int]$Matches[1] - 2000)
+}
+
+if (-not $revitMajor) {
+    Write-Error "Cannot determine Revit version from $RevitPath"
+    exit 1
+}
+$majorInt = [int]$revitMajor
+if ($majorInt -lt 20 -or $majorInt -gt 26) {
+    Write-Error "Detected major version $majorInt is out of supported range (R20-R26)"
+    exit 1
+}
+
+$RevitYear  = "20$revitMajor"
+$RCode      = "R$revitMajor"
+$FullConfig = "$Configuration $RCode"
+
 $RepoRoot    = "G:\TJ\BIM\mcp-servers-for-revit"
 $Solution    = "$RepoRoot\mcp-servers-for-revit.sln"
 $ServerDir   = "$RepoRoot\server"
 $AddinsDir   = "$env:APPDATA\Autodesk\Revit\Addins\$RevitYear"
-$StagingDir  = "$RepoRoot\plugin\bin\AddIn $RevitYear $Configuration"
+$StagingDir  = "$RepoRoot\plugin\bin\AddIn $RevitYear $FullConfig"
 
 # ---------------------------------------------------------------------------
 # Step 0: Pre-flight checks
 # ---------------------------------------------------------------------------
 
 Write-Host "`n=== mcp-servers-for-revit Build & Deploy ===" -ForegroundColor Cyan
-Write-Host "  Configuration : $Configuration"
-Write-Host "  Revit Year    : $RevitYear"
+Write-Host "  Configuration : $FullConfig"
+Write-Host "  Revit Year    : $RevitYear ($RCode)"
 Write-Host "  Staging       : $StagingDir"
 Write-Host "  Addins target : $AddinsDir"
 Write-Host ""
@@ -113,7 +161,7 @@ if ($Clean) {
     }
 }
 
-$buildArgs = @("build", $Solution, "-c", $Configuration, "--no-incremental")
+$buildArgs = @("build", $Solution, "-c", $FullConfig, "--no-incremental")
 $buildStartTime = Get-Date
 & dotnet @buildArgs
 $buildExitCode = $LASTEXITCODE
@@ -132,18 +180,50 @@ Write-Host "      C# build OK ($($buildDuration.TotalSeconds.ToString('0.0'))s)"
 
 Write-Host "[3/5] Building TypeScript MCP Server..." -ForegroundColor Yellow
 
+# Auto-detect Node.js/npm: prefer PATH, else search common install locations.
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    $nodeHome = $null
+    foreach ($base in @("$env:ProgramFiles\Nodejs", "${env:ProgramFiles(x86)}\Nodejs",
+                        "$env:LOCALAPPDATA\Programs\nodejs", "H:\Nodejs", "D:\Nodejs",
+                        "C:\Nodejs", "D:\Program Files\Nodejs", "H:\Program Files\Nodejs")) {
+        if (Test-Path "$base\npm.cmd") { $nodeHome = $base; break }
+    }
+    if (-not $nodeHome) {
+        $found = Get-ChildItem 'C:\','D:\','H:\' -Filter 'npm.cmd' -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { $nodeHome = $found.DirectoryName }
+    }
+    if ($nodeHome) {
+        $env:PATH = "$nodeHome;$env:PATH"
+        Write-Host "      (Node.js found at: $nodeHome)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "      ERROR: npm not found on PATH or disk. Install Node.js (>=20)." -ForegroundColor Red
+        exit 1
+    }
+}
+
 Push-Location $ServerDir
 try {
     # Ensure node_modules exist
     if (-not (Test-Path "node_modules")) {
         Write-Host "      Installing npm dependencies..." -ForegroundColor DarkGray
+        # npm writes notices to stderr; ErrorActionPreference=Stop would treat
+        # any stderr line as a fatal error, so relax it for these calls.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         npm install --silent 2>&1 | Out-Null
+        $ErrorActionPreference = $prevEAP
     }
 
+    # npm/tsc emit progress + "npm notice" to stderr. Under
+    # ErrorActionPreference=Stop these abort the script as NativeCommandError
+    # before the command finishes. Temporarily relax and rely on $LASTEXITCODE.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $tsStartTime = Get-Date
     $tsResult = npm run build 2>&1
     $tsDuration = (Get-Date) - $tsStartTime
     $tsExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
 
     if ($tsExit -ne 0) {
         Write-Host "      TS BUILD FAILED:" -ForegroundColor Red

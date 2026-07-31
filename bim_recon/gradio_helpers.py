@@ -987,3 +987,152 @@ def apply_vlm_review(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Revit MCP 安装
+# ---------------------------------------------------------------------------
+
+def _read_exe_file_version(exe_path: str):
+    """Read PE file version (major, minor, build, private) via the Win32
+    Version API.
+
+    Uses ctypes (standard library) so there is no subprocess to hang the
+    Gradio worker thread. Returns None if the resource is absent/unreadable.
+    """
+    import ctypes
+    from ctypes import wintypes
+    try:
+        ver = ctypes.WinDLL("version")
+    except OSError:
+        return None
+    ver.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    ver.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    ver.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    ver.GetFileVersionInfoW.restype = wintypes.BOOL
+    ver.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+    ver.VerQueryValueW.restype = wintypes.BOOL
+
+    handle = wintypes.DWORD(0)
+    size = ver.GetFileVersionInfoSizeW(exe_path, ctypes.byref(handle))
+    if not size:
+        return None
+    buf = (ctypes.c_char * size)()
+    if not ver.GetFileVersionInfoW(exe_path, 0, size, buf):
+        return None
+    ptr = ctypes.c_void_p()
+    plen = wintypes.UINT(0)
+    # Root "\\" block returns VS_FIXEDFILEINFO (13 DWORDs = 52 bytes) when a
+    # version resource is present. fileVer = [2].MS, [3].LS; productVer similar.
+    if not ver.VerQueryValueW(ctypes.cast(buf, ctypes.c_void_p), "\\",
+                              ctypes.byref(ptr), ctypes.byref(plen)) or plen.value < 52:
+        return None
+    f = ctypes.cast(ptr, ctypes.POINTER(wintypes.DWORD * 13)).contents
+    file_ms, file_ls = int(f[2]), int(f[3])
+    return (
+        (file_ms >> 16) & 0xFFFF, file_ms & 0xFFFF,
+        (file_ls >> 16) & 0xFFFF, file_ls & 0xFFFF,
+    )
+
+
+def detect_revit_version(revit_exe: str) -> dict:
+    """从 Revit.exe 提取版本号 → 推导 Revit 年份与 R-code。
+
+    用 Win32 Version API（ctypes）读取 PE 版本资源，不启动 PowerShell 子进程，
+    避免在 Gradio worker 线程中阻塞。csproj 支持 R20-R26（Revit 2020-2026）。
+    """
+    if not revit_exe:
+        return {"status": "error", "message": "请输入 Revit.exe 路径"}
+    path = Path(revit_exe)
+    if not path.is_file():
+        return {"status": "error", "message": f"找不到文件: {revit_exe}"}
+    try:
+        logger.info("[REVIT-DETECT] start ctypes read for %s", revit_exe)
+        major = minor = build = private = None
+        fv = _read_exe_file_version(revit_exe)
+        logger.info("[REVIT-DETECT] ctypes read result: %s", fv)
+        if fv:
+            major, minor, build, private = fv
+
+        # fallback：路径中的年份（"Revit 2026" → 26）
+        if not major:
+            import re
+            m = re.search(r'20(2\d)', revit_exe, re.IGNORECASE)
+            if m:
+                major = int(m.group(1)) - 2000
+
+        if not major:
+            return {"status": "error",
+                    "message": "无法读取 Revit.exe 版本信息（无版本资源且路径无年份）"}
+        if not (20 <= major <= 26):
+            return {"status": "error",
+                    "message": f"主版本号 {major} 不在支持范围（R20-R26，即 Revit 2020-2026）"}
+        year = 2000 + major
+        ver_label = (f"{major}.{minor}.{build}.{private}"
+                     if minor is not None else str(major))
+        return {
+            "status": "ok",
+            "version": ver_label,
+            "year": year,
+            "rcode": f"R{major}",
+            "message": f"检测到 Revit {year}（{ver_label}），构建配置 R{major}",
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+def install_revit_mcp(
+    revit_exe: str,
+    configuration: str,
+    skip_kill: bool,
+    skip_launch: bool,
+    clean: bool,
+):
+    """流式执行 build_deploy_revit.ps1，逐行回传安装日志。
+
+    yields (log_text, summary_text) — Gradio 生成器，按 run_pipeline_direct 模式。
+    """
+    if not revit_exe:
+        yield "❌ 请先输入 Revit.exe 路径", ""
+        return
+    ps1 = ROOT / "scripts" / "build_deploy_revit.ps1"
+    if not ps1.is_file():
+        yield f"❌ 找不到构建脚本: {ps1}", ""
+        return
+
+    args = [
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(ps1),
+        "-Configuration", configuration,
+        "-RevitPath", revit_exe,
+    ]
+    if skip_kill:
+        args.append("-SkipKillRevit")
+    if skip_launch:
+        args.append("-SkipLaunch")
+    if clean:
+        args.append("-Clean")
+
+    logger.info("Revit MCP 安装启动: %s", " ".join(args))
+    header = f"启动安装...\n配置: {configuration}\nRevit: {revit_exe}\n{'-' * 50}"
+    lines: list[str] = [header]
+    yield "\n".join(lines), "运行中..."
+
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip()
+        if line:
+            lines.append(line)
+        yield "\n".join(lines), "运行中..."
+    proc.wait()
+
+    if proc.returncode == 0:
+        summary = "✅ 安装完成"
+    else:
+        summary = f"❌ 安装失败 (exit {proc.returncode})"
+    lines.append("")
+    lines.append(summary)
+    yield "\n".join(lines), summary

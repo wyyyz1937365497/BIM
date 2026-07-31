@@ -9,6 +9,14 @@ The gsplat renderer initializes the Visual Studio compiler environment on demand
 """
 from __future__ import annotations
 
+# --- Localhost proxy bypass (must run before httpx/gradio import) ---
+# 系统代理（如 Clash 127.0.0.1:7892）会拦截 gradio 对 localhost 的内部请求，
+# 导致回调创建 event 后永不执行、前端按钮卡死。这里强制 localhost 绕过代理。
+import os as _os
+_LOCALHOST = "127.0.0.1,localhost,::1"
+_existing = _os.environ.get("NO_PROXY", "")
+_os.environ["NO_PROXY"] = _LOCALHOST if not _existing else f"{_existing},{_LOCALHOST}"
+
 import asyncio
 import math
 import shutil
@@ -35,6 +43,7 @@ from bim_recon.gradio_helpers import (
     on_element_select, on_mask_apply, fetch_camera_state, launch_scene_viewer,
     _get_scene, _get_falcon, _mask_bbox_to_wall_coords,
     resegment_from_viewpoint, apply_vlm_review,
+    detect_revit_version, install_revit_mcp,
 )
 from bim_recon.config import load_config
 from bim_recon.trellis_client import TrellisClient, TrellisMeshRequest
@@ -1077,8 +1086,67 @@ def build_app() -> gr.Blocks:
             outputs=[bmesh_import_status],
         )
 
+        # ====== ⑧ Revit MCP 安装 ======
+        gr.Markdown("---\n## ⑧ Revit MCP 安装")
+        gr.Markdown(
+            "将 `mcp-servers-for-revit` 插件构建并部署到本地 Revit Addins 目录。"
+            "从 Revit.exe 版本号自动检测年份（支持 2020-2026）。"
+        )
+        with gr.Row():
+            with gr.Column(scale=3):
+                revit_exe_box = gr.Textbox(
+                    label="Revit.exe 路径",
+                    value=r"F:\Software\AutoDesk\Revit 2026\Revit.exe",
+                    placeholder="粘贴或输入 Revit.exe 的完整路径",
+                    info="程序将从 exe 版本号自动检测 Revit 年份",
+                )
+            with gr.Column(scale=1):
+                revit_ver_btn = gr.Button("🔍 检测版本", variant="secondary")
+        revit_ver_info = gr.Textbox(label="版本检测结果", interactive=False)
+
+        with gr.Row():
+            revit_config = gr.Radio(
+                ["Debug", "Release"], value="Debug", label="构建配置",
+                info="Debug 含调试符号；Release 为优化版本",
+            )
+            revit_clean = gr.Checkbox(False, label="全量重新编译")
+            revit_skip_kill = gr.Checkbox(False, label="跳过关闭 Revit")
+            revit_skip_launch = gr.Checkbox(False, label="安装后不重启 Revit")
+
+        revit_install_btn = gr.Button("🔧 开始安装", variant="primary")
+        revit_install_status = gr.Textbox(label="安装状态", interactive=False)
+        revit_install_log = gr.Textbox(
+            label="安装日志（实时）", lines=15, max_lines=30,
+            interactive=False,
+            placeholder="点击「开始安装」后，构建日志将在此实时显示...",
+        )
+
+        async def _detect_revit_for_ui(revit_exe: str):
+            import time as _t
+            t0 = _t.time()
+            try:
+                res = detect_revit_version(revit_exe)
+                logger.info("[REVIT-DETECT] %.0fms: %s", (_t.time()-t0)*1000, res.get("message"))
+            except Exception as exc:
+                logger.exception("[REVIT-DETECT] failed")
+                res = {"status": "error", "message": f"内部错误: {exc}"}
+            prefix = "✅" if res.get("status") == "ok" else "❌"
+            return f"{prefix} {res.get('message', '未知错误')}"
+
+        revit_ver_btn.click(
+            fn=_detect_revit_for_ui,
+            inputs=[revit_exe_box],
+            outputs=[revit_ver_info],
+        )
+        revit_install_btn.click(
+            fn=install_revit_mcp,
+            inputs=[revit_exe_box, revit_config, revit_skip_kill,
+                    revit_skip_launch, revit_clean],
+            outputs=[revit_install_log, revit_install_status],
+        )
+
     return app
 
 
 if __name__ == "__main__":
-    build_app().launch(server_port=19255, server_name="127.0.0.1")
+    build_app().launch(server_port=19255, server_name="127.0.0.1", max_threads=8)
